@@ -1749,65 +1749,6 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                         }
                     }
 
-                    // BSF (0x0F 0xBC), BSR (0x0F 0xBD)
-                    0xBC => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let val = load_rm(cpu, ram, ram_size, modrm, lane);
-                        let masked = match lane {
-                            LANE16 => val & 0xFFFF,
-                            LANE32 => val & 0xFFFFFFFF,
-                            _ => val,
-                        };
-                        materialize_flags(cpu);
-                        if masked == 0 {
-                            cpu.rflags |= ZF;
-                        } else {
-                            cpu.rflags &= !ZF;
-                            let bit = masked.trailing_zeros() as u64;
-                            match lane {
-                                LANE16 => write_reg16(cpu, dst_reg, bit as u16),
-                                LANE32 => cpu.regs[dst_reg] = bit,
-                                _ => cpu.regs[dst_reg] = bit,
-                            }
-                        }
-                        cpu.lazy.op = FlagOp::External;
-                    }
-                    0xBD => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let val = load_rm(cpu, ram, ram_size, modrm, lane);
-                        let masked = match lane {
-                            LANE16 => val & 0xFFFF,
-                            LANE32 => val & 0xFFFFFFFF,
-                            _ => val,
-                        };
-                        materialize_flags(cpu);
-                        if masked == 0 {
-                            cpu.rflags |= ZF;
-                        } else {
-                            cpu.rflags &= !ZF;
-                            let bits = match lane { LANE16 => 16u32, LANE32 => 32, _ => 64 };
-                            let bit = (bits - 1 - masked.leading_zeros()) as u64;
-                            match lane {
-                                LANE16 => write_reg16(cpu, dst_reg, bit as u16),
-                                LANE32 => cpu.regs[dst_reg] = bit,
-                                _ => cpu.regs[dst_reg] = bit,
-                            }
-                        }
-                        cpu.lazy.op = FlagOp::External;
-                    }
-
-                    // BSWAP (0x0F 0xC8-0xCF)
-                    0xC8 | 0xC9 | 0xCA | 0xCB | 0xCC | 0xCD | 0xCE | 0xCF => {
-                        let r = (op2 & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                        match lane {
-                            LANE32 => cpu.regs[r] = (cpu.regs[r] as u32).swap_bytes() as u64,
-                            LANE64 => cpu.regs[r] = cpu.regs[r].swap_bytes(),
-                            _ => cpu.regs[r] = (cpu.regs[r] as u16).swap_bytes() as u64,
-                        }
-                    }
-
                     // MOVSX r32/64, r/m8 (0x0F 0xBE) — already handled above
                     // MOVSX r32/64, r/m16 (0x0F 0xBF) — already handled above
                     // MOVZX r, r/m8 (0x0F 0xB6) — already handled above
