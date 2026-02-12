@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+jslinux/
+
+# Rust
+target/
+Cargo.lock
+
+# WASM build artifacts
+*.wasm
+!jslinux/*.wasm
+pkg/
+
+# Editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Deletable decompilation artifacts (see CLAUDE.md)
+jslinux/ghidra-monster-highpcode.c
+jslinux/ghidra-monster-chunks.c
+jslinux/x86_64emu-wasm.wasm.i64
