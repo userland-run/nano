@@ -12,6 +12,7 @@ const LANE32: u32 = 256;
 const LANE64: u32 = 512;
 
 /// Try-or-fault: unwrap a Result, or handle the memory fault and continue the main loop.
+#[allow(unused_macros)]
 macro_rules! try_or_fault {
     ($cpu:expr, $expr:expr) => {
         match $expr {
@@ -27,6 +28,27 @@ macro_rules! try_or_fault {
                     }
                 }
                 continue;
+            }
+        }
+    };
+}
+
+/// Try-or-fault for page functions: returns true (fault) instead of continue.
+macro_rules! try_or_fault_page {
+    ($cpu:expr, $expr:expr) => {
+        match $expr {
+            Ok(v) => v,
+            Err(e) => {
+                match e {
+                    mem::MemFault::PageFault { vaddr, error_code } => {
+                        $cpu.cr2 = vaddr;
+                        raise_exception($cpu, EXC_PF, error_code);
+                    }
+                    mem::MemFault::DeviceAccess { .. } => {
+                        raise_exception($cpu, EXC_GP, 0);
+                    }
+                }
+                return true;
             }
         }
     };
@@ -122,89 +144,65 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
             else { LANE32 }
         };
 
-        let idx = opcode as u32 + lane;
 
-        // === Main dispatch ===
-        match idx {
-            // ============================================================
-            // NOP (0x90)
-            // ============================================================
-            0x90 | 0x190 | 0x290 => {
-                // NOP — do nothing (also XCHG EAX,EAX in 32-bit which is NOP)
-            }
+        // === Main dispatch (paged by opcode high nibble) ===
+        let page = opcode >> 4;
+        let fault = match page {
+            0x0 => exec_page_0(cpu, ram, ram_size, opcode, lane),
+            0x1 => exec_page_1(cpu, ram, ram_size, opcode, lane),
+            0x2 => exec_page_2(cpu, ram, ram_size, opcode, lane),
+            0x3 => exec_page_3(cpu, ram, ram_size, opcode, lane),
+            0x4 => exec_page_4(cpu, ram, ram_size, opcode, lane),
+            0x5 => exec_page_5(cpu, ram, ram_size, opcode, lane),
+            0x6 => exec_page_6(cpu, ram, ram_size, opcode, lane),
+            0x7 => exec_page_7(cpu, ram, ram_size, opcode, lane),
+            0x8 => exec_page_8(cpu, ram, ram_size, opcode, lane),
+            0x9 => exec_page_9(cpu, ram, ram_size, opcode, lane),
+            0xA => exec_page_a(cpu, ram, ram_size, opcode, lane),
+            0xB => exec_page_b(cpu, ram, ram_size, opcode, lane),
+            0xC => exec_page_c(cpu, ram, ram_size, opcode, lane),
+            0xD => exec_page_d(cpu, ram, ram_size, opcode, lane),
+            0xE => exec_page_e(cpu, ram, ram_size, opcode, lane),
+            0xF => exec_page_f(cpu, ram, ram_size, opcode, lane),
+            _ => unreachable!(),
+        };
+        if cpu.halted { return budget; }
+        if fault { continue; }
+    }
+}
 
-            // ============================================================
-            // MOV r8, imm8 (0xB0-0xB7)
-            // ============================================================
-            0xB0 | 0x1B0 | 0x2B0 | 0xB1 | 0x1B1 | 0x2B1 | 0xB2 | 0x1B2 | 0x2B2 | 0xB3 | 0x1B3 | 0x2B3 | 0xB4 | 0x1B4 | 0x2B4 | 0xB5 | 0x1B5 | 0x2B5 | 0xB6 | 0x1B6 | 0x2B6 | 0xB7 | 0x1B7 | 0x2B7 => {
-                let reg = ((opcode - 0xB0) & 7) as usize;
-                let reg = if cpu.prefix.rex != 0 {
-                    reg | ((cpu.prefix.rex as usize & 1) << 3)
-                } else { reg };
-                let imm = match mem::fetch_u8(cpu, ram, ram_size, cpu.rip) {
-                    Ok(v) => v,
-                    Err(_) => { raise_exception(cpu, EXC_PF, 0); continue; }
-                };
-                cpu.rip += 1;
-                write_reg8(cpu, reg, imm);
-            }
-
-            // ============================================================
-            // MOV r16/32/64, imm (0xB8-0xBF)
-            // ============================================================
-            0xB8 | 0x1B8 | 0x2B8 | 0xB9 | 0x1B9 | 0x2B9 | 0xBA | 0x1BA | 0x2BA | 0xBB | 0x1BB | 0x2BB | 0xBC | 0x1BC | 0x2BC | 0xBD | 0x1BD | 0x2BD | 0xBE | 0x1BE | 0x2BE | 0xBF | 0x1BF | 0x2BF => {
-                let reg = ((opcode - 0xB8) & 7) as usize;
-                let reg = reg | ((cpu.prefix.rex as usize & 1) << 3);
-                match lane {
-                    LANE16 => {
-                        let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size));
-                        write_reg16(cpu, reg, imm);
-                    }
-                    LANE32 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size));
-                        cpu.regs[reg] = imm as u64; // zero-extended
-                    }
-                    LANE64 => {
-                        // MOV r64, imm64 — full 64-bit immediate
-                        let imm = try_or_fault!(cpu, fetch_imm64(cpu, ram, ram_size));
-                        cpu.regs[reg] = imm;
-                    }
-                    _ => {}
-                }
-            }
-
-            // ============================================================
-            // ADD AL, imm8 (0x04)
-            // ============================================================
-            0x04 | 0x104 | 0x204 => {
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+// ============================================================
+// Page 0: opcodes 0x00-0x0F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_0(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0x04 => {
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let lhs = cpu.regs[RAX] as u8;
                 let res = lhs.wrapping_add(imm);
                 write_reg8_al(cpu, res);
                 set_lazy(cpu, FlagOp::AddB, lhs as u64, res as u64);
-            }
-
-            // ============================================================
-            // ADD rAX, imm16/32 (0x05)
-            // ============================================================
-            0x05 | 0x105 | 0x205 => {
+        }
+        0x05 => {
                 match lane {
                     LANE16 => {
-                        let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size));
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size));
                         let lhs = cpu.regs[RAX] as u16;
                         let res = lhs.wrapping_add(imm);
                         write_reg16(cpu, RAX, res);
                         set_lazy(cpu, FlagOp::AddW, lhs as u64, res as u64);
                     }
                     LANE32 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size));
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size));
                         let lhs = cpu.regs[RAX] as u32;
                         let res = lhs.wrapping_add(imm);
                         cpu.regs[RAX] = res as u64;
                         set_lazy(cpu, FlagOp::AddL, lhs as u64, res as u64);
                     }
                     LANE64 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
                         let lhs = cpu.regs[RAX];
                         let res = lhs.wrapping_add(imm);
                         cpu.regs[RAX] = res;
@@ -212,40 +210,322 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                     }
                     _ => {}
                 }
-            }
+        }
+        0x0C => {
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let res = (cpu.regs[RAX] as u8) | imm;
+                write_reg8_al(cpu, res);
+                set_lazy(cpu, FlagOp::OrB, 0, res as u64);
+        }
+        0x00 | 0x08 => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = read_reg8(cpu, src_reg);
+                if modrm & 0xC0 == 0xC0 {
+                    let dst_reg = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    let dst = read_reg8(cpu, dst_reg);
+                    let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                    if alu_op != 7 { write_reg8(cpu, dst_reg, res); } // CMP doesn't write
+                    set_lazy(cpu, flag_op, dst as u64, res as u64);
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    let dst = try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr));
+                    let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                    if alu_op != 7 { try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res)); }
+                    set_lazy(cpu, flag_op, dst as u64, res as u64);
+                }
+        }
+        0x01 | 0x09 => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                if modrm & 0xC0 == 0xC0 {
+                    let dst_reg = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    alu_ev_gv_reg(cpu, alu_op, dst_reg, src_reg, lane);
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    alu_ev_gv_mem(cpu, ram, ram_size, alu_op, addr, src_reg, lane);
+                }
+        }
+        0x02 | 0x0A => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    read_reg8(cpu, r)
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
+                };
+                let dst = read_reg8(cpu, dst_reg);
+                let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                if alu_op != 7 { write_reg8(cpu, dst_reg, res); }
+                set_lazy(cpu, flag_op, dst as u64, res as u64);
+        }
+        0x03 | 0x0B => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    cpu.regs[r]
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    match lane {
+                        LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
+                        LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
+                        _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
+                    }
+                };
+                alu_gv_ev(cpu, alu_op, dst_reg, src, lane);
+        }
+        0x0D => {
+                let op_byte = opcode;
+                match lane {
+                    LANE16 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size));
+                        let lhs = cpu.regs[RAX] as u16;
+                        let (res, fop) = match op_byte {
+                            0x25 => (lhs & imm, FlagOp::AndW),
+                            0x0D => (lhs | imm, FlagOp::OrW),
+                            _ => (lhs ^ imm, FlagOp::XorW),
+                        };
+                        write_reg16(cpu, RAX, res);
+                        set_lazy(cpu, fop, 0, res as u64);
+                    }
+                    LANE32 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size));
+                        let lhs = cpu.regs[RAX] as u32;
+                        let (res, fop) = match op_byte {
+                            0x25 => (lhs & imm, FlagOp::AndL),
+                            0x0D => (lhs | imm, FlagOp::OrL),
+                            _ => (lhs ^ imm, FlagOp::XorL),
+                        };
+                        cpu.regs[RAX] = res as u64;
+                        set_lazy(cpu, fop, 0, res as u64);
+                    }
+                    LANE64 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
+                        let lhs = cpu.regs[RAX];
+                        let (res, fop) = match op_byte {
+                            0x25 => (lhs & imm, FlagOp::AndQ),
+                            0x0D => (lhs | imm, FlagOp::OrQ),
+                            _ => (lhs ^ imm, FlagOp::XorQ),
+                        };
+                        cpu.regs[RAX] = res;
+                        set_lazy(cpu, fop, 0, res);
+                    }
+                    _ => {}
+                }
+        }
+        0x0F => {
+            let op2 = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+            let page2 = op2 >> 4;
+            return match page2 {
+                0x0 => exec_0f_page_0(cpu, ram, ram_size, op2, lane),
+                0x1 => exec_0f_page_1(cpu, ram, ram_size, op2, lane),
+                0x2 => exec_0f_page_2(cpu, ram, ram_size, op2, lane),
+                0x3 => exec_0f_page_3(cpu, ram, ram_size, op2, lane),
+                0x4 => exec_0f_page_4(cpu, ram, ram_size, op2, lane),
+                0x5 => exec_0f_page_5(cpu, ram, ram_size, op2, lane),
+                0x6 => exec_0f_page_6(cpu, ram, ram_size, op2, lane),
+                0x7 => exec_0f_page_7(cpu, ram, ram_size, op2, lane),
+                0x8 => exec_0f_page_8(cpu, ram, ram_size, op2, lane),
+                0x9 => exec_0f_page_9(cpu, ram, ram_size, op2, lane),
+                0xA => exec_0f_page_a(cpu, ram, ram_size, op2, lane),
+                0xB => exec_0f_page_b(cpu, ram, ram_size, op2, lane),
+                0xC => exec_0f_page_c(cpu, ram, ram_size, op2, lane),
+                0xD => exec_0f_page_d(cpu, ram, ram_size, op2, lane),
+                0xE => exec_0f_page_e(cpu, ram, ram_size, op2, lane),
+                0xF => exec_0f_page_f(cpu, ram, ram_size, op2, lane),
+                _ => unreachable!(),
+            };
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // SUB AL, imm8 (0x2C)
-            // ============================================================
-            0x2C | 0x12C | 0x22C => {
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+// ============================================================
+// Page 1: opcodes 0x10-0x1F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_1(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0x10 | 0x18 => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = read_reg8(cpu, src_reg);
+                if modrm & 0xC0 == 0xC0 {
+                    let dst_reg = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    let dst = read_reg8(cpu, dst_reg);
+                    let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                    if alu_op != 7 { write_reg8(cpu, dst_reg, res); } // CMP doesn't write
+                    set_lazy(cpu, flag_op, dst as u64, res as u64);
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    let dst = try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr));
+                    let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                    if alu_op != 7 { try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res)); }
+                    set_lazy(cpu, flag_op, dst as u64, res as u64);
+                }
+        }
+        0x11 | 0x19 => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                if modrm & 0xC0 == 0xC0 {
+                    let dst_reg = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    alu_ev_gv_reg(cpu, alu_op, dst_reg, src_reg, lane);
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    alu_ev_gv_mem(cpu, ram, ram_size, alu_op, addr, src_reg, lane);
+                }
+        }
+        0x12 | 0x1A => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    read_reg8(cpu, r)
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
+                };
+                let dst = read_reg8(cpu, dst_reg);
+                let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                if alu_op != 7 { write_reg8(cpu, dst_reg, res); }
+                set_lazy(cpu, flag_op, dst as u64, res as u64);
+        }
+        0x13 | 0x1B => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    cpu.regs[r]
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    match lane {
+                        LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
+                        LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
+                        _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
+                    }
+                };
+                alu_gv_ev(cpu, alu_op, dst_reg, src, lane);
+        }
+        0x14 => {
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let lhs = cpu.regs[RAX] as u8;
+                let cf = flags::get_cf(cpu) as u8;
+                let res = lhs.wrapping_add(imm).wrapping_add(cf);
+                write_reg8_al(cpu, res);
+                set_lazy(cpu, FlagOp::AdcB, lhs as u64, res as u64);
+        }
+        0x1C => {
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let lhs = cpu.regs[RAX] as u8;
+                let cf = flags::get_cf(cpu) as u8;
+                let res = lhs.wrapping_sub(imm).wrapping_sub(cf);
+                write_reg8_al(cpu, res);
+                set_lazy(cpu, FlagOp::SbbB, lhs as u64, res as u64);
+        }
+        0x15 => {
+                let cf = flags::get_cf(cpu) as u64;
+                match lane {
+                    LANE16 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size)) as u64;
+                        let lhs = cpu.regs[RAX] & 0xFFFF;
+                        let res = (lhs.wrapping_add(imm).wrapping_add(cf)) & 0xFFFF;
+                        write_reg16(cpu, RAX, res as u16);
+                        set_lazy(cpu, FlagOp::AdcW, lhs, res);
+                    }
+                    LANE32 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64;
+                        let lhs = cpu.regs[RAX] & 0xFFFFFFFF;
+                        let res = (lhs.wrapping_add(imm).wrapping_add(cf)) & 0xFFFFFFFF;
+                        cpu.regs[RAX] = res;
+                        set_lazy(cpu, FlagOp::AdcL, lhs, res);
+                    }
+                    LANE64 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
+                        let lhs = cpu.regs[RAX];
+                        let res = lhs.wrapping_add(imm).wrapping_add(cf);
+                        cpu.regs[RAX] = res;
+                        set_lazy(cpu, FlagOp::AdcQ, lhs, res);
+                    }
+                    _ => {}
+                }
+        }
+        0x1D => {
+                let cf = flags::get_cf(cpu) as u64;
+                match lane {
+                    LANE16 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size)) as u64;
+                        let lhs = cpu.regs[RAX] & 0xFFFF;
+                        let res = (lhs.wrapping_sub(imm).wrapping_sub(cf)) & 0xFFFF;
+                        write_reg16(cpu, RAX, res as u16);
+                        set_lazy(cpu, FlagOp::SbbW, lhs, res);
+                    }
+                    LANE32 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64;
+                        let lhs = cpu.regs[RAX] & 0xFFFFFFFF;
+                        let res = (lhs.wrapping_sub(imm).wrapping_sub(cf)) & 0xFFFFFFFF;
+                        cpu.regs[RAX] = res;
+                        set_lazy(cpu, FlagOp::SbbL, lhs, res);
+                    }
+                    LANE64 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
+                        let lhs = cpu.regs[RAX];
+                        let res = lhs.wrapping_sub(imm).wrapping_sub(cf);
+                        cpu.regs[RAX] = res;
+                        set_lazy(cpu, FlagOp::SbbQ, lhs, res);
+                    }
+                    _ => {}
+                }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// Page 2: opcodes 0x20-0x2F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_2(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0x2C => {
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let lhs = cpu.regs[RAX] as u8;
                 let res = lhs.wrapping_sub(imm);
                 write_reg8_al(cpu, res);
                 set_lazy(cpu, FlagOp::SubB, lhs as u64, res as u64);
-            }
-
-            // ============================================================
-            // SUB rAX, imm (0x2D)
-            // ============================================================
-            0x2D | 0x12D | 0x22D => {
+        }
+        0x2D => {
                 match lane {
                     LANE16 => {
-                        let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size));
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size));
                         let lhs = cpu.regs[RAX] as u16;
                         let res = lhs.wrapping_sub(imm);
                         write_reg16(cpu, RAX, res);
                         set_lazy(cpu, FlagOp::SubW, lhs as u64, res as u64);
                     }
                     LANE32 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size));
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size));
                         let lhs = cpu.regs[RAX] as u32;
                         let res = lhs.wrapping_sub(imm);
                         cpu.regs[RAX] = res as u64;
                         set_lazy(cpu, FlagOp::SubL, lhs as u64, res as u64);
                     }
                     LANE64 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
                         let lhs = cpu.regs[RAX];
                         let res = lhs.wrapping_sub(imm);
                         cpu.regs[RAX] = res;
@@ -253,200 +533,545 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                     }
                     _ => {}
                 }
-            }
+        }
+        0x24 => {
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let res = (cpu.regs[RAX] as u8) & imm;
+                write_reg8_al(cpu, res);
+                set_lazy(cpu, FlagOp::AndB, 0, res as u64);
+        }
+        0x20 | 0x28 => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = read_reg8(cpu, src_reg);
+                if modrm & 0xC0 == 0xC0 {
+                    let dst_reg = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    let dst = read_reg8(cpu, dst_reg);
+                    let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                    if alu_op != 7 { write_reg8(cpu, dst_reg, res); } // CMP doesn't write
+                    set_lazy(cpu, flag_op, dst as u64, res as u64);
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    let dst = try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr));
+                    let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                    if alu_op != 7 { try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res)); }
+                    set_lazy(cpu, flag_op, dst as u64, res as u64);
+                }
+        }
+        0x21 | 0x29 => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                if modrm & 0xC0 == 0xC0 {
+                    let dst_reg = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    alu_ev_gv_reg(cpu, alu_op, dst_reg, src_reg, lane);
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    alu_ev_gv_mem(cpu, ram, ram_size, alu_op, addr, src_reg, lane);
+                }
+        }
+        0x22 | 0x2A => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    read_reg8(cpu, r)
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
+                };
+                let dst = read_reg8(cpu, dst_reg);
+                let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                if alu_op != 7 { write_reg8(cpu, dst_reg, res); }
+                set_lazy(cpu, flag_op, dst as u64, res as u64);
+        }
+        0x23 | 0x2B => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    cpu.regs[r]
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    match lane {
+                        LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
+                        LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
+                        _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
+                    }
+                };
+                alu_gv_ev(cpu, alu_op, dst_reg, src, lane);
+        }
+        0x25 => {
+                let op_byte = opcode;
+                match lane {
+                    LANE16 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size));
+                        let lhs = cpu.regs[RAX] as u16;
+                        let (res, fop) = match op_byte {
+                            0x25 => (lhs & imm, FlagOp::AndW),
+                            0x0D => (lhs | imm, FlagOp::OrW),
+                            _ => (lhs ^ imm, FlagOp::XorW),
+                        };
+                        write_reg16(cpu, RAX, res);
+                        set_lazy(cpu, fop, 0, res as u64);
+                    }
+                    LANE32 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size));
+                        let lhs = cpu.regs[RAX] as u32;
+                        let (res, fop) = match op_byte {
+                            0x25 => (lhs & imm, FlagOp::AndL),
+                            0x0D => (lhs | imm, FlagOp::OrL),
+                            _ => (lhs ^ imm, FlagOp::XorL),
+                        };
+                        cpu.regs[RAX] = res as u64;
+                        set_lazy(cpu, fop, 0, res as u64);
+                    }
+                    LANE64 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
+                        let lhs = cpu.regs[RAX];
+                        let (res, fop) = match op_byte {
+                            0x25 => (lhs & imm, FlagOp::AndQ),
+                            0x0D => (lhs | imm, FlagOp::OrQ),
+                            _ => (lhs ^ imm, FlagOp::XorQ),
+                        };
+                        cpu.regs[RAX] = res;
+                        set_lazy(cpu, fop, 0, res);
+                    }
+                    _ => {}
+                }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // CMP AL, imm8 (0x3C)
-            // ============================================================
-            0x3C | 0x13C | 0x23C => {
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+// ============================================================
+// Page 3: opcodes 0x30-0x3F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_3(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0x3C => {
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let lhs = cpu.regs[RAX] as u8;
                 let res = lhs.wrapping_sub(imm);
                 set_lazy(cpu, FlagOp::SubB, lhs as u64, res as u64);
-            }
-
-            // ============================================================
-            // CMP rAX, imm (0x3D)
-            // ============================================================
-            0x3D | 0x13D | 0x23D => {
+        }
+        0x3D => {
                 match lane {
                     LANE16 => {
-                        let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size));
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size));
                         let lhs = cpu.regs[RAX] as u16;
                         let res = lhs.wrapping_sub(imm);
                         set_lazy(cpu, FlagOp::SubW, lhs as u64, res as u64);
                     }
                     LANE32 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size));
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size));
                         let lhs = cpu.regs[RAX] as u32;
                         let res = lhs.wrapping_sub(imm);
                         set_lazy(cpu, FlagOp::SubL, lhs as u64, res as u64);
                     }
                     LANE64 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
                         let lhs = cpu.regs[RAX];
                         let res = lhs.wrapping_sub(imm);
                         set_lazy(cpu, FlagOp::SubQ, lhs, res);
                     }
                     _ => {}
                 }
-            }
-
-            // ============================================================
-            // AND AL, imm8 (0x24)
-            // ============================================================
-            0x24 | 0x124 | 0x224 => {
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let res = (cpu.regs[RAX] as u8) & imm;
-                write_reg8_al(cpu, res);
-                set_lazy(cpu, FlagOp::AndB, 0, res as u64);
-            }
-
-            // ============================================================
-            // OR AL, imm8 (0x0C)
-            // ============================================================
-            0x0C | 0x10C | 0x20C => {
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let res = (cpu.regs[RAX] as u8) | imm;
-                write_reg8_al(cpu, res);
-                set_lazy(cpu, FlagOp::OrB, 0, res as u64);
-            }
-
-            // ============================================================
-            // XOR AL, imm8 (0x34)
-            // ============================================================
-            0x34 | 0x134 | 0x234 => {
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0x34 => {
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let res = (cpu.regs[RAX] as u8) ^ imm;
                 write_reg8_al(cpu, res);
                 set_lazy(cpu, FlagOp::XorB, 0, res as u64);
-            }
+        }
+        0x30 | 0x38 => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = read_reg8(cpu, src_reg);
+                if modrm & 0xC0 == 0xC0 {
+                    let dst_reg = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    let dst = read_reg8(cpu, dst_reg);
+                    let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                    if alu_op != 7 { write_reg8(cpu, dst_reg, res); } // CMP doesn't write
+                    set_lazy(cpu, flag_op, dst as u64, res as u64);
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    let dst = try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr));
+                    let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                    if alu_op != 7 { try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res)); }
+                    set_lazy(cpu, flag_op, dst as u64, res as u64);
+                }
+        }
+        0x31 | 0x39 => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                if modrm & 0xC0 == 0xC0 {
+                    let dst_reg = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    alu_ev_gv_reg(cpu, alu_op, dst_reg, src_reg, lane);
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    alu_ev_gv_mem(cpu, ram, ram_size, alu_op, addr, src_reg, lane);
+                }
+        }
+        0x32 | 0x3A => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    read_reg8(cpu, r)
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
+                };
+                let dst = read_reg8(cpu, dst_reg);
+                let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
+                if alu_op != 7 { write_reg8(cpu, dst_reg, res); }
+                set_lazy(cpu, flag_op, dst as u64, res as u64);
+        }
+        0x33 | 0x3B => {
+                let alu_op = ((opcode >> 3) & 7) as usize;
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    cpu.regs[r]
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    match lane {
+                        LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
+                        LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
+                        _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
+                    }
+                };
+                alu_gv_ev(cpu, alu_op, dst_reg, src, lane);
+        }
+        0x35 => {
+                let op_byte = opcode;
+                match lane {
+                    LANE16 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size));
+                        let lhs = cpu.regs[RAX] as u16;
+                        let (res, fop) = match op_byte {
+                            0x25 => (lhs & imm, FlagOp::AndW),
+                            0x0D => (lhs | imm, FlagOp::OrW),
+                            _ => (lhs ^ imm, FlagOp::XorW),
+                        };
+                        write_reg16(cpu, RAX, res);
+                        set_lazy(cpu, fop, 0, res as u64);
+                    }
+                    LANE32 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size));
+                        let lhs = cpu.regs[RAX] as u32;
+                        let (res, fop) = match op_byte {
+                            0x25 => (lhs & imm, FlagOp::AndL),
+                            0x0D => (lhs | imm, FlagOp::OrL),
+                            _ => (lhs ^ imm, FlagOp::XorL),
+                        };
+                        cpu.regs[RAX] = res as u64;
+                        set_lazy(cpu, fop, 0, res as u64);
+                    }
+                    LANE64 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
+                        let lhs = cpu.regs[RAX];
+                        let (res, fop) = match op_byte {
+                            0x25 => (lhs & imm, FlagOp::AndQ),
+                            0x0D => (lhs | imm, FlagOp::OrQ),
+                            _ => (lhs ^ imm, FlagOp::XorQ),
+                        };
+                        cpu.regs[RAX] = res;
+                        set_lazy(cpu, fop, 0, res);
+                    }
+                    _ => {}
+                }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // TEST AL, imm8 (0xA8)
-            // ============================================================
-            0xA8 | 0x1A8 | 0x2A8 => {
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let res = (cpu.regs[RAX] as u8) & imm;
-                set_lazy(cpu, FlagOp::AndB, 0, res as u64);
-            }
+// ============================================================
+// Page 4: opcodes 0x40-0x4F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_4(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // PUSH r16/32/64 (0x50-0x57)
-            // ============================================================
-            0x50 | 0x150 | 0x250 | 0x51 | 0x151 | 0x251 | 0x52 | 0x152 | 0x252 | 0x53 | 0x153 | 0x253 | 0x54 | 0x154 | 0x254 | 0x55 | 0x155 | 0x255 | 0x56 | 0x156 | 0x256 | 0x57 | 0x157 | 0x257 => {
+// ============================================================
+// Page 5: opcodes 0x50-0x5F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_5(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0x50..=0x57 => {
                 let reg = ((opcode - 0x50) & 7) as usize
                     | ((cpu.prefix.rex as usize & 1) << 3);
                 let val = cpu.regs[reg];
                 if cpu.long_mode {
                     cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
-                    try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], val));
+                    try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], val));
                 } else {
                     cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
-                    try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], val as u32));
+                    try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], val as u32));
                 }
-            }
-
-            // ============================================================
-            // POP r16/32/64 (0x58-0x5F)
-            // ============================================================
-            0x58 | 0x158 | 0x258 | 0x59 | 0x159 | 0x259 | 0x5A | 0x15A | 0x25A | 0x5B | 0x15B | 0x25B | 0x5C | 0x15C | 0x25C | 0x5D | 0x15D | 0x25D | 0x5E | 0x15E | 0x25E | 0x5F | 0x15F | 0x25F => {
+        }
+        0x58..=0x5F => {
                 let reg = ((opcode - 0x58) & 7) as usize
                     | ((cpu.prefix.rex as usize & 1) << 3);
                 if cpu.long_mode {
-                    let val = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
+                    let val = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
                     cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
                     cpu.regs[reg] = val;
                 } else {
-                    let val = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
+                    let val = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
                     cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
                     cpu.regs[reg] = val as u64;
                 }
-            }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // CALL rel32 (0xE8)
-            // ============================================================
-            0xE8 | 0x1E8 | 0x2E8 => {
-                let rel = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32;
-                let ret_addr = cpu.rip;
+// ============================================================
+// Page 6: opcodes 0x60-0x6F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_6(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0x63 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let dst_reg = ((modrm >> 3) & 7) as usize
+                    | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let val = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize
+                        | ((cpu.prefix.rex as usize & 1) << 3);
+                    cpu.regs[r] as u32
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr))
+                };
+                cpu.regs[dst_reg] = val as i32 as i64 as u64;
+        }
+        0x69 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    cpu.regs[r]
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    match lane {
+                        LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
+                        LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
+                        _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
+                    }
+                };
+                match lane {
+                    LANE16 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size)) as i16 as i32;
+                        let res = (src as i16 as i32).wrapping_mul(imm);
+                        write_reg16(cpu, dst_reg, res as u16);
+                        let overflow = res != res as i16 as i32;
+                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
+                        cpu.lazy.op = FlagOp::External;
+                    }
+                    LANE32 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as i64;
+                        let res = (src as i32 as i64).wrapping_mul(imm);
+                        cpu.regs[dst_reg] = res as u32 as u64;
+                        let overflow = res != res as i32 as i64;
+                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
+                        cpu.lazy.op = FlagOp::External;
+                    }
+                    _ => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as i64;
+                        let res = (src as i64 as i128).wrapping_mul(imm as i128);
+                        cpu.regs[dst_reg] = res as u64;
+                        let overflow = res != res as i64 as i128;
+                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
+                        cpu.lazy.op = FlagOp::External;
+                    }
+                }
+        }
+        0x6B => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let src = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    cpu.regs[r]
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    match lane {
+                        LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
+                        LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
+                        _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
+                    }
+                };
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
+                match lane {
+                    LANE16 => {
+                        let res = (src as i16 as i32).wrapping_mul(imm as i32);
+                        write_reg16(cpu, dst_reg, res as u16);
+                        let overflow = res != res as i16 as i32;
+                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
+                    }
+                    LANE32 => {
+                        let res = (src as i32 as i64).wrapping_mul(imm as i64);
+                        cpu.regs[dst_reg] = res as u32 as u64;
+                        let overflow = res != res as i32 as i64;
+                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
+                    }
+                    _ => {
+                        let res = (src as i64 as i128).wrapping_mul(imm as i128);
+                        cpu.regs[dst_reg] = res as u64;
+                        let overflow = res != res as i64 as i128;
+                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
+                    }
+                }
+                cpu.lazy.op = FlagOp::External;
+        }
+        0x6A => {
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8 as i64 as u64;
                 if cpu.long_mode {
                     cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
-                    try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], ret_addr));
-                    cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
+                    try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], imm));
                 } else {
                     cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
-                    try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], ret_addr as u32));
-                    cpu.rip = (cpu.rip.wrapping_add(rel as i64 as u64)) & 0xFFFFFFFF;
+                    try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], imm as u32));
                 }
-            }
-
-            // ============================================================
-            // RET near (0xC3)
-            // ============================================================
-            0xC3 | 0x1C3 | 0x2C3 => {
-                if cpu.long_mode {
-                    let addr = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
-                    cpu.rip = addr;
+        }
+        0x68 => {
+                match lane {
+                    LANE16 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size)) as u64;
+                        cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(2);
+                        try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, cpu.regs[RSP], imm as u16));
+                    }
+                    _ => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as i64 as u64;
+                        if cpu.long_mode {
+                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
+                            try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], imm));
+                        } else {
+                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
+                            try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], imm as u32));
+                        }
+                    }
+                }
+        }
+        0x6C => {
+                // INSB: read byte from port DX, store to [RDI]
+                let port = cpu.regs[RDX] as u16;
+                let val = crate::pic::io_read(cpu, ram, ram_size, port, 1) as u8;
+                try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, cpu.regs[RDI], val));
+                let df = (cpu.rflags & DF) != 0;
+                if df { cpu.regs[RDI] = cpu.regs[RDI].wrapping_sub(1); }
+                else { cpu.regs[RDI] = cpu.regs[RDI].wrapping_add(1); }
+        }
+        0x6D => {
+                // INSW/D: read word/dword from port DX, store to [RDI]
+                let port = cpu.regs[RDX] as u16;
+                let size = if lane == LANE16 { 2u8 } else { 4u8 };
+                let val = crate::pic::io_read(cpu, ram, ram_size, port, size);
+                if lane == LANE16 {
+                    try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, cpu.regs[RDI], val as u16));
+                    let df = (cpu.rflags & DF) != 0;
+                    if df { cpu.regs[RDI] = cpu.regs[RDI].wrapping_sub(2); }
+                    else { cpu.regs[RDI] = cpu.regs[RDI].wrapping_add(2); }
                 } else {
-                    let addr = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
-                    cpu.rip = addr as u64;
+                    try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RDI], val));
+                    let df = (cpu.rflags & DF) != 0;
+                    if df { cpu.regs[RDI] = cpu.regs[RDI].wrapping_sub(4); }
+                    else { cpu.regs[RDI] = cpu.regs[RDI].wrapping_add(4); }
                 }
-            }
-
-            // ============================================================
-            // JMP rel8 (0xEB)
-            // ============================================================
-            0xEB | 0x1EB | 0x2EB => {
-                let rel = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
-                cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
-            }
-
-            // ============================================================
-            // JMP rel32 (0xE9)
-            // ============================================================
-            0xE9 | 0x1E9 | 0x2E9 => {
-                let rel = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32;
-                cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
-                if !cpu.long_mode {
-                    cpu.rip &= 0xFFFFFFFF;
+        }
+        0x6E => {
+                // OUTSB: read byte from [RSI], write to port DX
+                let port = cpu.regs[RDX] as u16;
+                let val = try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, cpu.regs[RSI]));
+                crate::pic::io_write(cpu, ram, ram_size, port, val as u32, 1);
+                let df = (cpu.rflags & DF) != 0;
+                if df { cpu.regs[RSI] = cpu.regs[RSI].wrapping_sub(1); }
+                else { cpu.regs[RSI] = cpu.regs[RSI].wrapping_add(1); }
+        }
+        0x6F => {
+                // OUTSW/D: read word/dword from [RSI], write to port DX
+                let port = cpu.regs[RDX] as u16;
+                if lane == LANE16 {
+                    let val = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, cpu.regs[RSI]));
+                    crate::pic::io_write(cpu, ram, ram_size, port, val as u32, 2);
+                    let df = (cpu.rflags & DF) != 0;
+                    if df { cpu.regs[RSI] = cpu.regs[RSI].wrapping_sub(2); }
+                    else { cpu.regs[RSI] = cpu.regs[RSI].wrapping_add(2); }
+                } else {
+                    let val = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSI]));
+                    crate::pic::io_write(cpu, ram, ram_size, port, val, 4);
+                    let df = (cpu.rflags & DF) != 0;
+                    if df { cpu.regs[RSI] = cpu.regs[RSI].wrapping_sub(4); }
+                    else { cpu.regs[RSI] = cpu.regs[RSI].wrapping_add(4); }
                 }
-            }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // Jcc rel8 (0x70-0x7F)
-            // ============================================================
-            0x70 | 0x170 | 0x270 | 0x71 | 0x171 | 0x271 | 0x72 | 0x172 | 0x272 | 0x73 | 0x173 | 0x273 | 0x74 | 0x174 | 0x274 | 0x75 | 0x175 | 0x275 | 0x76 | 0x176 | 0x276 | 0x77 | 0x177 | 0x277 | 0x78 | 0x178 | 0x278 | 0x79 | 0x179 | 0x279 | 0x7A | 0x17A | 0x27A | 0x7B | 0x17B | 0x27B | 0x7C | 0x17C | 0x27C | 0x7D | 0x17D | 0x27D | 0x7E | 0x17E | 0x27E | 0x7F | 0x17F | 0x27F => {
+// ============================================================
+// Page 7: opcodes 0x70-0x7F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_7(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0x70..=0x7F => {
                 let cc = (opcode & 0x0F) as u8;
-                let rel = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
+                let rel = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
                 if eval_cc(cpu, cc) {
                     cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
                 }
-            }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // LEA r, m (0x8D) — load effective address
-            // ============================================================
-            0x8D | 0x18D | 0x28D => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+// ============================================================
+// Page 8: opcodes 0x80-0x8F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_8(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0x8D => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let reg = ((modrm >> 3) & 7) as usize
                     | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
                 match lane {
                     LANE16 => write_reg16(cpu, reg, addr as u16),
                     LANE32 => cpu.regs[reg] = addr as u32 as u64,
                     LANE64 => cpu.regs[reg] = addr,
                     _ => {}
                 }
-            }
-
-            // ============================================================
-            // MOV r/m8, r8 (0x88)
-            // ============================================================
-            0x88 | 0x188 | 0x288 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0x88 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let src_reg = ((modrm >> 3) & 7) as usize
                     | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
                 let val = read_reg8(cpu, src_reg);
@@ -455,16 +1080,12 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                         | ((cpu.prefix.rex as usize & 1) << 3);
                     write_reg8(cpu, dst_reg, val);
                 } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, val));
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, val));
                 }
-            }
-
-            // ============================================================
-            // MOV r/m16/32/64, r (0x89)
-            // ============================================================
-            0x89 | 0x189 | 0x289 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0x89 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let src_reg = ((modrm >> 3) & 7) as usize
                     | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
                 let val = cpu.regs[src_reg];
@@ -478,21 +1099,17 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                         _ => {}
                     }
                 } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
                     match lane {
-                        LANE16 => try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, addr, val as u16)),
-                        LANE32 => try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr, val as u32)),
-                        LANE64 => try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, val)),
+                        LANE16 => try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, addr, val as u16)),
+                        LANE32 => try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr, val as u32)),
+                        LANE64 => try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, val)),
                         _ => {}
                     }
                 }
-            }
-
-            // ============================================================
-            // MOV r8, r/m8 (0x8A)
-            // ============================================================
-            0x8A | 0x18A | 0x28A => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0x8A => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let dst_reg = ((modrm >> 3) & 7) as usize
                     | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
                 let val = if modrm & 0xC0 == 0xC0 {
@@ -500,17 +1117,13 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                         | ((cpu.prefix.rex as usize & 1) << 3);
                     read_reg8(cpu, src_reg)
                 } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
                 };
                 write_reg8(cpu, dst_reg, val);
-            }
-
-            // ============================================================
-            // MOV r16/32/64, r/m (0x8B)
-            // ============================================================
-            0x8B | 0x18B | 0x28B => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0x8B => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let dst_reg = ((modrm >> 3) & 7) as usize
                     | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
                 if modrm & 0xC0 == 0xC0 {
@@ -523,90 +1136,231 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                         _ => {}
                     }
                 } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
                     match lane {
                         LANE16 => {
-                            let v = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
+                            let v = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
                             write_reg16(cpu, dst_reg, v);
                         }
                         LANE32 => {
-                            let v = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
+                            let v = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
                             cpu.regs[dst_reg] = v as u64;
                         }
                         LANE64 => {
-                            let v = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
+                            let v = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
                             cpu.regs[dst_reg] = v;
                         }
                         _ => {}
                     }
                 }
-            }
-
-            // ============================================================
-            // MOV r/m, imm8 (0xC6) — GRP11
-            // ============================================================
-            0xC6 | 0x1C6 | 0x2C6 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                // reg field must be 0 for MOV
-                if modrm & 0xC0 == 0xC0 {
-                    let dst_reg = (modrm & 7) as usize
-                        | ((cpu.prefix.rex as usize & 1) << 3);
-                    let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                    write_reg8(cpu, dst_reg, imm);
+        }
+        0x84 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let src = read_reg8(cpu, ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3);
+                let dst = if modrm & 0xC0 == 0xC0 {
+                    read_reg8(cpu, (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3))
                 } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                    try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, imm));
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
+                };
+                set_lazy(cpu, FlagOp::AndB, 0, (dst & src) as u64);
+        }
+        0x85 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                let (dst, res_fop) = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    (cpu.regs[r], 0u8)
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    let v = match lane {
+                        LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
+                        LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
+                        _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
+                    };
+                    (v, 0u8)
+                };
+                let _ = res_fop;
+                let src = cpu.regs[src_reg];
+                match lane {
+                    LANE16 => set_lazy(cpu, FlagOp::AndW, 0, (dst as u16 & src as u16) as u64),
+                    LANE32 => set_lazy(cpu, FlagOp::AndL, 0, (dst as u32 & src as u32) as u64),
+                    _ => set_lazy(cpu, FlagOp::AndQ, 0, dst & src),
                 }
-            }
-
-            // ============================================================
-            // MOV r/m, imm16/32/64 (0xC7) — GRP11
-            // ============================================================
-            0xC7 | 0x1C7 | 0x2C7 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0x86 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
                 if modrm & 0xC0 == 0xC0 {
-                    let dst_reg = (modrm & 7) as usize
-                        | ((cpu.prefix.rex as usize & 1) << 3);
+                    let rm = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    let a = read_reg8(cpu, reg);
+                    let b = read_reg8(cpu, rm);
+                    write_reg8(cpu, reg, b);
+                    write_reg8(cpu, rm, a);
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    let mem_val = try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr));
+                    let reg_val = read_reg8(cpu, reg);
+                    write_reg8(cpu, reg, mem_val);
+                    try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, reg_val));
+                }
+        }
+        0x87 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                if modrm & 0xC0 == 0xC0 {
+                    let rm = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    let a = cpu.regs[reg];
+                    let b = cpu.regs[rm];
                     match lane {
-                        LANE16 => {
-                            let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size));
-                            write_reg16(cpu, dst_reg, imm);
-                        }
-                        LANE32 => {
-                            let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size));
-                            cpu.regs[dst_reg] = imm as u64;
-                        }
-                        LANE64 => {
-                            let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
-                            cpu.regs[dst_reg] = imm;
-                        }
-                        _ => {}
+                        LANE16 => { write_reg16(cpu, reg, b as u16); write_reg16(cpu, rm, a as u16); }
+                        LANE32 => { cpu.regs[reg] = b as u32 as u64; cpu.regs[rm] = a as u32 as u64; }
+                        _ => { cpu.regs[reg] = b; cpu.regs[rm] = a; }
                     }
                 } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
                     match lane {
                         LANE16 => {
-                            let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size));
-                            try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, addr, imm));
+                            let v = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
+                            try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, addr, cpu.regs[reg] as u16));
+                            write_reg16(cpu, reg, v);
                         }
                         LANE32 => {
-                            let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size));
-                            try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr, imm));
+                            let v = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
+                            try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.regs[reg] as u32));
+                            cpu.regs[reg] = v as u64;
                         }
-                        LANE64 => {
-                            let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u32;
-                            try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, imm as i32 as u64));
+                        _ => {
+                            let v = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
+                            try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.regs[reg]));
+                            cpu.regs[reg] = v;
                         }
-                        _ => {}
                     }
                 }
-            }
+        }
+        0x80 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let alu_op = ((modrm >> 3) & 7) as usize;
+                let (dst, addr) = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    (read_reg8(cpu, r), 0u64)
+                } else {
+                    let a = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    (try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, a)), a)
+                };
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let (res, flag_op) = alu_op_b(cpu, alu_op, dst, imm);
+                if alu_op != 7 { // not CMP
+                    if modrm & 0xC0 == 0xC0 {
+                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                        write_reg8(cpu, r, res);
+                    } else {
+                        try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res));
+                    }
+                }
+                set_lazy(cpu, flag_op, dst as u64, res as u64);
+        }
+        0x81 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let alu_op = ((modrm >> 3) & 7) as usize;
+                grp1_ev_imm(cpu, ram, ram_size, modrm, alu_op, lane, false);
+        }
+        0x82 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let alu_op = ((modrm >> 3) & 7) as usize;
+                let (dst, addr) = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    (read_reg8(cpu, r), 0u64)
+                } else {
+                    let a = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    (try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, a)), a)
+                };
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let (res, flag_op) = alu_op_b(cpu, alu_op, dst, imm);
+                if alu_op != 7 {
+                    if modrm & 0xC0 == 0xC0 {
+                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                        write_reg8(cpu, r, res);
+                    } else {
+                        try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res));
+                    }
+                }
+                set_lazy(cpu, flag_op, dst as u64, res as u64);
+        }
+        0x83 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let alu_op = ((modrm >> 3) & 7) as usize;
+                grp1_ev_imm(cpu, ram, ram_size, modrm, alu_op, lane, true);
+        }
+        0x8C => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let seg = ((modrm >> 3) & 7) as usize;
+                let val = if seg < 6 { cpu.segs[seg].selector } else { 0 };
+                if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    write_reg16(cpu, r, val);
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, addr, val));
+                }
+        }
+        0x8E => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let seg = ((modrm >> 3) & 7) as usize;
+                let val = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    cpu.regs[r] as u16
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
+                };
+                if seg < 6 {
+                    cpu.segs[seg].selector = val;
+                    // In long mode, only FS/GS base matters; others are effectively flat
+                }
+        }
+        0x8F => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let reg_field = (modrm >> 3) & 7;
+                if reg_field != 0 { raise_exception(cpu, EXC_UD, 0); return true; }
+                if cpu.long_mode {
+                    let val = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
+                    if modrm & 0xC0 == 0xC0 {
+                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                        cpu.regs[r] = val;
+                    } else {
+                        let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                        try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, val));
+                    }
+                } else {
+                    let val = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
+                    if modrm & 0xC0 == 0xC0 {
+                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                        cpu.regs[r] = val as u64;
+                    } else {
+                        let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                        try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr, val));
+                    }
+                }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // XCHG rAX, r (0x91-0x97 — 0x90 is NOP)
-            // ============================================================
-            0x91 | 0x191 | 0x291 | 0x92 | 0x192 | 0x292 | 0x93 | 0x193 | 0x293 | 0x94 | 0x194 | 0x294 | 0x95 | 0x195 | 0x295 | 0x96 | 0x196 | 0x296 | 0x97 | 0x197 | 0x297 => {
+// ============================================================
+// Page 9: opcodes 0x90-0x9F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_9(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0x90 => {
+                // NOP — do nothing (also XCHG EAX,EAX in 32-bit which is NOP)
+        }
+        0x91..=0x97 => {
                 let reg = ((opcode - 0x90) & 7) as usize
                     | ((cpu.prefix.rex as usize & 1) << 3);
                 let tmp = cpu.regs[RAX];
@@ -625,1827 +1379,341 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                     }
                     _ => {}
                 }
-            }
-
-            // ============================================================
-            // CLC (0xF8), STC (0xF9), CMC (0xF5)
-            // ============================================================
-            0xF8 | 0x1F8 | 0x2F8 => {
+        }
+        0x98 => {
+                match lane {
+                    LANE16 => {
+                        // CBW: AL -> AX (sign extend)
+                        let val = cpu.regs[RAX] as u8 as i8 as i16 as u16;
+                        write_reg16(cpu, RAX, val);
+                    }
+                    LANE32 => {
+                        // CWDE: AX -> EAX
+                        let val = cpu.regs[RAX] as u16 as i16 as i32 as u32;
+                        cpu.regs[RAX] = val as u64;
+                    }
+                    LANE64 => {
+                        // CDQE: EAX -> RAX
+                        let val = cpu.regs[RAX] as u32 as i32 as i64 as u64;
+                        cpu.regs[RAX] = val;
+                    }
+                    _ => {}
+                }
+        }
+        0x99 => {
+                match lane {
+                    LANE16 => {
+                        // CWD: AX -> DX:AX
+                        let val = cpu.regs[RAX] as i16;
+                        write_reg16(cpu, RDX, if val < 0 { 0xFFFF } else { 0 });
+                    }
+                    LANE32 => {
+                        // CDQ: EAX -> EDX:EAX
+                        let val = cpu.regs[RAX] as i32;
+                        cpu.regs[RDX] = if val < 0 { 0xFFFFFFFF } else { 0 };
+                    }
+                    LANE64 => {
+                        // CQO: RAX -> RDX:RAX
+                        let val = cpu.regs[RAX] as i64;
+                        cpu.regs[RDX] = if val < 0 { !0u64 } else { 0 };
+                    }
+                    _ => {}
+                }
+        }
+        0x9C => {
                 materialize_flags(cpu);
-                cpu.rflags &= !CF;
-                cpu.lazy.op = FlagOp::External;
-            }
-            0xF9 | 0x1F9 | 0x2F9 => {
-                materialize_flags(cpu);
-                cpu.rflags |= CF;
-                cpu.lazy.op = FlagOp::External;
-            }
-            0xF5 | 0x1F5 | 0x2F5 => {
-                materialize_flags(cpu);
-                cpu.rflags ^= CF;
-                cpu.lazy.op = FlagOp::External;
-            }
-
-            // ============================================================
-            // CLD (0xFC), STD (0xFD)
-            // ============================================================
-            0xFC | 0x1FC | 0x2FC => { cpu.rflags &= !DF; }
-            0xFD | 0x1FD | 0x2FD => { cpu.rflags |= DF; }
-
-            // ============================================================
-            // CLI (0xFA), STI (0xFB)
-            // ============================================================
-            0xFA | 0x1FA | 0x2FA => { cpu.rflags &= !IF; }
-            0xFB | 0x1FB | 0x2FB => {
-                cpu.rflags |= IF;
-                cpu.inhibit_irq = true; // delay interrupt by one instruction
-            }
-
-            // ============================================================
-            // HLT (0xF4)
-            // ============================================================
-            0xF4 | 0x1F4 | 0x2F4 => {
-                if cpu.cpl != 0 {
-                    raise_exception(cpu, EXC_GP, 0);
+                let flags = cpu.rflags & 0x00000000003F7FD5; // mask off reserved bits
+                if cpu.long_mode {
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
+                    try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], flags));
                 } else {
-                    cpu.halted = true;
-                    return budget;
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
+                    try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], flags as u32));
                 }
-            }
+        }
+        0x9D => {
+                let flags = if cpu.long_mode {
+                    let v = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
+                    v
+                } else {
+                    let v = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
+                    v as u64
+                };
+                let mask = CF | PF | AF | ZF | SF | TF | IF | DF | OF | AC;
+                cpu.rflags = (cpu.rflags & !mask) | (flags & mask) | 0x02;
+                cpu.lazy.op = FlagOp::External;
+        }
+        0x9E => {
+                // SAHF: AH → lower 8 bits of EFLAGS
+                let ah = (cpu.regs[RAX] >> 8) as u8;
+                cpu.rflags = (cpu.rflags & !0xFF) | (ah as u64 & (CF | PF | AF | ZF | SF)) | 0x02;
+                cpu.lazy.op = FlagOp::External;
+        }
+        0x9F => {
+                // LAHF: lower 8 bits of EFLAGS → AH
+                materialize_flags(cpu);
+                let ah = (cpu.rflags & 0xFF) as u8;
+                cpu.regs[RAX] = (cpu.regs[RAX] & !0xFF00) | ((ah as u64) << 8);
+        }
+        0x9B => {}
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // CPUID (0x0F 0xA2) — handle via two-byte opcode
-            // Two-byte opcodes start with 0x0F
-            // ============================================================
-            0x0F | 0x10F | 0x20F => {
-                let op2 = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                match op2 {
-                    // Jcc rel32 (0x0F 0x80-0x8F)
-                    0x80..=0x8F => {
-                        let cc = (op2 & 0x0F) as u8;
-                        let rel = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32;
-                        if eval_cc(cpu, cc) {
-                            cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
-                            if !cpu.long_mode {
-                                cpu.rip &= 0xFFFFFFFF;
-                            }
-                        }
+// ============================================================
+// Page A: opcodes 0xA0-0xAF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_a(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0xA8 => {
+                let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let res = (cpu.regs[RAX] as u8) & imm;
+                set_lazy(cpu, FlagOp::AndB, 0, res as u64);
+        }
+        0xA9 => {
+                match lane {
+                    LANE16 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size));
+                        let res = cpu.regs[RAX] as u16 & imm;
+                        set_lazy(cpu, FlagOp::AndW, 0, res as u64);
+                    }
+                    LANE32 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size));
+                        let res = cpu.regs[RAX] as u32 & imm;
+                        set_lazy(cpu, FlagOp::AndL, 0, res as u64);
+                    }
+                    LANE64 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
+                        let res = cpu.regs[RAX] & imm;
+                        set_lazy(cpu, FlagOp::AndQ, 0, res);
+                    }
+                    _ => {}
+                }
+        }
+        0xA0 => {
+                let addr = if cpu.long_mode && !cpu.prefix.addr_size {
+                    try_or_fault_page!(cpu, fetch_imm64(cpu, ram, ram_size))
+                } else {
+                    try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64
+                };
+                let val = try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr));
+                write_reg8_al(cpu, val);
+        }
+        0xA1 => {
+                let addr = if cpu.long_mode && !cpu.prefix.addr_size {
+                    try_or_fault_page!(cpu, fetch_imm64(cpu, ram, ram_size))
+                } else {
+                    try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64
+                };
+                match lane {
+                    LANE16 => {
+                        let v = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
+                        write_reg16(cpu, RAX, v);
+                    }
+                    LANE32 => {
+                        let v = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
+                        cpu.regs[RAX] = v as u64;
                     }
-                    // SETcc r/m8 (0x0F 0x90-0x9F)
-                    0x90..=0x9F => {
-                        let cc = (op2 & 0x0F) as u8;
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let val = if eval_cc(cpu, cc) { 1u8 } else { 0u8 };
-                        if modrm & 0xC0 == 0xC0 {
-                            let reg = (modrm & 7) as usize
-                                | ((cpu.prefix.rex as usize & 1) << 3);
-                            write_reg8(cpu, reg, val);
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, val));
-                        }
-                    }
-                    // CMOVcc (0x0F 0x40-0x4F)
-                    0x40..=0x4F => {
-                        let cc = (op2 & 0x0F) as u8;
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst_reg = ((modrm >> 3) & 7) as usize
-                            | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let src_val = if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize
-                                | ((cpu.prefix.rex as usize & 1) << 3);
-                            cpu.regs[r]
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            match lane {
-                                LANE16 => try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
-                                LANE32 => try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
-                                _ => try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
-                            }
-                        };
-                        if eval_cc(cpu, cc) {
-                            match lane {
-                                LANE16 => write_reg16(cpu, dst_reg, src_val as u16),
-                                LANE32 => cpu.regs[dst_reg] = src_val as u32 as u64,
-                                LANE64 => cpu.regs[dst_reg] = src_val,
-                                _ => {}
-                            }
-                        }
-                    }
-                    // MOVZX r, r/m8 (0x0F 0xB6)
-                    0xB6 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst_reg = ((modrm >> 3) & 7) as usize
-                            | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let val = if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize
-                                | ((cpu.prefix.rex as usize & 1) << 3);
-                            read_reg8(cpu, r)
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
-                        };
-                        match lane {
-                            LANE16 => write_reg16(cpu, dst_reg, val as u16),
-                            _ => cpu.regs[dst_reg] = val as u64,
-                        }
-                    }
-                    // MOVZX r, r/m16 (0x0F 0xB7)
-                    0xB7 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst_reg = ((modrm >> 3) & 7) as usize
-                            | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let val = if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize
-                                | ((cpu.prefix.rex as usize & 1) << 3);
-                            cpu.regs[r] as u16
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
-                        };
-                        match lane {
-                            LANE16 => write_reg16(cpu, dst_reg, val),
-                            _ => cpu.regs[dst_reg] = val as u64,
-                        }
-                    }
-                    // MOVSX r, r/m8 (0x0F 0xBE)
-                    0xBE => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst_reg = ((modrm >> 3) & 7) as usize
-                            | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let val = if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize
-                                | ((cpu.prefix.rex as usize & 1) << 3);
-                            read_reg8(cpu, r)
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
-                        };
-                        match lane {
-                            LANE16 => write_reg16(cpu, dst_reg, val as i8 as u16),
-                            LANE32 => cpu.regs[dst_reg] = val as i8 as i32 as u32 as u64,
-                            LANE64 => cpu.regs[dst_reg] = val as i8 as i64 as u64,
-                            _ => {}
-                        }
-                    }
-                    // MOVSX r, r/m16 (0x0F 0xBF)
-                    0xBF => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst_reg = ((modrm >> 3) & 7) as usize
-                            | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let val = if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize
-                                | ((cpu.prefix.rex as usize & 1) << 3);
-                            cpu.regs[r] as u16
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
-                        };
-                        match lane {
-                            LANE16 => write_reg16(cpu, dst_reg, val),
-                            LANE32 => cpu.regs[dst_reg] = val as i16 as i32 as u32 as u64,
-                            LANE64 => cpu.regs[dst_reg] = val as i16 as i64 as u64,
-                            _ => {}
-                        }
-                    }
-                    // CPUID (0x0F 0xA2)
-                    0xA2 => {
-                        handle_cpuid(cpu);
-                    }
-                    // RDTSC (0x0F 0x31)
-                    0x31 => {
-                        let tsc = cpu.tsc;
-                        cpu.regs[RAX] = tsc & 0xFFFFFFFF;
-                        cpu.regs[RDX] = (tsc >> 32) & 0xFFFFFFFF;
-                        cpu.tsc += 100; // approximate increment
-                    }
-                    // WRMSR (0x0F 0x30)
-                    0x30 => {
-                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); continue; }
-                        let ecx = cpu.regs[RCX] as u32;
-                        let val = (cpu.regs[RDX] << 32) | (cpu.regs[RAX] & 0xFFFFFFFF);
-                        handle_wrmsr(cpu, ecx, val);
-                    }
-                    // RDMSR (0x0F 0x32)
-                    0x32 => {
-                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); continue; }
-                        let ecx = cpu.regs[RCX] as u32;
-                        let val = handle_rdmsr(cpu, ecx);
-                        cpu.regs[RAX] = val & 0xFFFFFFFF;
-                        cpu.regs[RDX] = (val >> 32) & 0xFFFFFFFF;
-                    }
-                    // SLDT/STR/LLDT/LTR (0x0F 0x00 /0-3)
-                    0x00 => {
-                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); continue; }
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let reg_field = (modrm >> 3) & 7;
-                        match reg_field {
-                            0 => {
-                                // SLDT — store LDT selector
-                                let val = cpu.ldt.selector;
-                                if modrm & 0xC0 == 0xC0 {
-                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                    cpu.regs[r] = val as u64;
-                                } else {
-                                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                    try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, addr, val));
-                                }
-                            }
-                            1 => {
-                                // STR — store task register selector
-                                let val = cpu.tr.selector;
-                                if modrm & 0xC0 == 0xC0 {
-                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                    cpu.regs[r] = val as u64;
-                                } else {
-                                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                    try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, addr, val));
-                                }
-                            }
-                            2 => {
-                                // LLDT — load LDT from selector
-                                let sel = if modrm & 0xC0 == 0xC0 {
-                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                    cpu.regs[r] as u16
-                                } else {
-                                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                    try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
-                                };
-                                cpu.ldt.selector = sel;
-                                // Load LDT descriptor from GDT (simplified: just set base/limit from GDT entry)
-                                if sel != 0 {
-                                    let desc_addr = cpu.gdt.base + (sel as u64 & 0xFFF8);
-                                    let lo = read_phys_u32(ram, ram_size, desc_addr);
-                                    let hi = read_phys_u32(ram, ram_size, desc_addr + 4);
-                                    let base = ((lo >> 16) as u64 & 0xFFFF) | (((hi & 0xFF) as u64) << 16) | (((hi >> 24) as u64) << 24);
-                                    let limit = (lo & 0xFFFF) as u32 | ((hi & 0xF0000) as u32);
-                                    if cpu.long_mode {
-                                        let base_hi = read_phys_u32(ram, ram_size, desc_addr + 8);
-                                        cpu.ldt.base = base | ((base_hi as u64) << 32);
-                                    } else {
-                                        cpu.ldt.base = base;
-                                    }
-                                    cpu.ldt.limit = limit;
-                                }
-                            }
-                            3 => {
-                                // LTR — load task register from selector
-                                let sel = if modrm & 0xC0 == 0xC0 {
-                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                    cpu.regs[r] as u16
-                                } else {
-                                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                    try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
-                                };
-                                cpu.tr.selector = sel;
-                                // Load TSS descriptor from GDT
-                                let desc_addr = cpu.gdt.base + (sel as u64 & 0xFFF8);
-                                let lo = read_phys_u32(ram, ram_size, desc_addr);
-                                let hi = read_phys_u32(ram, ram_size, desc_addr + 4);
-                                let base = ((lo >> 16) as u64 & 0xFFFF) | (((hi & 0xFF) as u64) << 16) | (((hi >> 24) as u64) << 24);
-                                let limit = (lo & 0xFFFF) as u32 | ((hi & 0xF0000) as u32);
-                                cpu.tr.flags = hi & 0x00F0FF00;
-                                if cpu.long_mode {
-                                    // 64-bit TSS descriptor is 16 bytes
-                                    let base_hi = read_phys_u32(ram, ram_size, desc_addr + 8);
-                                    cpu.tr.base = base | ((base_hi as u64) << 32);
-                                } else {
-                                    cpu.tr.base = base;
-                                }
-                                cpu.tr.limit = limit;
-                                // Mark TSS as busy (set bit 1 of type field in GDT)
-                                let busy = hi | 0x200;
-                                write_phys_u32(ram, ram_size, desc_addr + 4, busy);
-                            }
-                            _ => {}
-                        }
-                    }
-                    // System instructions (0x0F 0x01)
-                    0x01 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let reg_field = (modrm >> 3) & 7;
-                        match reg_field {
-                            0 => {
-                                // SGDT
-                                if modrm & 0xC0 != 0xC0 {
-                                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                    try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, addr, cpu.gdt.limit));
-                                    if cpu.long_mode {
-                                        try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr + 2, cpu.gdt.base));
-                                    } else {
-                                        try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr + 2, cpu.gdt.base as u32));
-                                    }
-                                }
-                            }
-                            1 => {
-                                // SIDT
-                                if modrm & 0xC0 != 0xC0 {
-                                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                    try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, addr, cpu.idt.limit));
-                                    if cpu.long_mode {
-                                        try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr + 2, cpu.idt.base));
-                                    } else {
-                                        try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr + 2, cpu.idt.base as u32));
-                                    }
-                                }
-                            }
-                            2 => {
-                                // LGDT
-                                if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); continue; }
-                                if modrm & 0xC0 != 0xC0 {
-                                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                    let limit = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
-                                    let base = if cpu.long_mode {
-                                        try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr + 2))
-                                    } else {
-                                        try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr + 2)) as u64
-                                    };
-                                    cpu.gdt.limit = limit;
-                                    cpu.gdt.base = base;
-                                }
-                            }
-                            3 => {
-                                // LIDT
-                                if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); continue; }
-                                if modrm & 0xC0 != 0xC0 {
-                                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                    let limit = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
-                                    let base = if cpu.long_mode {
-                                        try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr + 2))
-                                    } else {
-                                        try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr + 2)) as u64
-                                    };
-                                    cpu.idt.limit = limit;
-                                    cpu.idt.base = base;
-                                }
-                            }
-                            4 => {
-                                // SMSW — store machine status word (CR0 low 16 bits)
-                                let val = cpu.cr0 as u16;
-                                if modrm & 0xC0 == 0xC0 {
-                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                    cpu.regs[r] = val as u64;
-                                } else {
-                                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                    try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, addr, val));
-                                }
-                            }
-                            6 => {
-                                // LMSW — load machine status word (set low bits of CR0)
-                                if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); continue; }
-                                let val = if modrm & 0xC0 == 0xC0 {
-                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                    cpu.regs[r] as u16
-                                } else {
-                                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                    try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
-                                };
-                                // LMSW can set PE but cannot clear it
-                                cpu.cr0 = (cpu.cr0 & !0xF) | (val as u64 & 0xF) | (cpu.cr0 & CR0_PE);
-                            }
-                            7 => {
-                                if modrm == 0xF8 {
-                                    // SWAPGS (0x0F 0x01 0xF8)
-                                    if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); continue; }
-                                    let tmp = cpu.segs[SEG_GS].base;
-                                    cpu.segs[SEG_GS].base = cpu.kernel_gs_base;
-                                    cpu.kernel_gs_base = tmp;
-                                } else if modrm & 0xC0 != 0xC0 {
-                                    // INVLPG m
-                                    if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); continue; }
-                                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                    cpu.tlb.flush_page(addr);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    // SYSCALL (0x0F 0x05)
-                    0x05 => {
-                        if cpu.cpl != 3 { raise_exception(cpu, EXC_UD, 0); continue; }
-                        // Save user RIP and RFLAGS
-                        cpu.regs[RCX] = cpu.rip;
-                        cpu.regs[R11] = cpu.rflags;
-                        // Load kernel entry point
-                        cpu.rip = cpu.lstar;
-                        // Mask flags
-                        cpu.rflags &= !cpu.fmask;
-                        cpu.rflags &= !(IF | TF | RF); // always clear these
-                        cpu.lazy.op = FlagOp::External;
-                        // Switch to kernel mode
-                        cpu.cpl = 0;
-                        // Set CS/SS from STAR
-                        cpu.segs[SEG_CS].selector = ((cpu.star >> 32) & 0xFFFF) as u16;
-                        cpu.segs[SEG_CS].base = 0;
-                        cpu.segs[SEG_CS].limit = 0xFFFFFFFF;
-                        cpu.segs[SEG_CS].flags = 0x00AF9B00; // 64-bit code
-                        cpu.segs[SEG_SS].selector = (((cpu.star >> 32) + 8) & 0xFFFF) as u16;
-                        cpu.segs[SEG_SS].base = 0;
-                        cpu.segs[SEG_SS].limit = 0xFFFFFFFF;
-                        cpu.segs[SEG_SS].flags = 0x00CF9300; // data
-                    }
-                    // SYSRET (0x0F 0x07)
-                    0x07 => {
-                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); continue; }
-                        cpu.rip = cpu.regs[RCX];
-                        cpu.rflags = cpu.regs[R11] | 0x2; // restore RFLAGS, ensure bit 1
-                        cpu.lazy.op = FlagOp::External;
-                        cpu.cpl = 3;
-                        // Set CS/SS from STAR for user mode
-                        cpu.segs[SEG_CS].selector = (((cpu.star >> 48) + 16) & 0xFFFF) as u16;
-                        cpu.segs[SEG_CS].base = 0;
-                        cpu.segs[SEG_CS].limit = 0xFFFFFFFF;
-                        cpu.segs[SEG_CS].flags = 0x00AFFB00; // 64-bit code, DPL 3
-                        cpu.segs[SEG_SS].selector = (((cpu.star >> 48) + 8) & 0xFFFF) as u16;
-                        cpu.segs[SEG_SS].base = 0;
-                        cpu.segs[SEG_SS].limit = 0xFFFFFFFF;
-                        cpu.segs[SEG_SS].flags = 0x00CFF300; // data, DPL 3
-                    }
-                    // WBINVD (0x0F 0x09)
-                    0x09 => { /* no-op cache flush */ }
-                    // UD2 (0x0F 0x0B)
-                    0x0B => {
-                        raise_exception(cpu, EXC_UD, 0);
-                    }
-                    // MOV r, CRn (0x0F 0x20)
-                    0x20 => {
-                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); continue; }
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let cr = ((modrm >> 3) & 7) as usize;
-                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                        cpu.regs[r] = match cr {
-                            0 => cpu.cr0,
-                            2 => cpu.cr2,
-                            3 => cpu.cr3,
-                            4 => cpu.cr4,
-                            8 => cpu.cr8,
-                            _ => 0,
-                        };
-                    }
-                    // MOV CRn, r (0x0F 0x22)
-                    0x22 => {
-                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); continue; }
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let cr = ((modrm >> 3) & 7) as usize;
-                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                        let val = cpu.regs[r];
-                        match cr {
-                            0 => {
-                                cpu.cr0 = val;
-                                // Update long_mode based on EFER.LMA
-                                cpu.long_mode = (cpu.efer & EFER_LME != 0) && (val & CR0_PG != 0);
-                                if cpu.long_mode { cpu.efer |= EFER_LMA; } else { cpu.efer &= !EFER_LMA; }
-                                cpu.tlb.flush_all();
-                            }
-                            2 => cpu.cr2 = val,
-                            3 => {
-                                cpu.cr3 = val;
-                                cpu.tlb.flush_all();
-                            }
-                            4 => {
-                                cpu.cr4 = val;
-                                cpu.tlb.flush_all();
-                            }
-                            8 => cpu.cr8 = val,
-                            _ => {}
-                        }
-                    }
-                    // IMUL r, r/m (0x0F 0xAF)
-                    0xAF => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let src = load_rm(cpu, ram, ram_size, modrm, lane);
-                        match lane {
-                            LANE16 => {
-                                let res = (cpu.regs[dst_reg] as u16 as i16 as i32).wrapping_mul(src as i16 as i32);
-                                write_reg16(cpu, dst_reg, res as u16);
-                                materialize_flags(cpu);
-                                if res as i16 as i32 != res { cpu.rflags |= CF | OF; }
-                                else { cpu.rflags &= !(CF | OF); }
-                                cpu.lazy.op = FlagOp::External;
-                            }
-                            LANE32 => {
-                                let res = (cpu.regs[dst_reg] as u32 as i32 as i64).wrapping_mul(src as i32 as i64);
-                                cpu.regs[dst_reg] = res as u32 as u64;
-                                materialize_flags(cpu);
-                                if res as i32 as i64 != res { cpu.rflags |= CF | OF; }
-                                else { cpu.rflags &= !(CF | OF); }
-                                cpu.lazy.op = FlagOp::External;
-                            }
-                            LANE64 => {
-                                let res = (cpu.regs[dst_reg] as i64 as i128).wrapping_mul(src as i64 as i128);
-                                cpu.regs[dst_reg] = res as u64;
-                                materialize_flags(cpu);
-                                if res as i64 as i128 != res { cpu.rflags |= CF | OF; }
-                                else { cpu.rflags &= !(CF | OF); }
-                                cpu.lazy.op = FlagOp::External;
-                            }
-                            _ => {}
-                        }
-                    }
-                    // BSF (0x0F 0xBC) / BSR (0x0F 0xBD)
-                    0xBC => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let src = load_rm(cpu, ram, ram_size, modrm, lane);
-                        materialize_flags(cpu);
-                        match lane {
-                            LANE16 => {
-                                let v = src as u16;
-                                if v == 0 { cpu.rflags |= ZF; }
-                                else { cpu.rflags &= !ZF; write_reg16(cpu, dst_reg, v.trailing_zeros() as u16); }
-                            }
-                            LANE32 => {
-                                let v = src as u32;
-                                if v == 0 { cpu.rflags |= ZF; }
-                                else { cpu.rflags &= !ZF; cpu.regs[dst_reg] = v.trailing_zeros() as u64; }
-                            }
-                            _ => {
-                                if src == 0 { cpu.rflags |= ZF; }
-                                else { cpu.rflags &= !ZF; cpu.regs[dst_reg] = src.trailing_zeros() as u64; }
-                            }
-                        }
-                        cpu.lazy.op = FlagOp::External;
-                    }
-                    0xBD => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let src = load_rm(cpu, ram, ram_size, modrm, lane);
-                        materialize_flags(cpu);
-                        match lane {
-                            LANE16 => {
-                                let v = src as u16;
-                                if v == 0 { cpu.rflags |= ZF; }
-                                else { cpu.rflags &= !ZF; write_reg16(cpu, dst_reg, (15 - v.leading_zeros()) as u16); }
-                            }
-                            LANE32 => {
-                                let v = src as u32;
-                                if v == 0 { cpu.rflags |= ZF; }
-                                else { cpu.rflags &= !ZF; cpu.regs[dst_reg] = (31 - v.leading_zeros()) as u64; }
-                            }
-                            _ => {
-                                if src == 0 { cpu.rflags |= ZF; }
-                                else { cpu.rflags &= !ZF; cpu.regs[dst_reg] = (63 - src.leading_zeros()) as u64; }
-                            }
-                        }
-                        cpu.lazy.op = FlagOp::External;
-                    }
-                    // BSWAP (0x0F 0xC8-0xCF)
-                    0xC8..=0xCF => {
-                        let r = (op2 & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                        match lane {
-                            LANE32 => cpu.regs[r] = (cpu.regs[r] as u32).swap_bytes() as u64,
-                            _ => cpu.regs[r] = cpu.regs[r].swap_bytes(),
-                        }
-                    }
-                    // CMPXCHG r/m8, r8 (0x0F 0xB0) / r/m, r (0x0F 0xB1)
-                    0xB0 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let src = read_reg8(cpu, src_reg);
-                        let dst = if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            read_reg8(cpu, r)
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
-                        };
-                        let al = cpu.regs[RAX] as u8;
-                        let res = al.wrapping_sub(dst);
-                        set_lazy(cpu, FlagOp::SubB, al as u64, res as u64);
-                        if al == dst {
-                            if modrm & 0xC0 == 0xC0 {
-                                let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                write_reg8(cpu, r, src);
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, src));
-                            }
-                        } else {
-                            write_reg8_al(cpu, dst);
-                        }
-                    }
-                    0xB1 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let src = cpu.regs[src_reg];
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
-                        match lane {
-                            LANE32 => {
-                                let a = cpu.regs[RAX] as u32;
-                                let d = dst as u32;
-                                let res = a.wrapping_sub(d);
-                                set_lazy(cpu, FlagOp::SubL, a as u64, res as u64);
-                                if a == d {
-                                    store_rm(cpu, ram, ram_size, modrm, lane, src);
-                                } else {
-                                    cpu.regs[RAX] = d as u64;
-                                }
-                            }
-                            LANE64 => {
-                                let a = cpu.regs[RAX];
-                                let res = a.wrapping_sub(dst);
-                                set_lazy(cpu, FlagOp::SubQ, a, res);
-                                if a == dst {
-                                    store_rm(cpu, ram, ram_size, modrm, lane, src);
-                                } else {
-                                    cpu.regs[RAX] = dst;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    // XADD r/m, r (0x0F 0xC0/0xC1)
-                    0xC0 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let src = read_reg8(cpu, src_reg);
-                        let dst = if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            read_reg8(cpu, r)
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
-                        };
-                        let res = dst.wrapping_add(src);
-                        write_reg8(cpu, src_reg, dst); // src reg gets old dst
-                        if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            write_reg8(cpu, r, res);
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res));
-                        }
-                        set_lazy(cpu, FlagOp::AddB, dst as u64, res as u64);
-                    }
-                    0xC1 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let src = cpu.regs[src_reg];
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
-                        match lane {
-                            LANE32 => {
-                                let res = (dst as u32).wrapping_add(src as u32);
-                                cpu.regs[src_reg] = dst as u32 as u64;
-                                store_rm(cpu, ram, ram_size, modrm, lane, res as u64);
-                                set_lazy(cpu, FlagOp::AddL, dst, res as u64);
-                            }
-                            LANE64 => {
-                                let res = dst.wrapping_add(src);
-                                cpu.regs[src_reg] = dst;
-                                store_rm(cpu, ram, ram_size, modrm, lane, res);
-                                set_lazy(cpu, FlagOp::AddQ, dst, res);
-                            }
-                            _ => {}
-                        }
-                    }
-                    // NOP (0x0F 0x1F /0) — multi-byte NOP
-                    0x1F => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if modrm & 0xC0 != 0xC0 {
-                            let _ = decode_modrm_addr(cpu, ram, ram_size, modrm); // consume but ignore
-                        }
-                    }
-                    // NOP hints (0x0F 0x18-0x1E) — prefetch/hint NOPs
-                    0x18 | 0x19 | 0x1A | 0x1B | 0x1C | 0x1D | 0x1E => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if modrm & 0xC0 != 0xC0 {
-                            let _ = decode_modrm_addr(cpu, ram, ram_size, modrm);
-                        }
-                    }
-
-                    // PUSH FS (0x0F 0xA0), PUSH GS (0x0F 0xA8)
-                    0xA0 => {
-                        let val = cpu.segs[SEG_FS].selector as u64;
-                        if cpu.long_mode {
-                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
-                            try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], val));
-                        } else {
-                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
-                            try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], val as u32));
-                        }
-                    }
-                    0xA8 => {
-                        let val = cpu.segs[SEG_GS].selector as u64;
-                        if cpu.long_mode {
-                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
-                            try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], val));
-                        } else {
-                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
-                            try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], val as u32));
-                        }
-                    }
-                    // POP FS (0x0F 0xA1), POP GS (0x0F 0xA9)
-                    0xA1 => {
-                        let val = if cpu.long_mode {
-                            let v = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
-                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
-                            v as u16
-                        } else {
-                            let v = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
-                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
-                            v as u16
-                        };
-                        cpu.segs[SEG_FS].selector = val;
-                    }
-                    0xA9 => {
-                        let val = if cpu.long_mode {
-                            let v = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
-                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
-                            v as u16
-                        } else {
-                            let v = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
-                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
-                            v as u16
-                        };
-                        cpu.segs[SEG_GS].selector = val;
-                    }
-
-                    // BT r/m, r (0x0F 0xA3)
-                    0xA3 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let bit_pos = cpu.regs[src_reg];
-                        let val = if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            match lane {
-                                LANE16 => cpu.regs[r] as u16 as u64,
-                                LANE32 => cpu.regs[r] as u32 as u64,
-                                _ => cpu.regs[r],
-                            }
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            let (op_bits, op_bytes) = match lane { LANE16 => (16u64, 2i64), LANE32 => (32, 4), _ => (64, 8) };
-                            let byte_offset = ((bit_pos as i64) >> if op_bits == 16 { 4 } else if op_bits == 32 { 5 } else { 6 }) * op_bytes;
-                            let eff_addr = addr.wrapping_add(byte_offset as u64);
-                            match lane {
-                                LANE16 => try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, eff_addr)) as u64,
-                                LANE32 => try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, eff_addr)) as u64,
-                                _ => try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, eff_addr)),
-                            }
-                        };
-                        let mask = match lane { LANE16 => 15, LANE32 => 31, _ => 63 };
-                        let bit = (val >> (bit_pos & mask)) & 1;
-                        materialize_flags(cpu);
-                        cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
-                        cpu.lazy.op = FlagOp::External;
-                    }
-                    // BTS r/m, r (0x0F 0xAB)
-                    0xAB => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let bit_pos = cpu.regs[src_reg];
-                        let mask = match lane { LANE16 => 15u64, LANE32 => 31, _ => 63 };
-                        if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            let val = cpu.regs[r];
-                            let bit = (val >> (bit_pos & mask)) & 1;
-                            cpu.regs[r] = val | (1u64 << (bit_pos & mask));
-                            if lane == LANE32 { cpu.regs[r] = cpu.regs[r] as u32 as u64; }
-                            materialize_flags(cpu);
-                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
-                            cpu.lazy.op = FlagOp::External;
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            let (op_bits, op_bytes) = match lane { LANE16 => (16u64, 2i64), LANE32 => (32, 4), _ => (64, 8) };
-                            let byte_offset = ((bit_pos as i64) >> if op_bits == 16 { 4 } else if op_bits == 32 { 5 } else { 6 }) * op_bytes;
-                            let eff_addr = addr.wrapping_add(byte_offset as u64);
-                            let val = match lane {
-                                LANE16 => try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, eff_addr)) as u64,
-                                LANE32 => try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, eff_addr)) as u64,
-                                _ => try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, eff_addr)),
-                            };
-                            let bit = (val >> (bit_pos & mask)) & 1;
-                            let new_val = val | (1u64 << (bit_pos & mask));
-                            match lane {
-                                LANE16 => { try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, eff_addr, new_val as u16)); }
-                                LANE32 => { try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, eff_addr, new_val as u32)); }
-                                _ => { try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, eff_addr, new_val)); }
-                            }
-                            materialize_flags(cpu);
-                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
-                            cpu.lazy.op = FlagOp::External;
-                        }
-                    }
-                    // BTR r/m, r (0x0F 0xB3)
-                    0xB3 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let bit_pos = cpu.regs[src_reg];
-                        let mask = match lane { LANE16 => 15u64, LANE32 => 31, _ => 63 };
-                        if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            let val = cpu.regs[r];
-                            let bit = (val >> (bit_pos & mask)) & 1;
-                            cpu.regs[r] = val & !(1u64 << (bit_pos & mask));
-                            if lane == LANE32 { cpu.regs[r] = cpu.regs[r] as u32 as u64; }
-                            materialize_flags(cpu);
-                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
-                            cpu.lazy.op = FlagOp::External;
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            let (op_bits, op_bytes) = match lane { LANE16 => (16u64, 2i64), LANE32 => (32, 4), _ => (64, 8) };
-                            let byte_offset = ((bit_pos as i64) >> if op_bits == 16 { 4 } else if op_bits == 32 { 5 } else { 6 }) * op_bytes;
-                            let eff_addr = addr.wrapping_add(byte_offset as u64);
-                            let val = match lane {
-                                LANE16 => try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, eff_addr)) as u64,
-                                LANE32 => try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, eff_addr)) as u64,
-                                _ => try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, eff_addr)),
-                            };
-                            let bit = (val >> (bit_pos & mask)) & 1;
-                            let new_val = val & !(1u64 << (bit_pos & mask));
-                            match lane {
-                                LANE16 => { try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, eff_addr, new_val as u16)); }
-                                LANE32 => { try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, eff_addr, new_val as u32)); }
-                                _ => { try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, eff_addr, new_val)); }
-                            }
-                            materialize_flags(cpu);
-                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
-                            cpu.lazy.op = FlagOp::External;
-                        }
-                    }
-                    // BTC r/m, r (0x0F 0xBB)
-                    0xBB => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let bit_pos = cpu.regs[src_reg];
-                        let mask = match lane { LANE16 => 15u64, LANE32 => 31, _ => 63 };
-                        if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            let val = cpu.regs[r];
-                            let bit = (val >> (bit_pos & mask)) & 1;
-                            cpu.regs[r] = val ^ (1u64 << (bit_pos & mask));
-                            if lane == LANE32 { cpu.regs[r] = cpu.regs[r] as u32 as u64; }
-                            materialize_flags(cpu);
-                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
-                            cpu.lazy.op = FlagOp::External;
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            let (op_bits, op_bytes) = match lane { LANE16 => (16u64, 2i64), LANE32 => (32, 4), _ => (64, 8) };
-                            let byte_offset = ((bit_pos as i64) >> if op_bits == 16 { 4 } else if op_bits == 32 { 5 } else { 6 }) * op_bytes;
-                            let eff_addr = addr.wrapping_add(byte_offset as u64);
-                            let val = match lane {
-                                LANE16 => try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, eff_addr)) as u64,
-                                LANE32 => try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, eff_addr)) as u64,
-                                _ => try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, eff_addr)),
-                            };
-                            let bit = (val >> (bit_pos & mask)) & 1;
-                            let new_val = val ^ (1u64 << (bit_pos & mask));
-                            match lane {
-                                LANE16 => { try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, eff_addr, new_val as u16)); }
-                                LANE32 => { try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, eff_addr, new_val as u32)); }
-                                _ => { try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, eff_addr, new_val)); }
-                            }
-                            materialize_flags(cpu);
-                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
-                            cpu.lazy.op = FlagOp::External;
-                        }
-                    }
-
-                    // BT group 8: BT/BTS/BTR/BTC r/m, imm8 (0x0F 0xBA /4-7)
-                    0xBA => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let reg_field = (modrm >> 3) & 7;
-                        let val = load_rm(cpu, ram, ram_size, modrm, lane);
-                        let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let mask = match lane { LANE16 => 15u8, LANE32 => 31, _ => 63 };
-                        let bit_idx = imm & mask;
-                        let bit = (val >> bit_idx) & 1;
-                        match reg_field {
-                            4 => { // BT — read only
-                            }
-                            5 => { // BTS — set bit
-                                let new_val = val | (1u64 << bit_idx);
-                                store_rm(cpu, ram, ram_size, modrm, lane, new_val);
-                            }
-                            6 => { // BTR — clear bit
-                                let new_val = val & !(1u64 << bit_idx);
-                                store_rm(cpu, ram, ram_size, modrm, lane, new_val);
-                            }
-                            7 => { // BTC — complement bit
-                                let new_val = val ^ (1u64 << bit_idx);
-                                store_rm(cpu, ram, ram_size, modrm, lane, new_val);
-                            }
-                            _ => { raise_exception(cpu, EXC_UD, 0); continue; }
-                        }
-                        materialize_flags(cpu);
-                        cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
-                        cpu.lazy.op = FlagOp::External;
-                    }
-
-                    // SHLD r/m, r, imm8 (0x0F 0xA4)
-                    0xA4 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let fill = cpu.regs[src_reg];
-                        let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
-                        let res = exec_shld(dst, fill, imm as u64, lane);
-                        if res != u64::MAX {
-                            store_rm(cpu, ram, ram_size, modrm, lane, res);
-                        }
-                    }
-                    // SHLD r/m, r, CL (0x0F 0xA5)
-                    0xA5 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let fill = cpu.regs[src_reg];
-                        let count = cpu.regs[RCX] as u8;
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
-                        let res = exec_shld(dst, fill, count as u64, lane);
-                        if res != u64::MAX {
-                            store_rm(cpu, ram, ram_size, modrm, lane, res);
-                        }
-                    }
-                    // SHRD r/m, r, imm8 (0x0F 0xAC)
-                    0xAC => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let fill = cpu.regs[src_reg];
-                        let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
-                        let res = exec_shrd(dst, fill, imm as u64, lane);
-                        if res != u64::MAX {
-                            store_rm(cpu, ram, ram_size, modrm, lane, res);
-                        }
-                    }
-                    // SHRD r/m, r, CL (0x0F 0xAD)
-                    0xAD => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let fill = cpu.regs[src_reg];
-                        let count = cpu.regs[RCX] as u8;
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
-                        let res = exec_shrd(dst, fill, count as u64, lane);
-                        if res != u64::MAX {
-                            store_rm(cpu, ram, ram_size, modrm, lane, res);
-                        }
-                    }
-
-                    // CMPXCHG8B/16B (0x0F 0xC7 /1)
-                    0xC7 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let reg_field = (modrm >> 3) & 7;
-                        if reg_field != 1 || modrm & 0xC0 == 0xC0 {
-                            raise_exception(cpu, EXC_UD, 0); continue;
-                        }
-                        let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                        if lane == LANE64 {
-                            // CMPXCHG16B: compare RDX:RAX with m128
-                            let lo = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
-                            let hi = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr.wrapping_add(8)));
-                            if cpu.regs[RAX] == lo && cpu.regs[RDX] == hi {
-                                try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.regs[RBX]));
-                                try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr.wrapping_add(8), cpu.regs[RCX]));
-                                materialize_flags(cpu);
-                                cpu.rflags |= ZF;
-                                cpu.lazy.op = FlagOp::External;
-                            } else {
-                                cpu.regs[RAX] = lo;
-                                cpu.regs[RDX] = hi;
-                                materialize_flags(cpu);
-                                cpu.rflags &= !ZF;
-                                cpu.lazy.op = FlagOp::External;
-                            }
-                        } else {
-                            // CMPXCHG8B: compare EDX:EAX with m64
-                            let lo = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64;
-                            let hi = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr.wrapping_add(4))) as u64;
-                            let cmp_val = (hi << 32) | lo;
-                            let eax_edx = ((cpu.regs[RDX] as u32 as u64) << 32) | (cpu.regs[RAX] as u32 as u64);
-                            if eax_edx == cmp_val {
-                                try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.regs[RBX] as u32));
-                                try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr.wrapping_add(4), cpu.regs[RCX] as u32));
-                                materialize_flags(cpu);
-                                cpu.rflags |= ZF;
-                                cpu.lazy.op = FlagOp::External;
-                            } else {
-                                cpu.regs[RAX] = lo;
-                                cpu.regs[RDX] = hi;
-                                materialize_flags(cpu);
-                                cpu.rflags &= !ZF;
-                                cpu.lazy.op = FlagOp::External;
-                            }
-                        }
-                    }
-
-                    // MOVNTI m32/64, r (0x0F 0xC3) — non-temporal store → regular store
-                    0xC3 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); continue; }
-                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                        match lane {
-                            LANE32 => { try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.regs[src_reg] as u32)); }
-                            LANE64 => { try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.regs[src_reg])); }
-                            _ => { try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.regs[src_reg] as u32)); }
-                        }
-                    }
-
-                    // LSS r, m16:16/32/64 (0x0F 0xB2)
-                    0xB2 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); continue; }
-                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                        match lane {
-                            LANE16 => {
-                                let val = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
-                                let sel = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(2)));
-                                write_reg16(cpu, dst_reg, val);
-                                cpu.segs[SEG_SS].selector = sel;
-                            }
-                            LANE32 => {
-                                let val = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
-                                let sel = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(4)));
-                                cpu.regs[dst_reg] = val as u64;
-                                cpu.segs[SEG_SS].selector = sel;
-                            }
-                            _ => {
-                                let val = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
-                                let sel = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(8)));
-                                cpu.regs[dst_reg] = val;
-                                cpu.segs[SEG_SS].selector = sel;
-                            }
-                        }
-                    }
-                    // LFS r, m16:16/32/64 (0x0F 0xB4)
-                    0xB4 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); continue; }
-                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                        match lane {
-                            LANE16 => {
-                                let val = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
-                                let sel = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(2)));
-                                write_reg16(cpu, dst_reg, val);
-                                cpu.segs[SEG_FS].selector = sel;
-                            }
-                            LANE32 => {
-                                let val = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
-                                let sel = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(4)));
-                                cpu.regs[dst_reg] = val as u64;
-                                cpu.segs[SEG_FS].selector = sel;
-                            }
-                            _ => {
-                                let val = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
-                                let sel = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(8)));
-                                cpu.regs[dst_reg] = val;
-                                cpu.segs[SEG_FS].selector = sel;
-                            }
-                        }
-                    }
-                    // LGS r, m16:16/32/64 (0x0F 0xB5)
-                    0xB5 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); continue; }
-                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                        match lane {
-                            LANE16 => {
-                                let val = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
-                                let sel = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(2)));
-                                write_reg16(cpu, dst_reg, val);
-                                cpu.segs[SEG_GS].selector = sel;
-                            }
-                            LANE32 => {
-                                let val = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
-                                let sel = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(4)));
-                                cpu.regs[dst_reg] = val as u64;
-                                cpu.segs[SEG_GS].selector = sel;
-                            }
-                            _ => {
-                                let val = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
-                                let sel = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(8)));
-                                cpu.regs[dst_reg] = val;
-                                cpu.segs[SEG_GS].selector = sel;
-                            }
-                        }
-                    }
-
-                    // 0x0F 0xAE — fences + LDMXCSR/STMXCSR
-                    0xAE => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let reg_field = (modrm >> 3) & 7;
-                        if modrm & 0xC0 == 0xC0 {
-                            // mod=11: LFENCE(5), MFENCE(6), SFENCE(7) → no-op
-                            match reg_field {
-                                5 | 6 | 7 => {} // fence no-ops
-                                _ => { raise_exception(cpu, EXC_UD, 0); continue; }
-                            }
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            match reg_field {
-                                2 => { // LDMXCSR
-                                    cpu.sse.mxcsr = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
-                                }
-                                3 => { // STMXCSR
-                                    try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.sse.mxcsr));
-                                }
-                                5 | 6 | 7 => {} // fence no-ops (memory forms)
-                                _ => { raise_exception(cpu, EXC_UD, 0); continue; }
-                            }
-                        }
-                    }
-
-                    // MOVSX r32/64, r/m8 (0x0F 0xBE) — already handled above
-                    // MOVSX r32/64, r/m16 (0x0F 0xBF) — already handled above
-                    // MOVZX r, r/m8 (0x0F 0xB6) — already handled above
-                    // MOVZX r, r/m16 (0x0F 0xB7) — already handled above
-
-                    // ==========================================================
-                    // SSE/SSE2 — Data Movement
-                    // ==========================================================
-
-                    // MOVUPS/MOVAPS (0x10/0x11/0x28/0x29) — no prefix
-                    // MOVUPD/MOVAPD (0x10/0x11/0x28/0x29) — 0x66 prefix
-                    // MOVSS (0x10/0x11) — 0xF3 prefix
-                    // MOVSD (0x10/0x11) — 0xF2 prefix
-                    0x10 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        if cpu.prefix.rep == 0xF3 {
-                            // MOVSS xmm, xmm/m32
-                            if modrm & 0xC0 == 0xC0 {
-                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                // reg-reg: merge low 32 bits only
-                                let src_lo = cpu.sse.xmm[src][0];
-                                cpu.sse.xmm[dst][0] = (cpu.sse.xmm[dst][0] & 0xFFFFFFFF00000000) | (src_lo & 0xFFFFFFFF);
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                let val = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
-                                cpu.sse.xmm[dst][0] = val as u64;
-                                cpu.sse.xmm[dst][1] = 0;
-                            }
-                        } else if cpu.prefix.rep == 0xF2 {
-                            // MOVSD xmm, xmm/m64
-                            if modrm & 0xC0 == 0xC0 {
-                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                cpu.sse.xmm[dst][0] = cpu.sse.xmm[src][0];
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                cpu.sse.xmm[dst][0] = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
-                                cpu.sse.xmm[dst][1] = 0;
-                            }
-                        } else {
-                            // MOVUPS/MOVUPD: load 128-bit
-                            let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                            cpu.sse.xmm[dst][0] = lo;
-                            cpu.sse.xmm[dst][1] = hi;
-                        }
-                    }
-                    0x11 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        if cpu.prefix.rep == 0xF3 {
-                            // MOVSS xmm/m32, xmm
-                            if modrm & 0xC0 == 0xC0 {
-                                let dst_r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                cpu.sse.xmm[dst_r][0] = (cpu.sse.xmm[dst_r][0] & 0xFFFFFFFF00000000) | (cpu.sse.xmm[src][0] & 0xFFFFFFFF);
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0] as u32));
-                            }
-                        } else if cpu.prefix.rep == 0xF2 {
-                            // MOVSD xmm/m64, xmm
-                            if modrm & 0xC0 == 0xC0 {
-                                let dst_r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                cpu.sse.xmm[dst_r][0] = cpu.sse.xmm[src][0];
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0]));
-                            }
-                        } else {
-                            // MOVUPS/MOVUPD: store 128-bit
-                            store_xmm_rm(cpu, ram, ram_size, modrm, cpu.sse.xmm[src][0], cpu.sse.xmm[src][1]);
-                        }
-                    }
-                    // MOVLPS/MOVHLPS (0x12), MOVLPD (0x12 + 66)
-                    0x12 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        if modrm & 0xC0 == 0xC0 {
-                            // MOVHLPS: dst.lo = src.hi
-                            let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            cpu.sse.xmm[dst][0] = cpu.sse.xmm[src][1];
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            cpu.sse.xmm[dst][0] = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
-                        }
-                    }
-                    0x13 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); continue; }
-                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                        try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0]));
-                    }
-                    // MOVHPS/MOVLHPS (0x16), MOVHPD (0x16 + 66)
-                    0x16 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        if modrm & 0xC0 == 0xC0 {
-                            // MOVLHPS: dst.hi = src.lo
-                            let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            cpu.sse.xmm[dst][1] = cpu.sse.xmm[src][0];
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            cpu.sse.xmm[dst][1] = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
-                        }
-                    }
-                    0x17 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); continue; }
-                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                        try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][1]));
-                    }
-                    // MOVAPS/MOVAPD (0x28/0x29)
-                    0x28 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        cpu.sse.xmm[dst][0] = lo;
-                        cpu.sse.xmm[dst][1] = hi;
-                    }
-                    0x29 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        store_xmm_rm(cpu, ram, ram_size, modrm, cpu.sse.xmm[src][0], cpu.sse.xmm[src][1]);
-                    }
-                    // MOVNTPS/MOVNTPD (0x2B) — non-temporal store → regular store
-                    0x2B => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); continue; }
-                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                        try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0]));
-                        try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr.wrapping_add(8), cpu.sse.xmm[src][1]));
-                    }
-
-                    // MOVD/MOVQ GP↔XMM (0x6E, 0x7E)
-                    0x6E => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        if lane == LANE64 {
-                            // MOVQ xmm, r/m64
-                            let val = load_rm(cpu, ram, ram_size, modrm, LANE64);
-                            cpu.sse.xmm[dst][0] = val;
-                            cpu.sse.xmm[dst][1] = 0;
-                        } else {
-                            // MOVD xmm, r/m32
-                            let val = load_rm(cpu, ram, ram_size, modrm, LANE32);
-                            cpu.sse.xmm[dst][0] = val as u32 as u64;
-                            cpu.sse.xmm[dst][1] = 0;
-                        }
-                    }
-                    0x7E => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if cpu.prefix.rep == 0xF3 {
-                            // MOVQ xmm, xmm/m64
-                            let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                            if modrm & 0xC0 == 0xC0 {
-                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                cpu.sse.xmm[dst][0] = cpu.sse.xmm[src][0];
-                                cpu.sse.xmm[dst][1] = 0;
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                cpu.sse.xmm[dst][0] = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
-                                cpu.sse.xmm[dst][1] = 0;
-                            }
-                        } else {
-                            // MOVD r/m32, xmm or MOVQ r/m64, xmm
-                            let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                            let val = cpu.sse.xmm[src][0];
-                            if lane == LANE64 {
-                                store_rm(cpu, ram, ram_size, modrm, LANE64, val);
-                            } else {
-                                store_rm(cpu, ram, ram_size, modrm, LANE32, val as u32 as u64);
-                            }
-                        }
-                    }
-                    // MOVDQA/MOVDQU (0x6F/0x7F)
-                    0x6F => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        cpu.sse.xmm[dst][0] = lo;
-                        cpu.sse.xmm[dst][1] = hi;
-                    }
-                    0x7F => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        store_xmm_rm(cpu, ram, ram_size, modrm, cpu.sse.xmm[src][0], cpu.sse.xmm[src][1]);
-                    }
-                    // MOVQ xmm/m64, xmm (0xD6 + 66 prefix)
-                    0xD6 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        if modrm & 0xC0 == 0xC0 {
-                            let dst_r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            cpu.sse.xmm[dst_r][0] = cpu.sse.xmm[src][0];
-                            cpu.sse.xmm[dst_r][1] = 0;
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0]));
-                        }
-                    }
-                    // MOVNTDQ (0xE7 + 66) — non-temporal 128-bit store
-                    0xE7 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); continue; }
-                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                        try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0]));
-                        try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr.wrapping_add(8), cpu.sse.xmm[src][1]));
-                    }
-
-                    // ==========================================================
-                    // SSE/SSE2 — Logical
-                    // ==========================================================
-                    // ANDPS/ANDPD (0x54), ANDNPS/ANDNPD (0x55), ORPS/ORPD (0x56), XORPS/XORPD (0x57)
-                    0x54 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        cpu.sse.xmm[dst][0] &= lo;
-                        cpu.sse.xmm[dst][1] &= hi;
-                    }
-                    0x55 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        cpu.sse.xmm[dst][0] = (!cpu.sse.xmm[dst][0]) & lo;
-                        cpu.sse.xmm[dst][1] = (!cpu.sse.xmm[dst][1]) & hi;
-                    }
-                    0x56 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        cpu.sse.xmm[dst][0] |= lo;
-                        cpu.sse.xmm[dst][1] |= hi;
-                    }
-                    0x57 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        cpu.sse.xmm[dst][0] ^= lo;
-                        cpu.sse.xmm[dst][1] ^= hi;
-                    }
-
-                    // ==========================================================
-                    // SSE/SSE2 — Compare
-                    // ==========================================================
-                    // UCOMISS/UCOMISD (0x2E), COMISS/COMISD (0x2F)
-                    0x2E | 0x2F => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let is_sd = cpu.prefix.op_size; // 0x66 prefix = double
-                        let a: f64;
-                        let b: f64;
-                        if is_sd {
-                            a = f64::from_bits(cpu.sse.xmm[dst][0]);
-                            if modrm & 0xC0 == 0xC0 {
-                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                b = f64::from_bits(cpu.sse.xmm[src][0]);
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                b = f64::from_bits(try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr)));
-                            }
-                        } else {
-                            a = f32::from_bits(cpu.sse.xmm[dst][0] as u32) as f64;
-                            if modrm & 0xC0 == 0xC0 {
-                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                b = f32::from_bits(cpu.sse.xmm[src][0] as u32) as f64;
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                b = f32::from_bits(try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr))) as f64;
-                            }
-                        }
-                        materialize_flags(cpu);
-                        cpu.rflags &= !(CF | ZF | PF | OF | SF | AF);
-                        if a.is_nan() || b.is_nan() {
-                            cpu.rflags |= CF | ZF | PF;
-                        } else if a > b {
-                            // all clear
-                        } else if a < b {
-                            cpu.rflags |= CF;
-                        } else {
-                            cpu.rflags |= ZF;
-                        }
-                        cpu.lazy.op = FlagOp::External;
-                    }
-
-                    // CMPPS/CMPPD/CMPSS/CMPSD (0xC2)
-                    0xC2 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let pred = imm & 7;
-                        if cpu.prefix.rep == 0xF3 {
-                            // CMPSS — scalar single
-                            let a = f32::from_bits(cpu.sse.xmm[dst][0] as u32);
-                            let b = f32::from_bits(lo as u32);
-                            let r = sse_cmp_f32(a, b, pred);
-                            cpu.sse.xmm[dst][0] = (cpu.sse.xmm[dst][0] & 0xFFFFFFFF00000000) | r as u64;
-                        } else if cpu.prefix.rep == 0xF2 {
-                            // CMPSD — scalar double
-                            let a = f64::from_bits(cpu.sse.xmm[dst][0]);
-                            let b = f64::from_bits(lo);
-                            let r = sse_cmp_f64(a, b, pred);
-                            cpu.sse.xmm[dst][0] = r;
-                        } else if cpu.prefix.op_size {
-                            // CMPPD — packed double
-                            let a0 = f64::from_bits(cpu.sse.xmm[dst][0]);
-                            let a1 = f64::from_bits(cpu.sse.xmm[dst][1]);
-                            let b0 = f64::from_bits(lo);
-                            let b1 = f64::from_bits(hi);
-                            cpu.sse.xmm[dst][0] = sse_cmp_f64(a0, b0, pred);
-                            cpu.sse.xmm[dst][1] = sse_cmp_f64(a1, b1, pred);
-                        } else {
-                            // CMPPS — packed single
-                            sse_cmpps(cpu, dst, lo, hi, pred);
-                        }
-                    }
-
-                    // ==========================================================
-                    // SSE — Extract/Mask
-                    // ==========================================================
-                    // MOVMSKPS/MOVMSKPD (0x50)
-                    0x50 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                        if cpu.prefix.op_size {
-                            // MOVMSKPD — extract sign bits of 2 doubles
-                            let bit0 = (cpu.sse.xmm[src][0] >> 63) & 1;
-                            let bit1 = (cpu.sse.xmm[src][1] >> 63) & 1;
-                            cpu.regs[dst] = bit0 | (bit1 << 1);
-                        } else {
-                            // MOVMSKPS — extract sign bits of 4 floats
-                            let lo = cpu.sse.xmm[src][0];
-                            let hi = cpu.sse.xmm[src][1];
-                            let bit0 = (lo >> 31) & 1;
-                            let bit1 = (lo >> 63) & 1;
-                            let bit2 = (hi >> 31) & 1;
-                            let bit3 = (hi >> 63) & 1;
-                            cpu.regs[dst] = bit0 | (bit1 << 1) | (bit2 << 2) | (bit3 << 3);
-                        }
-                    }
-                    // PMOVMSKB (0xD7 + 66 prefix)
-                    0xD7 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                        let lo = cpu.sse.xmm[src][0];
-                        let hi = cpu.sse.xmm[src][1];
-                        let mut mask = 0u64;
-                        for i in 0..8 { mask |= ((lo >> (i * 8 + 7)) & 1) << i; }
-                        for i in 0..8 { mask |= ((hi >> (i * 8 + 7)) & 1) << (i + 8); }
-                        cpu.regs[dst] = mask;
-                    }
-
-                    // ==========================================================
-                    // SSE — Shuffle
-                    // ==========================================================
-                    // UNPCKLPS/UNPCKLPD (0x14)
-                    0x14 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, _hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        if cpu.prefix.op_size {
-                            // UNPCKLPD: dst[0] = dst[0], dst[1] = src[0]
-                            cpu.sse.xmm[dst][1] = lo;
-                        } else {
-                            // UNPCKLPS: interleave low 32-bit floats
-                            let d0 = cpu.sse.xmm[dst][0] as u32 as u64;
-                            let d1 = (cpu.sse.xmm[dst][0] >> 32) as u32 as u64;
-                            let s0 = lo as u32 as u64;
-                            let s1 = (lo >> 32) as u32 as u64;
-                            cpu.sse.xmm[dst][0] = d0 | (s0 << 32);
-                            cpu.sse.xmm[dst][1] = d1 | (s1 << 32);
-                        }
-                    }
-                    // UNPCKHPS/UNPCKHPD (0x15)
-                    0x15 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (_lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        if cpu.prefix.op_size {
-                            // UNPCKHPD: dst[0] = dst[1], dst[1] = src[1]
-                            cpu.sse.xmm[dst][0] = cpu.sse.xmm[dst][1];
-                            cpu.sse.xmm[dst][1] = hi;
-                        } else {
-                            // UNPCKHPS: interleave high 32-bit floats
-                            let d2 = cpu.sse.xmm[dst][1] as u32 as u64;
-                            let d3 = (cpu.sse.xmm[dst][1] >> 32) as u32 as u64;
-                            let s2 = hi as u32 as u64;
-                            let s3 = (hi >> 32) as u32 as u64;
-                            cpu.sse.xmm[dst][0] = d2 | (s2 << 32);
-                            cpu.sse.xmm[dst][1] = d3 | (s3 << 32);
-                        }
-                    }
-                    // PSHUFD/PSHUFLW/PSHUFHW (0x70)
-                    0x70 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if cpu.prefix.op_size || cpu.prefix.rep == 0 {
-                            // PSHUFD: shuffle 32-bit dwords
-                            let dwords = [lo as u32, (lo >> 32) as u32, hi as u32, (hi >> 32) as u32];
-                            let r0 = dwords[(imm & 3) as usize];
-                            let r1 = dwords[((imm >> 2) & 3) as usize];
-                            let r2 = dwords[((imm >> 4) & 3) as usize];
-                            let r3 = dwords[((imm >> 6) & 3) as usize];
-                            cpu.sse.xmm[dst][0] = r0 as u64 | ((r1 as u64) << 32);
-                            cpu.sse.xmm[dst][1] = r2 as u64 | ((r3 as u64) << 32);
-                        } else if cpu.prefix.rep == 0xF3 {
-                            // PSHUFLW: shuffle low 4 words, high unchanged
-                            let words = [lo as u16, (lo >> 16) as u16, (lo >> 32) as u16, (lo >> 48) as u16];
-                            let r0 = words[(imm & 3) as usize] as u64;
-                            let r1 = words[((imm >> 2) & 3) as usize] as u64;
-                            let r2 = words[((imm >> 4) & 3) as usize] as u64;
-                            let r3 = words[((imm >> 6) & 3) as usize] as u64;
-                            cpu.sse.xmm[dst][0] = r0 | (r1 << 16) | (r2 << 32) | (r3 << 48);
-                            cpu.sse.xmm[dst][1] = hi;
-                        } else {
-                            // PSHUFHW: shuffle high 4 words, low unchanged
-                            let words = [hi as u16, (hi >> 16) as u16, (hi >> 32) as u16, (hi >> 48) as u16];
-                            let r0 = words[(imm & 3) as usize] as u64;
-                            let r1 = words[((imm >> 2) & 3) as usize] as u64;
-                            let r2 = words[((imm >> 4) & 3) as usize] as u64;
-                            let r3 = words[((imm >> 6) & 3) as usize] as u64;
-                            cpu.sse.xmm[dst][0] = lo;
-                            cpu.sse.xmm[dst][1] = r0 | (r1 << 16) | (r2 << 32) | (r3 << 48);
-                        }
-                    }
-                    // SHUFPS/SHUFPD (0xC6)
-                    0xC6 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        if cpu.prefix.op_size {
-                            // SHUFPD
-                            let d = [cpu.sse.xmm[dst][0], cpu.sse.xmm[dst][1]];
-                            let s = [lo, hi];
-                            cpu.sse.xmm[dst][0] = d[(imm & 1) as usize];
-                            cpu.sse.xmm[dst][1] = s[((imm >> 1) & 1) as usize];
-                        } else {
-                            // SHUFPS
-                            let d = [cpu.sse.xmm[dst][0] as u32, (cpu.sse.xmm[dst][0] >> 32) as u32,
-                                     cpu.sse.xmm[dst][1] as u32, (cpu.sse.xmm[dst][1] >> 32) as u32];
-                            let s = [lo as u32, (lo >> 32) as u32, hi as u32, (hi >> 32) as u32];
-                            let r0 = d[(imm & 3) as usize] as u64;
-                            let r1 = d[((imm >> 2) & 3) as usize] as u64;
-                            let r2 = s[((imm >> 4) & 3) as usize] as u64;
-                            let r3 = s[((imm >> 6) & 3) as usize] as u64;
-                            cpu.sse.xmm[dst][0] = r0 | (r1 << 32);
-                            cpu.sse.xmm[dst][1] = r2 | (r3 << 32);
-                        }
-                    }
-
-                    // ==========================================================
-                    // SSE/SSE2 — Float Arithmetic (0x51-0x5F)
-                    // ==========================================================
-                    0x51 | 0x52 | 0x53 | 0x58 | 0x59 | 0x5A | 0x5B | 0x5C | 0x5D | 0x5E | 0x5F => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        exec_sse_arith(cpu, dst, lo, hi, op2);
-                    }
-
-                    // ==========================================================
-                    // SSE2 — Packed Integer Arithmetic
-                    // ==========================================================
-                    // PADDB/W/D/Q, PSUBB/W/D/Q, etc.
-                    0x60 | 0x61 | 0x62 | 0x63 | 0x64 | 0x65 | 0x66 | 0x67 |
-                    0x68 | 0x69 | 0x6A | 0x6B | 0x6C | 0x6D |
-                    0x71 | 0x72 | 0x73 |
-                    0x74 | 0x75 | 0x76 |
-                    0xD1 | 0xD2 | 0xD3 | 0xD4 | 0xD5 |
-                    0xD8 | 0xD9 | 0xDA | 0xDB | 0xDC | 0xDD | 0xDE | 0xDF |
-                    0xE0 | 0xE1 | 0xE2 | 0xE3 | 0xE4 | 0xE5 |
-                    0xE8 | 0xE9 | 0xEA | 0xEB | 0xEC | 0xED | 0xEE | 0xEF |
-                    0xF1 | 0xF2 | 0xF3 | 0xF4 | 0xF5 | 0xF6 |
-                    0xF8 | 0xF9 | 0xFA | 0xFB | 0xFC | 0xFD | 0xFE => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        // Shift-by-immediate (0x71/72/73) have imm8 after modrm, not XMM source
-                        if op2 == 0x71 || op2 == 0x72 || op2 == 0x73 {
-                            let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                            let reg_field = (modrm >> 3) & 7;
-                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            exec_sse_shift_imm(cpu, r, op2, reg_field, imm);
-                        } else {
-                            let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                            exec_sse_int_op(cpu, dst, lo, hi, op2);
-                        }
-                    }
-
-                    // ==========================================================
-                    // SSE/SSE2 — Conversions
-                    // ==========================================================
-                    0x2A => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        if cpu.prefix.rep == 0xF3 {
-                            // CVTSI2SS
-                            let val = if lane == LANE64 {
-                                load_rm(cpu, ram, ram_size, modrm, LANE64) as i64 as f32
-                            } else {
-                                load_rm(cpu, ram, ram_size, modrm, LANE32) as i32 as f32
-                            };
-                            cpu.sse.xmm[dst][0] = (cpu.sse.xmm[dst][0] & 0xFFFFFFFF00000000) | val.to_bits() as u64;
-                        } else if cpu.prefix.rep == 0xF2 {
-                            // CVTSI2SD
-                            let val = if lane == LANE64 {
-                                load_rm(cpu, ram, ram_size, modrm, LANE64) as i64 as f64
-                            } else {
-                                load_rm(cpu, ram, ram_size, modrm, LANE32) as i32 as f64
-                            };
-                            cpu.sse.xmm[dst][0] = val.to_bits();
-                        } else {
-                            // CVTPI2PS / CVTPI2PD — not commonly used, ignore
-                        }
-                    }
-                    0x2C => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        if cpu.prefix.rep == 0xF3 {
-                            // CVTTSS2SI
-                            let val = if modrm & 0xC0 == 0xC0 {
-                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                f32::from_bits(cpu.sse.xmm[src][0] as u32)
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                f32::from_bits(try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr)))
-                            };
-                            if lane == LANE64 {
-                                cpu.regs[dst] = val as i64 as u64;
-                            } else {
-                                cpu.regs[dst] = val as i32 as u32 as u64;
-                            }
-                        } else if cpu.prefix.rep == 0xF2 {
-                            // CVTTSD2SI
-                            let val = if modrm & 0xC0 == 0xC0 {
-                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                f64::from_bits(cpu.sse.xmm[src][0])
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                f64::from_bits(try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr)))
-                            };
-                            if lane == LANE64 {
-                                cpu.regs[dst] = val as i64 as u64;
-                            } else {
-                                cpu.regs[dst] = val as i32 as u32 as u64;
-                            }
-                        }
-                    }
-                    0x2D => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        if cpu.prefix.rep == 0xF3 {
-                            // CVTSS2SI (rounds per MXCSR)
-                            let val = if modrm & 0xC0 == 0xC0 {
-                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                f32::from_bits(cpu.sse.xmm[src][0] as u32)
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                f32::from_bits(try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr)))
-                            };
-                            if lane == LANE64 {
-                                cpu.regs[dst] = libm::roundf(val) as i64 as u64;
-                            } else {
-                                cpu.regs[dst] = libm::roundf(val) as i32 as u32 as u64;
-                            }
-                        } else if cpu.prefix.rep == 0xF2 {
-                            // CVTSD2SI
-                            let val = if modrm & 0xC0 == 0xC0 {
-                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                                f64::from_bits(cpu.sse.xmm[src][0])
-                            } else {
-                                let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                                f64::from_bits(try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr)))
-                            };
-                            if lane == LANE64 {
-                                cpu.regs[dst] = libm::round(val) as i64 as u64;
-                            } else {
-                                cpu.regs[dst] = libm::round(val) as i32 as u32 as u64;
-                            }
-                        }
-                    }
-                    // CVTPS2PD / CVTSS2SD / CVTPD2PS / CVTSD2SS (0x5A)
-                    // Already handled in SSE arith block (0x5A)
-
-                    // CVTDQ2PS / CVTPS2DQ (0x5B) — handled in arith block
-                    // CVTPD2DQ / CVTDQ2PD (0xE6) — handled below
-                    0xE6 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
-                        if cpu.prefix.op_size {
-                            // CVTTPD2DQ: packed double → packed dword (truncate)
-                            let d0 = f64::from_bits(lo) as i32;
-                            let d1 = f64::from_bits(hi) as i32;
-                            cpu.sse.xmm[dst][0] = d0 as u32 as u64 | ((d1 as u32 as u64) << 32);
-                            cpu.sse.xmm[dst][1] = 0;
-                        } else if cpu.prefix.rep == 0xF3 {
-                            // CVTDQ2PD: packed dword → packed double
-                            let d0 = lo as u32 as i32 as f64;
-                            let d1 = (lo >> 32) as u32 as i32 as f64;
-                            cpu.sse.xmm[dst][0] = d0.to_bits();
-                            cpu.sse.xmm[dst][1] = d1.to_bits();
-                        } else if cpu.prefix.rep == 0xF2 {
-                            // CVTPD2DQ: packed double → packed dword (round)
-                            let d0 = libm::round(f64::from_bits(lo)) as i32;
-                            let d1 = libm::round(f64::from_bits(hi)) as i32;
-                            cpu.sse.xmm[dst][0] = d0 as u32 as u64 | ((d1 as u32 as u64) << 32);
-                            cpu.sse.xmm[dst][1] = 0;
-                        }
-                    }
-
-                    // ==========================================================
-                    // SSE Control
-                    // ==========================================================
-                    // EMMS (0x77) — empty MMX state
-                    0x77 => {
-                        cpu.fpu.tag = 0xFFFF;
-                    }
-
-                    // PINSRW (0xC4), PEXTRW (0xC5)
-                    0xC4 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let val = if modrm & 0xC0 == 0xC0 {
-                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                            cpu.regs[r] as u16
-                        } else {
-                            let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                            try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
-                        };
-                        let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let sel = (imm & 7) as usize;
-                        let qword = sel >> 2;
-                        let word_in_qword = sel & 3;
-                        let shift = word_in_qword * 16;
-                        let mask = !(0xFFFFu64 << shift);
-                        cpu.sse.xmm[dst][qword] = (cpu.sse.xmm[dst][qword] & mask) | ((val as u64) << shift);
-                    }
-                    0xC5 => {
-                        let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                        let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                        let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let sel = (imm & 7) as usize;
-                        let qword = sel >> 2;
-                        let word_in_qword = sel & 3;
-                        let val = (cpu.sse.xmm[src][qword] >> (word_in_qword * 16)) as u16;
-                        cpu.regs[dst] = val as u64;
-                    }
-
-                    // SWAPGS (0x0F 0x01 /F8) — already handled in 0x01 above
-                    // XGETBV (0x0F 0x01 /D0) — TODO
                     _ => {
-                        // Unimplemented 0F opcode
-                        raise_exception(cpu, EXC_UD, 0);
+                        let v = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
+                        cpu.regs[RAX] = v;
                     }
                 }
-            }
+        }
+        0xA2 => {
+                let addr = if cpu.long_mode && !cpu.prefix.addr_size {
+                    try_or_fault_page!(cpu, fetch_imm64(cpu, ram, ram_size))
+                } else {
+                    try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64
+                };
+                try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, cpu.regs[RAX] as u8));
+        }
+        0xA3 => {
+                let addr = if cpu.long_mode && !cpu.prefix.addr_size {
+                    try_or_fault_page!(cpu, fetch_imm64(cpu, ram, ram_size))
+                } else {
+                    try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64
+                };
+                match lane {
+                    LANE16 => try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, addr, cpu.regs[RAX] as u16)),
+                    LANE32 => try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.regs[RAX] as u32)),
+                    _ => try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.regs[RAX])),
+                }
+        }
+        0xA4 => {
+                string_movsb(cpu, ram, ram_size);
+        }
+        0xA5 => {
+                string_movs(cpu, ram, ram_size, lane);
+        }
+        0xA6 => {
+                string_cmpsb(cpu, ram, ram_size);
+        }
+        0xA7 => {
+                string_cmps(cpu, ram, ram_size, lane);
+        }
+        0xAA => {
+                string_stosb(cpu, ram, ram_size);
+        }
+        0xAB => {
+                string_stos(cpu, ram, ram_size, lane);
+        }
+        0xAC => {
+                string_lodsb(cpu, ram, ram_size);
+        }
+        0xAD => {
+                string_lods(cpu, ram, ram_size, lane);
+        }
+        0xAE => {
+                string_scasb(cpu, ram, ram_size);
+        }
+        0xAF => {
+                string_scas(cpu, ram, ram_size, lane);
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // INT3 (0xCC) — breakpoint trap
-            // ============================================================
-            0xCC | 0x1CC | 0x2CC => {
+// ============================================================
+// Page B: opcodes 0xB0-0xBF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_b(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0xB0..=0xB7 => {
+                let reg = ((opcode - 0xB0) & 7) as usize;
+                let reg = if cpu.prefix.rex != 0 {
+                    reg | ((cpu.prefix.rex as usize & 1) << 3)
+                } else { reg };
+                let imm = match mem::fetch_u8(cpu, ram, ram_size, cpu.rip) {
+                    Ok(v) => v,
+                    Err(_) => { raise_exception(cpu, EXC_PF, 0); return true; }
+                };
+                cpu.rip += 1;
+                write_reg8(cpu, reg, imm);
+        }
+        0xB8..=0xBF => {
+                let reg = ((opcode - 0xB8) & 7) as usize;
+                let reg = reg | ((cpu.prefix.rex as usize & 1) << 3);
+                match lane {
+                    LANE16 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size));
+                        write_reg16(cpu, reg, imm);
+                    }
+                    LANE32 => {
+                        let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size));
+                        cpu.regs[reg] = imm as u64; // zero-extended
+                    }
+                    LANE64 => {
+                        // MOV r64, imm64 — full 64-bit immediate
+                        let imm = try_or_fault_page!(cpu, fetch_imm64(cpu, ram, ram_size));
+                        cpu.regs[reg] = imm;
+                    }
+                    _ => {}
+                }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// Page C: opcodes 0xC0-0xCF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_c(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0xC3 => {
+                if cpu.long_mode {
+                    let addr = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
+                    cpu.rip = addr;
+                } else {
+                    let addr = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
+                    cpu.rip = addr as u64;
+                }
+        }
+        0xC6 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                // reg field must be 0 for MOV
+                if modrm & 0xC0 == 0xC0 {
+                    let dst_reg = (modrm & 7) as usize
+                        | ((cpu.prefix.rex as usize & 1) << 3);
+                    let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                    write_reg8(cpu, dst_reg, imm);
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                    try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, imm));
+                }
+        }
+        0xC7 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                if modrm & 0xC0 == 0xC0 {
+                    let dst_reg = (modrm & 7) as usize
+                        | ((cpu.prefix.rex as usize & 1) << 3);
+                    match lane {
+                        LANE16 => {
+                            let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size));
+                            write_reg16(cpu, dst_reg, imm);
+                        }
+                        LANE32 => {
+                            let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size));
+                            cpu.regs[dst_reg] = imm as u64;
+                        }
+                        LANE64 => {
+                            let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
+                            cpu.regs[dst_reg] = imm;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    match lane {
+                        LANE16 => {
+                            let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size));
+                            try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, addr, imm));
+                        }
+                        LANE32 => {
+                            let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size));
+                            try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr, imm));
+                        }
+                        LANE64 => {
+                            let imm = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u32;
+                            try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, imm as i32 as u64));
+                        }
+                        _ => {}
+                    }
+                }
+        }
+        0xCC => {
                 // INT3 is a trap: pushed RIP is after the instruction
                 deliver_interrupt(cpu, ram, ram_size, EXC_BP, false, 0);
-            }
-
-            // ============================================================
-            // INT imm8 (0xCD) — software interrupt
-            // ============================================================
-            0xCD | 0x1CD | 0x2CD => {
-                let vector = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0xCD => {
+                let vector = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 // INT is a trap: pushed RIP is after the instruction (current rip)
                 // Don't use raise_exception which rewinds RIP to instr_start
                 deliver_interrupt(cpu, ram, ram_size, vector as u32, false, 0);
-            }
-
-            // ============================================================
-            // IRET/IRETD/IRETQ (0xCF)
-            // ============================================================
-            0xCF | 0x1CF | 0x2CF => {
+        }
+        0xCF => {
                 if cpu.long_mode {
                     // 64-bit IRETQ: pop RIP, CS, RFLAGS, RSP, SS
                     let rsp = cpu.regs[RSP];
-                    let new_rip = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, rsp));
-                    let new_cs = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, rsp + 8));
-                    let new_rflags = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, rsp + 16));
-                    let new_rsp = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, rsp + 24));
-                    let new_ss = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, rsp + 32));
+                    let new_rip = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, rsp));
+                    let new_cs = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, rsp + 8));
+                    let new_rflags = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, rsp + 16));
+                    let new_rsp = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, rsp + 24));
+                    let new_ss = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, rsp + 32));
 
                     let old_cpl = cpu.cpl;
                     let new_cpl = (new_cs as u16 & 3) as u8;
@@ -2496,9 +1764,9 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                 } else {
                     // 32-bit IRETD: pop EIP, CS, EFLAGS
                     let rsp = cpu.regs[RSP];
-                    let new_eip = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, rsp));
-                    let new_cs = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, rsp + 4));
-                    let new_eflags = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, rsp + 8));
+                    let new_eip = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, rsp));
+                    let new_cs = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, rsp + 4));
+                    let new_eflags = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, rsp + 8));
 
                     cpu.rip = new_eip as u64;
                     cpu.segs[SEG_CS].selector = new_cs as u16;
@@ -2507,494 +1775,31 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                     cpu.regs[RSP] = rsp + 12;
                     cpu.halted = false;
                 }
-            }
-
-            // ============================================================
-            // MOVSXD r64, r/m32 (0x63 in 64-bit mode)
-            // ============================================================
-            0x263 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let dst_reg = ((modrm >> 3) & 7) as usize
-                    | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                let val = if modrm & 0xC0 == 0xC0 {
-                    let r = (modrm & 7) as usize
-                        | ((cpu.prefix.rex as usize & 1) << 3);
-                    cpu.regs[r] as u32
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr))
-                };
-                cpu.regs[dst_reg] = val as i32 as i64 as u64;
-            }
-
-            // ============================================================
-            // LEAVE (0xC9)
-            // ============================================================
-            0xC9 | 0x1C9 | 0x2C9 => {
+        }
+        0xC9 => {
                 cpu.regs[RSP] = cpu.regs[RBP];
                 if cpu.long_mode {
-                    let val = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
+                    let val = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
                     cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
                     cpu.regs[RBP] = val;
                 } else {
-                    let val = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
+                    let val = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
                     cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
                     cpu.regs[RBP] = val as u64;
                 }
-            }
-
-            // ============================================================
-            // CDQE/CWDE/CBW (0x98)
-            // ============================================================
-            0x98 | 0x198 | 0x298 => {
-                match lane {
-                    LANE16 => {
-                        // CBW: AL -> AX (sign extend)
-                        let val = cpu.regs[RAX] as u8 as i8 as i16 as u16;
-                        write_reg16(cpu, RAX, val);
-                    }
-                    LANE32 => {
-                        // CWDE: AX -> EAX
-                        let val = cpu.regs[RAX] as u16 as i16 as i32 as u32;
-                        cpu.regs[RAX] = val as u64;
-                    }
-                    LANE64 => {
-                        // CDQE: EAX -> RAX
-                        let val = cpu.regs[RAX] as u32 as i32 as i64 as u64;
-                        cpu.regs[RAX] = val;
-                    }
-                    _ => {}
-                }
-            }
-
-            // ============================================================
-            // CQO/CDQ/CWD (0x99)
-            // ============================================================
-            0x99 | 0x199 | 0x299 => {
-                match lane {
-                    LANE16 => {
-                        // CWD: AX -> DX:AX
-                        let val = cpu.regs[RAX] as i16;
-                        write_reg16(cpu, RDX, if val < 0 { 0xFFFF } else { 0 });
-                    }
-                    LANE32 => {
-                        // CDQ: EAX -> EDX:EAX
-                        let val = cpu.regs[RAX] as i32;
-                        cpu.regs[RDX] = if val < 0 { 0xFFFFFFFF } else { 0 };
-                    }
-                    LANE64 => {
-                        // CQO: RAX -> RDX:RAX
-                        let val = cpu.regs[RAX] as i64;
-                        cpu.regs[RDX] = if val < 0 { !0u64 } else { 0 };
-                    }
-                    _ => {}
-                }
-            }
-
-            // ============================================================
-            // ALU Eb,Gb — byte r/m ops (0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38)
-            // ADD=0x00, OR=0x08, ADC=0x10, SBB=0x18, AND=0x20, SUB=0x28, XOR=0x30, CMP=0x38
-            // ============================================================
-            0x00 | 0x100 | 0x200 | 0x08 | 0x108 | 0x208 | 0x10 | 0x110 | 0x210 | 0x18 | 0x118 | 0x218 | 0x20 | 0x120 | 0x220 | 0x28 | 0x128 | 0x228 | 0x30 | 0x130 | 0x230 | 0x38 | 0x138 | 0x238 => {
-                let alu_op = ((opcode >> 3) & 7) as usize;
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                let src = read_reg8(cpu, src_reg);
-                if modrm & 0xC0 == 0xC0 {
-                    let dst_reg = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    let dst = read_reg8(cpu, dst_reg);
-                    let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
-                    if alu_op != 7 { write_reg8(cpu, dst_reg, res); } // CMP doesn't write
-                    set_lazy(cpu, flag_op, dst as u64, res as u64);
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    let dst = try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, addr));
-                    let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
-                    if alu_op != 7 { try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res)); }
-                    set_lazy(cpu, flag_op, dst as u64, res as u64);
-                }
-            }
-
-            // ============================================================
-            // ALU Ev,Gv — word/dword/qword r/m ops (0x01, 0x09, 0x11, 0x19, 0x21, 0x29, 0x31, 0x39)
-            // ============================================================
-            0x01 | 0x101 | 0x201 | 0x09 | 0x109 | 0x209 | 0x11 | 0x111 | 0x211 | 0x19 | 0x119 | 0x219 | 0x21 | 0x121 | 0x221 | 0x29 | 0x129 | 0x229 | 0x31 | 0x131 | 0x231 | 0x39 | 0x139 | 0x239 => {
-                let alu_op = ((opcode >> 3) & 7) as usize;
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                if modrm & 0xC0 == 0xC0 {
-                    let dst_reg = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    alu_ev_gv_reg(cpu, alu_op, dst_reg, src_reg, lane);
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    alu_ev_gv_mem(cpu, ram, ram_size, alu_op, addr, src_reg, lane);
-                }
-            }
-
-            // ============================================================
-            // ALU Gb,Eb — byte r/m ops (0x02, 0x0A, 0x12, 0x1A, 0x22, 0x2A, 0x32, 0x3A)
-            // ============================================================
-            0x02 | 0x102 | 0x202 | 0x0A | 0x10A | 0x20A | 0x12 | 0x112 | 0x212 | 0x1A | 0x11A | 0x21A | 0x22 | 0x122 | 0x222 | 0x2A | 0x12A | 0x22A | 0x32 | 0x132 | 0x232 | 0x3A | 0x13A | 0x23A => {
-                let alu_op = ((opcode >> 3) & 7) as usize;
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                let src = if modrm & 0xC0 == 0xC0 {
-                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    read_reg8(cpu, r)
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
-                };
-                let dst = read_reg8(cpu, dst_reg);
-                let (res, flag_op) = alu_op_b(cpu, alu_op, dst, src);
-                if alu_op != 7 { write_reg8(cpu, dst_reg, res); }
-                set_lazy(cpu, flag_op, dst as u64, res as u64);
-            }
-
-            // ============================================================
-            // ALU Gv,Ev — word/dword/qword (0x03, 0x0B, 0x13, 0x1B, 0x23, 0x2B, 0x33, 0x3B)
-            // ============================================================
-            0x03 | 0x103 | 0x203 | 0x0B | 0x10B | 0x20B | 0x13 | 0x113 | 0x213 | 0x1B | 0x11B | 0x21B | 0x23 | 0x123 | 0x223 | 0x2B | 0x12B | 0x22B | 0x33 | 0x133 | 0x233 | 0x3B | 0x13B | 0x23B => {
-                let alu_op = ((opcode >> 3) & 7) as usize;
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                let src = if modrm & 0xC0 == 0xC0 {
-                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    cpu.regs[r]
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    match lane {
-                        LANE16 => try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
-                        LANE32 => try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
-                        _ => try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
-                    }
-                };
-                alu_gv_ev(cpu, alu_op, dst_reg, src, lane);
-            }
-
-            // ============================================================
-            // ALU AL, imm8 (0x04, 0x0C, 0x14, 0x1C, 0x24, 0x34 already handled above)
-            // ADC AL (0x14), SBB AL (0x1C)
-            // ============================================================
-            0x14 | 0x114 | 0x214 => {
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let lhs = cpu.regs[RAX] as u8;
-                let cf = flags::get_cf(cpu) as u8;
-                let res = lhs.wrapping_add(imm).wrapping_add(cf);
-                write_reg8_al(cpu, res);
-                set_lazy(cpu, FlagOp::AdcB, lhs as u64, res as u64);
-            }
-            0x1C | 0x11C | 0x21C => {
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let lhs = cpu.regs[RAX] as u8;
-                let cf = flags::get_cf(cpu) as u8;
-                let res = lhs.wrapping_sub(imm).wrapping_sub(cf);
-                write_reg8_al(cpu, res);
-                set_lazy(cpu, FlagOp::SbbB, lhs as u64, res as u64);
-            }
-
-            // ============================================================
-            // ALU rAX, imm16/32 for remaining ops (AND=0x25, OR=0x0D, XOR=0x35 already handled)
-            // ADC rAX (0x15), SBB rAX (0x1D)
-            // ============================================================
-            0x15 | 0x115 | 0x215 => {
-                let cf = flags::get_cf(cpu) as u64;
-                match lane {
-                    LANE16 => {
-                        let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size)) as u64;
-                        let lhs = cpu.regs[RAX] & 0xFFFF;
-                        let res = (lhs.wrapping_add(imm).wrapping_add(cf)) & 0xFFFF;
-                        write_reg16(cpu, RAX, res as u16);
-                        set_lazy(cpu, FlagOp::AdcW, lhs, res);
-                    }
-                    LANE32 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64;
-                        let lhs = cpu.regs[RAX] & 0xFFFFFFFF;
-                        let res = (lhs.wrapping_add(imm).wrapping_add(cf)) & 0xFFFFFFFF;
-                        cpu.regs[RAX] = res;
-                        set_lazy(cpu, FlagOp::AdcL, lhs, res);
-                    }
-                    LANE64 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
-                        let lhs = cpu.regs[RAX];
-                        let res = lhs.wrapping_add(imm).wrapping_add(cf);
-                        cpu.regs[RAX] = res;
-                        set_lazy(cpu, FlagOp::AdcQ, lhs, res);
-                    }
-                    _ => {}
-                }
-            }
-            0x1D | 0x11D | 0x21D => {
-                let cf = flags::get_cf(cpu) as u64;
-                match lane {
-                    LANE16 => {
-                        let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size)) as u64;
-                        let lhs = cpu.regs[RAX] & 0xFFFF;
-                        let res = (lhs.wrapping_sub(imm).wrapping_sub(cf)) & 0xFFFF;
-                        write_reg16(cpu, RAX, res as u16);
-                        set_lazy(cpu, FlagOp::SbbW, lhs, res);
-                    }
-                    LANE32 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64;
-                        let lhs = cpu.regs[RAX] & 0xFFFFFFFF;
-                        let res = (lhs.wrapping_sub(imm).wrapping_sub(cf)) & 0xFFFFFFFF;
-                        cpu.regs[RAX] = res;
-                        set_lazy(cpu, FlagOp::SbbL, lhs, res);
-                    }
-                    LANE64 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
-                        let lhs = cpu.regs[RAX];
-                        let res = lhs.wrapping_sub(imm).wrapping_sub(cf);
-                        cpu.regs[RAX] = res;
-                        set_lazy(cpu, FlagOp::SbbQ, lhs, res);
-                    }
-                    _ => {}
-                }
-            }
-
-            // AND rAX, imm (0x25), OR rAX, imm (0x0D), XOR rAX, imm (0x35)
-            0x25 | 0x125 | 0x225 | 0x0D | 0x10D | 0x20D | 0x35 | 0x135 | 0x235 => {
-                let op_byte = opcode;
-                match lane {
-                    LANE16 => {
-                        let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size));
-                        let lhs = cpu.regs[RAX] as u16;
-                        let (res, fop) = match op_byte {
-                            0x25 => (lhs & imm, FlagOp::AndW),
-                            0x0D => (lhs | imm, FlagOp::OrW),
-                            _ => (lhs ^ imm, FlagOp::XorW),
-                        };
-                        write_reg16(cpu, RAX, res);
-                        set_lazy(cpu, fop, 0, res as u64);
-                    }
-                    LANE32 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size));
-                        let lhs = cpu.regs[RAX] as u32;
-                        let (res, fop) = match op_byte {
-                            0x25 => (lhs & imm, FlagOp::AndL),
-                            0x0D => (lhs | imm, FlagOp::OrL),
-                            _ => (lhs ^ imm, FlagOp::XorL),
-                        };
-                        cpu.regs[RAX] = res as u64;
-                        set_lazy(cpu, fop, 0, res as u64);
-                    }
-                    LANE64 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
-                        let lhs = cpu.regs[RAX];
-                        let (res, fop) = match op_byte {
-                            0x25 => (lhs & imm, FlagOp::AndQ),
-                            0x0D => (lhs | imm, FlagOp::OrQ),
-                            _ => (lhs ^ imm, FlagOp::XorQ),
-                        };
-                        cpu.regs[RAX] = res;
-                        set_lazy(cpu, fop, 0, res);
-                    }
-                    _ => {}
-                }
-            }
-
-            // TEST rAX, imm (0xA9)
-            0xA9 | 0x1A9 | 0x2A9 => {
-                match lane {
-                    LANE16 => {
-                        let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size));
-                        let res = cpu.regs[RAX] as u16 & imm;
-                        set_lazy(cpu, FlagOp::AndW, 0, res as u64);
-                    }
-                    LANE32 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size));
-                        let res = cpu.regs[RAX] as u32 & imm;
-                        set_lazy(cpu, FlagOp::AndL, 0, res as u64);
-                    }
-                    LANE64 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as u64;
-                        let res = cpu.regs[RAX] & imm;
-                        set_lazy(cpu, FlagOp::AndQ, 0, res);
-                    }
-                    _ => {}
-                }
-            }
-
-            // ============================================================
-            // TEST r/m, r (0x84 byte, 0x85 word/dword/qword)
-            // ============================================================
-            0x84 | 0x184 | 0x284 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let src = read_reg8(cpu, ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3);
-                let dst = if modrm & 0xC0 == 0xC0 {
-                    read_reg8(cpu, (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3))
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
-                };
-                set_lazy(cpu, FlagOp::AndB, 0, (dst & src) as u64);
-            }
-            0x85 | 0x185 | 0x285 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                let (dst, res_fop) = if modrm & 0xC0 == 0xC0 {
-                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    (cpu.regs[r], 0u8)
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    let v = match lane {
-                        LANE16 => try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
-                        LANE32 => try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
-                        _ => try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
-                    };
-                    (v, 0u8)
-                };
-                let _ = res_fop;
-                let src = cpu.regs[src_reg];
-                match lane {
-                    LANE16 => set_lazy(cpu, FlagOp::AndW, 0, (dst as u16 & src as u16) as u64),
-                    LANE32 => set_lazy(cpu, FlagOp::AndL, 0, (dst as u32 & src as u32) as u64),
-                    _ => set_lazy(cpu, FlagOp::AndQ, 0, dst & src),
-                }
-            }
-
-            // ============================================================
-            // XCHG r/m, r (0x86 byte, 0x87 word/dword/qword)
-            // ============================================================
-            0x86 | 0x186 | 0x286 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                if modrm & 0xC0 == 0xC0 {
-                    let rm = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    let a = read_reg8(cpu, reg);
-                    let b = read_reg8(cpu, rm);
-                    write_reg8(cpu, reg, b);
-                    write_reg8(cpu, rm, a);
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    let mem_val = try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, addr));
-                    let reg_val = read_reg8(cpu, reg);
-                    write_reg8(cpu, reg, mem_val);
-                    try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, reg_val));
-                }
-            }
-            0x87 | 0x187 | 0x287 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                if modrm & 0xC0 == 0xC0 {
-                    let rm = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    let a = cpu.regs[reg];
-                    let b = cpu.regs[rm];
-                    match lane {
-                        LANE16 => { write_reg16(cpu, reg, b as u16); write_reg16(cpu, rm, a as u16); }
-                        LANE32 => { cpu.regs[reg] = b as u32 as u64; cpu.regs[rm] = a as u32 as u64; }
-                        _ => { cpu.regs[reg] = b; cpu.regs[rm] = a; }
-                    }
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    match lane {
-                        LANE16 => {
-                            let v = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
-                            try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, addr, cpu.regs[reg] as u16));
-                            write_reg16(cpu, reg, v);
-                        }
-                        LANE32 => {
-                            let v = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
-                            try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.regs[reg] as u32));
-                            cpu.regs[reg] = v as u64;
-                        }
-                        _ => {
-                            let v = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
-                            try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.regs[reg]));
-                            cpu.regs[reg] = v;
-                        }
-                    }
-                }
-            }
-
-            // ============================================================
-            // GRP1 Eb, imm8 (0x80)
-            // ============================================================
-            0x80 | 0x180 | 0x280 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let alu_op = ((modrm >> 3) & 7) as usize;
-                let (dst, addr) = if modrm & 0xC0 == 0xC0 {
-                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    (read_reg8(cpu, r), 0u64)
-                } else {
-                    let a = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    (try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, a)), a)
-                };
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let (res, flag_op) = alu_op_b(cpu, alu_op, dst, imm);
-                if alu_op != 7 { // not CMP
-                    if modrm & 0xC0 == 0xC0 {
-                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                        write_reg8(cpu, r, res);
-                    } else {
-                        try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res));
-                    }
-                }
-                set_lazy(cpu, flag_op, dst as u64, res as u64);
-            }
-
-            // ============================================================
-            // GRP1 Ev, imm16/32 (0x81)
-            // ============================================================
-            0x81 | 0x181 | 0x281 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let alu_op = ((modrm >> 3) & 7) as usize;
-                grp1_ev_imm(cpu, ram, ram_size, modrm, alu_op, lane, false);
-            }
-
-            // ============================================================
-            // GRP1 Eb, imm8 (0x82 — alias of 0x80 in 32-bit mode)
-            // ============================================================
-            0x82 | 0x182 | 0x282 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let alu_op = ((modrm >> 3) & 7) as usize;
-                let (dst, addr) = if modrm & 0xC0 == 0xC0 {
-                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    (read_reg8(cpu, r), 0u64)
-                } else {
-                    let a = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    (try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, a)), a)
-                };
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let (res, flag_op) = alu_op_b(cpu, alu_op, dst, imm);
-                if alu_op != 7 {
-                    if modrm & 0xC0 == 0xC0 {
-                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                        write_reg8(cpu, r, res);
-                    } else {
-                        try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res));
-                    }
-                }
-                set_lazy(cpu, flag_op, dst as u64, res as u64);
-            }
-
-            // ============================================================
-            // GRP1 Ev, imm8 sign-extended (0x83)
-            // ============================================================
-            0x83 | 0x183 | 0x283 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let alu_op = ((modrm >> 3) & 7) as usize;
-                grp1_ev_imm(cpu, ram, ram_size, modrm, alu_op, lane, true);
-            }
-
-            // ============================================================
-            // GRP2 — shifts and rotates
-            // 0xC0: Eb, imm8 | 0xC1: Ev, imm8
-            // 0xD0: Eb, 1    | 0xD1: Ev, 1
-            // 0xD2: Eb, CL   | 0xD3: Ev, CL
-            // ============================================================
-            0xC0 | 0x1C0 | 0x2C0 | 0xD0 | 0x1D0 | 0x2D0 | 0xD2 | 0x1D2 | 0x2D2 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0xC0 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let shift_op = ((modrm >> 3) & 7) as usize;
                 let (dst, addr) = if modrm & 0xC0 == 0xC0 {
                     let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
                     (read_reg8(cpu, r), 0u64)
                 } else {
-                    let a = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    (try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, a)), a)
+                    let a = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    (try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, a)), a)
                 };
                 let count = match opcode {
-                    0xC0 => try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) & 0x1F,
+                    0xC0 => try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) & 0x1F,
                     0xD0 => 1,
                     _ => cpu.regs[RCX] as u8 & 0x1F,
                 };
@@ -3004,51 +1809,287 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                         let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
                         write_reg8(cpu, r, res);
                     } else {
-                        try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res));
+                        try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res));
                     }
                 }
-            }
-            0xC1 | 0x1C1 | 0x2C1 | 0xD1 | 0x1D1 | 0x2D1 | 0xD3 | 0x1D3 | 0x2D3 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0xC1 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let shift_op = ((modrm >> 3) & 7) as usize;
                 let count_raw = match opcode {
-                    0xC1 => try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)),
+                    0xC1 => try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)),
                     0xD1 => 1,
                     _ => cpu.regs[RCX] as u8,
                 };
                 grp2_ev(cpu, ram, ram_size, modrm, shift_op, count_raw, lane);
-            }
+        }
+        0xC2 => {
+                let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size)) as u64;
+                if cpu.long_mode {
+                    let addr = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8).wrapping_add(imm);
+                    cpu.rip = addr;
+                } else {
+                    let addr = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4).wrapping_add(imm);
+                    cpu.rip = addr as u64;
+                }
+        }
+        0xC8 => {
+                let alloc_size = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size)) as u64;
+                let _nesting = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                // Simplified: nesting level 0 only
+                if cpu.long_mode {
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
+                    try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], cpu.regs[RBP]));
+                    cpu.regs[RBP] = cpu.regs[RSP];
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(alloc_size);
+                } else {
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
+                    try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], cpu.regs[RBP] as u32));
+                    cpu.regs[RBP] = cpu.regs[RSP] & 0xFFFFFFFF;
+                    cpu.regs[RSP] = (cpu.regs[RSP].wrapping_sub(alloc_size)) & 0xFFFFFFFF;
+                }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // GRP3 — TEST/NOT/NEG/MUL/IMUL/DIV/IDIV
-            // 0xF6: Eb  | 0xF7: Ev
-            // ============================================================
-            0xF6 | 0x1F6 | 0x2F6 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+// ============================================================
+// Page D: opcodes 0xD0-0xDF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_d(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0xD0 | 0xD2 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let shift_op = ((modrm >> 3) & 7) as usize;
+                let (dst, addr) = if modrm & 0xC0 == 0xC0 {
+                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                    (read_reg8(cpu, r), 0u64)
+                } else {
+                    let a = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    (try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, a)), a)
+                };
+                let count = match opcode {
+                    0xC0 => try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) & 0x1F,
+                    0xD0 => 1,
+                    _ => cpu.regs[RCX] as u8 & 0x1F,
+                };
+                if count != 0 {
+                    let res = shift_op_b(cpu, shift_op, dst, count);
+                    if modrm & 0xC0 == 0xC0 {
+                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                        write_reg8(cpu, r, res);
+                    } else {
+                        try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res));
+                    }
+                }
+        }
+        0xD1 | 0xD3 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                let shift_op = ((modrm >> 3) & 7) as usize;
+                let count_raw = match opcode {
+                    0xC1 => try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)),
+                    0xD1 => 1,
+                    _ => cpu.regs[RCX] as u8,
+                };
+                grp2_ev(cpu, ram, ram_size, modrm, shift_op, count_raw, lane);
+        }
+        0xD7 => {
+                let addr = cpu.regs[RBX].wrapping_add(cpu.regs[RAX] & 0xFF);
+                let val = try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr));
+                write_reg8_al(cpu, val);
+        }
+        0xDE..=0xDF => {
+                let fpu_op = (opcode & 7) as u8; // 0-7 maps to D8-DF
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                exec_fpu(cpu, ram, ram_size, fpu_op, modrm);
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// Page E: opcodes 0xE0-0xEF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_e(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0xE8 => {
+                let rel = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32;
+                let ret_addr = cpu.rip;
+                if cpu.long_mode {
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
+                    try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], ret_addr));
+                    cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
+                } else {
+                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
+                    try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], ret_addr as u32));
+                    cpu.rip = (cpu.rip.wrapping_add(rel as i64 as u64)) & 0xFFFFFFFF;
+                }
+        }
+        0xEB => {
+                let rel = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
+                cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
+        }
+        0xE9 => {
+                let rel = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32;
+                cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
+                if !cpu.long_mode {
+                    cpu.rip &= 0xFFFFFFFF;
+                }
+        }
+        0xE4 => {
+                let port = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as u16;
+                let val = crate::pic::io_read(cpu, ram, ram_size, port, 1);
+                write_reg8_al(cpu, val as u8);
+        }
+        0xEC => {
+                let port = cpu.regs[RDX] as u16;
+                let val = crate::pic::io_read(cpu, ram, ram_size, port, 1);
+                write_reg8_al(cpu, val as u8);
+        }
+        0xE5 => {
+                let port = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as u16;
+                let size = if lane == LANE16 { 2u8 } else { 4u8 };
+                let val = crate::pic::io_read(cpu, ram, ram_size, port, size);
+                match lane {
+                    LANE16 => write_reg16(cpu, RAX, val as u16),
+                    _ => cpu.regs[RAX] = val as u64,
+                }
+        }
+        0xED => {
+                let port = cpu.regs[RDX] as u16;
+                let size = if lane == LANE16 { 2u8 } else { 4u8 };
+                let val = crate::pic::io_read(cpu, ram, ram_size, port, size);
+                match lane {
+                    LANE16 => write_reg16(cpu, RAX, val as u16),
+                    _ => cpu.regs[RAX] = val as u64,
+                }
+        }
+        0xE6 => {
+                let port = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as u16;
+                crate::pic::io_write(cpu, ram, ram_size, port, cpu.regs[RAX] as u32 & 0xFF, 1);
+        }
+        0xEE => {
+                let port = cpu.regs[RDX] as u16;
+                crate::pic::io_write(cpu, ram, ram_size, port, cpu.regs[RAX] as u32 & 0xFF, 1);
+        }
+        0xE7 => {
+                let port = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as u16;
+                let size = if lane == LANE16 { 2u8 } else { 4u8 };
+                crate::pic::io_write(cpu, ram, ram_size, port, cpu.regs[RAX] as u32, size);
+        }
+        0xEF => {
+                let port = cpu.regs[RDX] as u16;
+                let size = if lane == LANE16 { 2u8 } else { 4u8 };
+                crate::pic::io_write(cpu, ram, ram_size, port, cpu.regs[RAX] as u32, size);
+        }
+        0xE2 => {
+                let rel = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
+                cpu.regs[RCX] = cpu.regs[RCX].wrapping_sub(1);
+                if cpu.regs[RCX] != 0 {
+                    cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
+                }
+        }
+        0xE0 => {
+                // LOOPNZ
+                let rel = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
+                cpu.regs[RCX] = cpu.regs[RCX].wrapping_sub(1);
+                if cpu.regs[RCX] != 0 && !eval_cc(cpu, 4) { // ZF==0
+                    cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
+                }
+        }
+        0xE1 => {
+                // LOOPZ
+                let rel = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
+                cpu.regs[RCX] = cpu.regs[RCX].wrapping_sub(1);
+                if cpu.regs[RCX] != 0 && eval_cc(cpu, 4) { // ZF==1
+                    cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
+                }
+        }
+        0xE3 => {
+                let rel = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
+                let counter = if cpu.prefix.addr_size {
+                    cpu.regs[RCX] as u32 as u64
+                } else {
+                    cpu.regs[RCX]
+                };
+                if counter == 0 {
+                    cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
+                    if !cpu.long_mode { cpu.rip &= 0xFFFFFFFF; }
+                }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// Page F: opcodes 0xF0-0xFF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_page_f(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, lane: u32) -> bool {
+    match opcode {
+        0xF8 => {
+                materialize_flags(cpu);
+                cpu.rflags &= !CF;
+                cpu.lazy.op = FlagOp::External;
+        }
+        0xF9 => {
+                materialize_flags(cpu);
+                cpu.rflags |= CF;
+                cpu.lazy.op = FlagOp::External;
+        }
+        0xF5 => {
+                materialize_flags(cpu);
+                cpu.rflags ^= CF;
+                cpu.lazy.op = FlagOp::External;
+        }
+        0xFC => {
+                cpu.rflags &= !DF;
+        }
+        0xFD => {
+                cpu.rflags |= DF;
+        }
+        0xFA => {
+                cpu.rflags &= !IF;
+        }
+        0xFB => {
+                cpu.rflags |= IF;
+                cpu.inhibit_irq = true; // delay interrupt by one instruction
+        }
+        0xF4 => {
+                if cpu.cpl != 0 {
+                    raise_exception(cpu, EXC_GP, 0);
+                } else {
+                    cpu.halted = true;
+                    { cpu.halted = true; return false; }
+                }
+        }
+        0xF6 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 grp3_eb(cpu, ram, ram_size, modrm);
-            }
-            0xF7 | 0x1F7 | 0x2F7 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0xF7 => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 grp3_ev(cpu, ram, ram_size, modrm, lane);
-            }
-
-            // ============================================================
-            // INC/DEC r (0x40-0x47/0x48-0x4F) — 32-bit mode only (REX in 64-bit)
-            // In 64-bit mode these are REX prefixes, handled in prefix loop
-            // ============================================================
-
-            // ============================================================
-            // GRP4 — INC/DEC Eb (0xFE)
-            // ============================================================
-            0xFE | 0x1FE | 0x2FE => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0xFE => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let op = (modrm >> 3) & 7;
                 let (dst, addr) = if modrm & 0xC0 == 0xC0 {
                     let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
                     (read_reg8(cpu, r), 0u64)
                 } else {
-                    let a = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    (try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, a)), a)
+                    let a = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                    (try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, a)), a)
                 };
                 let (res, fop) = if op == 0 {
                     (dst.wrapping_add(1), FlagOp::IncB)
@@ -3059,543 +2100,1805 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
                     let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
                     write_reg8(cpu, r, res);
                 } else {
-                    try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res));
+                    try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res));
                 }
                 set_lazy(cpu, fop, dst as u64, res as u64);
-            }
-
-            // ============================================================
-            // GRP5 — INC/DEC/CALL/JMP/PUSH Ev (0xFF)
-            // ============================================================
-            0xFF | 0x1FF | 0x2FF => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
+        }
+        0xFF => {
+                let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 grp5(cpu, ram, ram_size, modrm, lane);
-            }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // PUSHF (0x9C), POPF (0x9D)
-            // ============================================================
-            0x9C | 0x19C | 0x29C => {
-                materialize_flags(cpu);
-                let flags = cpu.rflags & 0x00000000003F7FD5; // mask off reserved bits
-                if cpu.long_mode {
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
-                    try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], flags));
-                } else {
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
-                    try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], flags as u32));
-                }
-            }
-            0x9D | 0x19D | 0x29D => {
-                let flags = if cpu.long_mode {
-                    let v = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
-                    v
-                } else {
-                    let v = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
-                    v as u64
-                };
-                let mask = CF | PF | AF | ZF | SF | TF | IF | DF | OF | AC;
-                cpu.rflags = (cpu.rflags & !mask) | (flags & mask) | 0x02;
-                cpu.lazy.op = FlagOp::External;
-            }
-
-            // ============================================================
-            // SAHF (0x9E) — Store AH into flags
-            // LAHF (0x9F) — Load flags into AH
-            // ============================================================
-            0x9E | 0x19E | 0x29E => {
-                // SAHF: AH → lower 8 bits of EFLAGS
-                let ah = (cpu.regs[RAX] >> 8) as u8;
-                cpu.rflags = (cpu.rflags & !0xFF) | (ah as u64 & (CF | PF | AF | ZF | SF)) | 0x02;
-                cpu.lazy.op = FlagOp::External;
-            }
-            0x9F | 0x19F | 0x29F => {
-                // LAHF: lower 8 bits of EFLAGS → AH
-                materialize_flags(cpu);
-                let ah = (cpu.rflags & 0xFF) as u8;
-                cpu.regs[RAX] = (cpu.regs[RAX] & !0xFF00) | ((ah as u64) << 8);
-            }
-
-            // ============================================================
-            // I/O instructions — IN/OUT
-            // IN AL, imm8 (0xE4) | IN AL, DX (0xEC)
-            // IN eAX, imm8 (0xE5) | IN eAX, DX (0xED)
-            // OUT imm8, AL (0xE6) | OUT DX, AL (0xEE)
-            // OUT imm8, eAX (0xE7) | OUT DX, eAX (0xEF)
-            // ============================================================
-            0xE4 | 0x1E4 | 0x2E4 => {
-                let port = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as u16;
-                let val = crate::pic::io_read(cpu, ram, ram_size, port, 1);
-                write_reg8_al(cpu, val as u8);
-            }
-            0xEC | 0x1EC | 0x2EC => {
-                let port = cpu.regs[RDX] as u16;
-                let val = crate::pic::io_read(cpu, ram, ram_size, port, 1);
-                write_reg8_al(cpu, val as u8);
-            }
-            0xE5 | 0x1E5 | 0x2E5 => {
-                let port = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as u16;
-                let size = if lane == LANE16 { 2u8 } else { 4u8 };
-                let val = crate::pic::io_read(cpu, ram, ram_size, port, size);
-                match lane {
-                    LANE16 => write_reg16(cpu, RAX, val as u16),
-                    _ => cpu.regs[RAX] = val as u64,
-                }
-            }
-            0xED | 0x1ED | 0x2ED => {
-                let port = cpu.regs[RDX] as u16;
-                let size = if lane == LANE16 { 2u8 } else { 4u8 };
-                let val = crate::pic::io_read(cpu, ram, ram_size, port, size);
-                match lane {
-                    LANE16 => write_reg16(cpu, RAX, val as u16),
-                    _ => cpu.regs[RAX] = val as u64,
-                }
-            }
-            0xE6 | 0x1E6 | 0x2E6 => {
-                let port = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as u16;
-                crate::pic::io_write(cpu, ram, ram_size, port, cpu.regs[RAX] as u32 & 0xFF, 1);
-            }
-            0xEE | 0x1EE | 0x2EE => {
-                let port = cpu.regs[RDX] as u16;
-                crate::pic::io_write(cpu, ram, ram_size, port, cpu.regs[RAX] as u32 & 0xFF, 1);
-            }
-            0xE7 | 0x1E7 | 0x2E7 => {
-                let port = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as u16;
-                let size = if lane == LANE16 { 2u8 } else { 4u8 };
-                crate::pic::io_write(cpu, ram, ram_size, port, cpu.regs[RAX] as u32, size);
-            }
-            0xEF | 0x1EF | 0x2EF => {
-                let port = cpu.regs[RDX] as u16;
-                let size = if lane == LANE16 { 2u8 } else { 4u8 };
-                crate::pic::io_write(cpu, ram, ram_size, port, cpu.regs[RAX] as u32, size);
-            }
-
-            // ============================================================
-            // MOV moffs — MOV AL,moffs8 (0xA0), MOV rAX,moffs (0xA1)
-            //              MOV moffs8,AL (0xA2), MOV moffs,rAX (0xA3)
-            // ============================================================
-            0xA0 | 0x1A0 | 0x2A0 => {
-                let addr = if cpu.long_mode && !cpu.prefix.addr_size {
-                    try_or_fault!(cpu, fetch_imm64(cpu, ram, ram_size))
-                } else {
-                    try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64
-                };
-                let val = try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, addr));
-                write_reg8_al(cpu, val);
-            }
-            0xA1 | 0x1A1 | 0x2A1 => {
-                let addr = if cpu.long_mode && !cpu.prefix.addr_size {
-                    try_or_fault!(cpu, fetch_imm64(cpu, ram, ram_size))
-                } else {
-                    try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64
-                };
-                match lane {
-                    LANE16 => {
-                        let v = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
-                        write_reg16(cpu, RAX, v);
-                    }
-                    LANE32 => {
-                        let v = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
-                        cpu.regs[RAX] = v as u64;
-                    }
-                    _ => {
-                        let v = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
-                        cpu.regs[RAX] = v;
-                    }
-                }
-            }
-            0xA2 | 0x1A2 | 0x2A2 => {
-                let addr = if cpu.long_mode && !cpu.prefix.addr_size {
-                    try_or_fault!(cpu, fetch_imm64(cpu, ram, ram_size))
-                } else {
-                    try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64
-                };
-                try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, addr, cpu.regs[RAX] as u8));
-            }
-            0xA3 | 0x1A3 | 0x2A3 => {
-                let addr = if cpu.long_mode && !cpu.prefix.addr_size {
-                    try_or_fault!(cpu, fetch_imm64(cpu, ram, ram_size))
-                } else {
-                    try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as u64
-                };
-                match lane {
-                    LANE16 => try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, addr, cpu.regs[RAX] as u16)),
-                    LANE32 => try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.regs[RAX] as u32)),
-                    _ => try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.regs[RAX])),
-                }
-            }
-
-            // ============================================================
-            // String operations (0xA4-0xA7, 0xAA-0xAF)
-            // ============================================================
-            0xA4 | 0x1A4 | 0x2A4 => { string_movsb(cpu, ram, ram_size); }
-            0xA5 | 0x1A5 | 0x2A5 => { string_movs(cpu, ram, ram_size, lane); }
-            0xA6 | 0x1A6 | 0x2A6 => { string_cmpsb(cpu, ram, ram_size); }
-            0xA7 | 0x1A7 | 0x2A7 => { string_cmps(cpu, ram, ram_size, lane); }
-            0xAA | 0x1AA | 0x2AA => { string_stosb(cpu, ram, ram_size); }
-            0xAB | 0x1AB | 0x2AB => { string_stos(cpu, ram, ram_size, lane); }
-            0xAC | 0x1AC | 0x2AC => { string_lodsb(cpu, ram, ram_size); }
-            0xAD | 0x1AD | 0x2AD => { string_lods(cpu, ram, ram_size, lane); }
-            0xAE | 0x1AE | 0x2AE => { string_scasb(cpu, ram, ram_size); }
-            0xAF | 0x1AF | 0x2AF => { string_scas(cpu, ram, ram_size, lane); }
-
-            // ============================================================
-            // RET imm16 (0xC2)
-            // ============================================================
-            0xC2 | 0x1C2 | 0x2C2 => {
-                let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size)) as u64;
-                if cpu.long_mode {
-                    let addr = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8).wrapping_add(imm);
-                    cpu.rip = addr;
-                } else {
-                    let addr = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4).wrapping_add(imm);
-                    cpu.rip = addr as u64;
-                }
-            }
-
-            // ============================================================
-            // CALL rel16 (0xE8 with 0x66 prefix) — rare but possible
-            // Already handled above for rel32
-
-            // IMUL r, r/m (0x0F 0xAF) and IMUL r, r/m, imm (0x69/0x6B)
-            // ============================================================
-            0x69 | 0x169 | 0x269 => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                let src = if modrm & 0xC0 == 0xC0 {
-                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    cpu.regs[r]
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    match lane {
-                        LANE16 => try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
-                        LANE32 => try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
-                        _ => try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
-                    }
-                };
-                match lane {
-                    LANE16 => {
-                        let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size)) as i16 as i32;
-                        let res = (src as i16 as i32).wrapping_mul(imm);
-                        write_reg16(cpu, dst_reg, res as u16);
-                        let overflow = res != res as i16 as i32;
-                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
+// ============================================================
+// 0F Page 0: op2 0x00-0x0F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_0(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0x00 => {
+                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); return true; }
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let reg_field = (modrm >> 3) & 7;
+                        match reg_field {
+                            0 => {
+                                // SLDT — store LDT selector
+                                let val = cpu.ldt.selector;
+                                if modrm & 0xC0 == 0xC0 {
+                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                    cpu.regs[r] = val as u64;
+                                } else {
+                                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                    try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, addr, val));
+                                }
+                            }
+                            1 => {
+                                // STR — store task register selector
+                                let val = cpu.tr.selector;
+                                if modrm & 0xC0 == 0xC0 {
+                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                    cpu.regs[r] = val as u64;
+                                } else {
+                                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                    try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, addr, val));
+                                }
+                            }
+                            2 => {
+                                // LLDT — load LDT from selector
+                                let sel = if modrm & 0xC0 == 0xC0 {
+                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                    cpu.regs[r] as u16
+                                } else {
+                                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                    try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
+                                };
+                                cpu.ldt.selector = sel;
+                                // Load LDT descriptor from GDT (simplified: just set base/limit from GDT entry)
+                                if sel != 0 {
+                                    let desc_addr = cpu.gdt.base + (sel as u64 & 0xFFF8);
+                                    let lo = read_phys_u32(ram, ram_size, desc_addr);
+                                    let hi = read_phys_u32(ram, ram_size, desc_addr + 4);
+                                    let base = ((lo >> 16) as u64 & 0xFFFF) | (((hi & 0xFF) as u64) << 16) | (((hi >> 24) as u64) << 24);
+                                    let limit = (lo & 0xFFFF) as u32 | ((hi & 0xF0000) as u32);
+                                    if cpu.long_mode {
+                                        let base_hi = read_phys_u32(ram, ram_size, desc_addr + 8);
+                                        cpu.ldt.base = base | ((base_hi as u64) << 32);
+                                    } else {
+                                        cpu.ldt.base = base;
+                                    }
+                                    cpu.ldt.limit = limit;
+                                }
+                            }
+                            3 => {
+                                // LTR — load task register from selector
+                                let sel = if modrm & 0xC0 == 0xC0 {
+                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                    cpu.regs[r] as u16
+                                } else {
+                                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                    try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
+                                };
+                                cpu.tr.selector = sel;
+                                // Load TSS descriptor from GDT
+                                let desc_addr = cpu.gdt.base + (sel as u64 & 0xFFF8);
+                                let lo = read_phys_u32(ram, ram_size, desc_addr);
+                                let hi = read_phys_u32(ram, ram_size, desc_addr + 4);
+                                let base = ((lo >> 16) as u64 & 0xFFFF) | (((hi & 0xFF) as u64) << 16) | (((hi >> 24) as u64) << 24);
+                                let limit = (lo & 0xFFFF) as u32 | ((hi & 0xF0000) as u32);
+                                cpu.tr.flags = hi & 0x00F0FF00;
+                                if cpu.long_mode {
+                                    // 64-bit TSS descriptor is 16 bytes
+                                    let base_hi = read_phys_u32(ram, ram_size, desc_addr + 8);
+                                    cpu.tr.base = base | ((base_hi as u64) << 32);
+                                } else {
+                                    cpu.tr.base = base;
+                                }
+                                cpu.tr.limit = limit;
+                                // Mark TSS as busy (set bit 1 of type field in GDT)
+                                let busy = hi | 0x200;
+                                write_phys_u32(ram, ram_size, desc_addr + 4, busy);
+                            }
+                            _ => {}
+                        }
+        }
+        0x01 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let reg_field = (modrm >> 3) & 7;
+                        match reg_field {
+                            0 => {
+                                // SGDT
+                                if modrm & 0xC0 != 0xC0 {
+                                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                    try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, addr, cpu.gdt.limit));
+                                    if cpu.long_mode {
+                                        try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr + 2, cpu.gdt.base));
+                                    } else {
+                                        try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr + 2, cpu.gdt.base as u32));
+                                    }
+                                }
+                            }
+                            1 => {
+                                // SIDT
+                                if modrm & 0xC0 != 0xC0 {
+                                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                    try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, addr, cpu.idt.limit));
+                                    if cpu.long_mode {
+                                        try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr + 2, cpu.idt.base));
+                                    } else {
+                                        try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr + 2, cpu.idt.base as u32));
+                                    }
+                                }
+                            }
+                            2 => {
+                                // LGDT
+                                if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); return true; }
+                                if modrm & 0xC0 != 0xC0 {
+                                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                    let limit = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
+                                    let base = if cpu.long_mode {
+                                        try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr + 2))
+                                    } else {
+                                        try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr + 2)) as u64
+                                    };
+                                    cpu.gdt.limit = limit;
+                                    cpu.gdt.base = base;
+                                }
+                            }
+                            3 => {
+                                // LIDT
+                                if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); return true; }
+                                if modrm & 0xC0 != 0xC0 {
+                                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                    let limit = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
+                                    let base = if cpu.long_mode {
+                                        try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr + 2))
+                                    } else {
+                                        try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr + 2)) as u64
+                                    };
+                                    cpu.idt.limit = limit;
+                                    cpu.idt.base = base;
+                                }
+                            }
+                            4 => {
+                                // SMSW — store machine status word (CR0 low 16 bits)
+                                let val = cpu.cr0 as u16;
+                                if modrm & 0xC0 == 0xC0 {
+                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                    cpu.regs[r] = val as u64;
+                                } else {
+                                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                    try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, addr, val));
+                                }
+                            }
+                            6 => {
+                                // LMSW — load machine status word (set low bits of CR0)
+                                if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); return true; }
+                                let val = if modrm & 0xC0 == 0xC0 {
+                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                    cpu.regs[r] as u16
+                                } else {
+                                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                    try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
+                                };
+                                // LMSW can set PE but cannot clear it
+                                cpu.cr0 = (cpu.cr0 & !0xF) | (val as u64 & 0xF) | (cpu.cr0 & CR0_PE);
+                            }
+                            7 => {
+                                if modrm == 0xF8 {
+                                    // SWAPGS (0x0F 0x01 0xF8)
+                                    if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); return true; }
+                                    let tmp = cpu.segs[SEG_GS].base;
+                                    cpu.segs[SEG_GS].base = cpu.kernel_gs_base;
+                                    cpu.kernel_gs_base = tmp;
+                                } else if modrm & 0xC0 != 0xC0 {
+                                    // INVLPG m
+                                    if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); return true; }
+                                    let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                    cpu.tlb.flush_page(addr);
+                                }
+                            }
+                            _ => {}
+                        }
+        }
+        0x05 => {
+                        if cpu.cpl != 3 { raise_exception(cpu, EXC_UD, 0); return true; }
+                        // Save user RIP and RFLAGS
+                        cpu.regs[RCX] = cpu.rip;
+                        cpu.regs[R11] = cpu.rflags;
+                        // Load kernel entry point
+                        cpu.rip = cpu.lstar;
+                        // Mask flags
+                        cpu.rflags &= !cpu.fmask;
+                        cpu.rflags &= !(IF | TF | RF); // always clear these
                         cpu.lazy.op = FlagOp::External;
-                    }
-                    LANE32 => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as i64;
-                        let res = (src as i32 as i64).wrapping_mul(imm);
-                        cpu.regs[dst_reg] = res as u32 as u64;
-                        let overflow = res != res as i32 as i64;
-                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
+                        // Switch to kernel mode
+                        cpu.cpl = 0;
+                        // Set CS/SS from STAR
+                        cpu.segs[SEG_CS].selector = ((cpu.star >> 32) & 0xFFFF) as u16;
+                        cpu.segs[SEG_CS].base = 0;
+                        cpu.segs[SEG_CS].limit = 0xFFFFFFFF;
+                        cpu.segs[SEG_CS].flags = 0x00AF9B00; // 64-bit code
+                        cpu.segs[SEG_SS].selector = (((cpu.star >> 32) + 8) & 0xFFFF) as u16;
+                        cpu.segs[SEG_SS].base = 0;
+                        cpu.segs[SEG_SS].limit = 0xFFFFFFFF;
+                        cpu.segs[SEG_SS].flags = 0x00CF9300; // data
+        }
+        0x07 => {
+                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); return true; }
+                        cpu.rip = cpu.regs[RCX];
+                        cpu.rflags = cpu.regs[R11] | 0x2; // restore RFLAGS, ensure bit 1
                         cpu.lazy.op = FlagOp::External;
-                    }
-                    _ => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as i64;
-                        let res = (src as i64 as i128).wrapping_mul(imm as i128);
-                        cpu.regs[dst_reg] = res as u64;
-                        let overflow = res != res as i64 as i128;
-                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
+                        cpu.cpl = 3;
+                        // Set CS/SS from STAR for user mode
+                        cpu.segs[SEG_CS].selector = (((cpu.star >> 48) + 16) & 0xFFFF) as u16;
+                        cpu.segs[SEG_CS].base = 0;
+                        cpu.segs[SEG_CS].limit = 0xFFFFFFFF;
+                        cpu.segs[SEG_CS].flags = 0x00AFFB00; // 64-bit code, DPL 3
+                        cpu.segs[SEG_SS].selector = (((cpu.star >> 48) + 8) & 0xFFFF) as u16;
+                        cpu.segs[SEG_SS].base = 0;
+                        cpu.segs[SEG_SS].limit = 0xFFFFFFFF;
+                        cpu.segs[SEG_SS].flags = 0x00CFF300; // data, DPL 3
+        }
+        0x09 => {
+                /* no-op cache flush */
+        }
+        0x0B => {
+                        raise_exception(cpu, EXC_UD, 0);
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page 1: op2 0x10-0x1F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_1(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0x1F => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if modrm & 0xC0 != 0xC0 {
+                            let _ = decode_modrm_addr(cpu, ram, ram_size, modrm); // consume but ignore
+                        }
+        }
+        0x18..=0x1E => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if modrm & 0xC0 != 0xC0 {
+                            let _ = decode_modrm_addr(cpu, ram, ram_size, modrm);
+                        }
+        }
+        0x10 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        if cpu.prefix.rep == 0xF3 {
+                            // MOVSS xmm, xmm/m32
+                            if modrm & 0xC0 == 0xC0 {
+                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                // reg-reg: merge low 32 bits only
+                                let src_lo = cpu.sse.xmm[src][0];
+                                cpu.sse.xmm[dst][0] = (cpu.sse.xmm[dst][0] & 0xFFFFFFFF00000000) | (src_lo & 0xFFFFFFFF);
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                let val = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
+                                cpu.sse.xmm[dst][0] = val as u64;
+                                cpu.sse.xmm[dst][1] = 0;
+                            }
+                        } else if cpu.prefix.rep == 0xF2 {
+                            // MOVSD xmm, xmm/m64
+                            if modrm & 0xC0 == 0xC0 {
+                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                cpu.sse.xmm[dst][0] = cpu.sse.xmm[src][0];
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                cpu.sse.xmm[dst][0] = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
+                                cpu.sse.xmm[dst][1] = 0;
+                            }
+                        } else {
+                            // MOVUPS/MOVUPD: load 128-bit
+                            let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                            cpu.sse.xmm[dst][0] = lo;
+                            cpu.sse.xmm[dst][1] = hi;
+                        }
+        }
+        0x11 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        if cpu.prefix.rep == 0xF3 {
+                            // MOVSS xmm/m32, xmm
+                            if modrm & 0xC0 == 0xC0 {
+                                let dst_r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                cpu.sse.xmm[dst_r][0] = (cpu.sse.xmm[dst_r][0] & 0xFFFFFFFF00000000) | (cpu.sse.xmm[src][0] & 0xFFFFFFFF);
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0] as u32));
+                            }
+                        } else if cpu.prefix.rep == 0xF2 {
+                            // MOVSD xmm/m64, xmm
+                            if modrm & 0xC0 == 0xC0 {
+                                let dst_r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                cpu.sse.xmm[dst_r][0] = cpu.sse.xmm[src][0];
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0]));
+                            }
+                        } else {
+                            // MOVUPS/MOVUPD: store 128-bit
+                            store_xmm_rm(cpu, ram, ram_size, modrm, cpu.sse.xmm[src][0], cpu.sse.xmm[src][1]);
+                        }
+        }
+        0x12 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        if modrm & 0xC0 == 0xC0 {
+                            // MOVHLPS: dst.lo = src.hi
+                            let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            cpu.sse.xmm[dst][0] = cpu.sse.xmm[src][1];
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            cpu.sse.xmm[dst][0] = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
+                        }
+        }
+        0x13 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); return true; }
+                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                        try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0]));
+        }
+        0x16 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        if modrm & 0xC0 == 0xC0 {
+                            // MOVLHPS: dst.hi = src.lo
+                            let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            cpu.sse.xmm[dst][1] = cpu.sse.xmm[src][0];
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            cpu.sse.xmm[dst][1] = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
+                        }
+        }
+        0x17 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); return true; }
+                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                        try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][1]));
+        }
+        0x14 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, _hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        if cpu.prefix.op_size {
+                            // UNPCKLPD: dst[0] = dst[0], dst[1] = src[0]
+                            cpu.sse.xmm[dst][1] = lo;
+                        } else {
+                            // UNPCKLPS: interleave low 32-bit floats
+                            let d0 = cpu.sse.xmm[dst][0] as u32 as u64;
+                            let d1 = (cpu.sse.xmm[dst][0] >> 32) as u32 as u64;
+                            let s0 = lo as u32 as u64;
+                            let s1 = (lo >> 32) as u32 as u64;
+                            cpu.sse.xmm[dst][0] = d0 | (s0 << 32);
+                            cpu.sse.xmm[dst][1] = d1 | (s1 << 32);
+                        }
+        }
+        0x15 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (_lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        if cpu.prefix.op_size {
+                            // UNPCKHPD: dst[0] = dst[1], dst[1] = src[1]
+                            cpu.sse.xmm[dst][0] = cpu.sse.xmm[dst][1];
+                            cpu.sse.xmm[dst][1] = hi;
+                        } else {
+                            // UNPCKHPS: interleave high 32-bit floats
+                            let d2 = cpu.sse.xmm[dst][1] as u32 as u64;
+                            let d3 = (cpu.sse.xmm[dst][1] >> 32) as u32 as u64;
+                            let s2 = hi as u32 as u64;
+                            let s3 = (hi >> 32) as u32 as u64;
+                            cpu.sse.xmm[dst][0] = d2 | (s2 << 32);
+                            cpu.sse.xmm[dst][1] = d3 | (s3 << 32);
+                        }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page 2: op2 0x20-0x2F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_2(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0x20 => {
+                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); return true; }
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let cr = ((modrm >> 3) & 7) as usize;
+                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                        cpu.regs[r] = match cr {
+                            0 => cpu.cr0,
+                            2 => cpu.cr2,
+                            3 => cpu.cr3,
+                            4 => cpu.cr4,
+                            8 => cpu.cr8,
+                            _ => 0,
+                        };
+        }
+        0x22 => {
+                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); return true; }
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let cr = ((modrm >> 3) & 7) as usize;
+                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                        let val = cpu.regs[r];
+                        match cr {
+                            0 => {
+                                cpu.cr0 = val;
+                                // Update long_mode based on EFER.LMA
+                                cpu.long_mode = (cpu.efer & EFER_LME != 0) && (val & CR0_PG != 0);
+                                if cpu.long_mode { cpu.efer |= EFER_LMA; } else { cpu.efer &= !EFER_LMA; }
+                                cpu.tlb.flush_all();
+                            }
+                            2 => cpu.cr2 = val,
+                            3 => {
+                                cpu.cr3 = val;
+                                cpu.tlb.flush_all();
+                            }
+                            4 => {
+                                cpu.cr4 = val;
+                                cpu.tlb.flush_all();
+                            }
+                            8 => cpu.cr8 = val,
+                            _ => {}
+                        }
+        }
+        0x28 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        cpu.sse.xmm[dst][0] = lo;
+                        cpu.sse.xmm[dst][1] = hi;
+        }
+        0x29 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        store_xmm_rm(cpu, ram, ram_size, modrm, cpu.sse.xmm[src][0], cpu.sse.xmm[src][1]);
+        }
+        0x2B => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); return true; }
+                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                        try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0]));
+                        try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr.wrapping_add(8), cpu.sse.xmm[src][1]));
+        }
+        0x2E..=0x2F => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let is_sd = cpu.prefix.op_size; // 0x66 prefix = double
+                        let a: f64;
+                        let b: f64;
+                        if is_sd {
+                            a = f64::from_bits(cpu.sse.xmm[dst][0]);
+                            if modrm & 0xC0 == 0xC0 {
+                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                b = f64::from_bits(cpu.sse.xmm[src][0]);
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                b = f64::from_bits(try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr)));
+                            }
+                        } else {
+                            a = f32::from_bits(cpu.sse.xmm[dst][0] as u32) as f64;
+                            if modrm & 0xC0 == 0xC0 {
+                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                b = f32::from_bits(cpu.sse.xmm[src][0] as u32) as f64;
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                b = f32::from_bits(try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr))) as f64;
+                            }
+                        }
+                        materialize_flags(cpu);
+                        cpu.rflags &= !(CF | ZF | PF | OF | SF | AF);
+                        if a.is_nan() || b.is_nan() {
+                            cpu.rflags |= CF | ZF | PF;
+                        } else if a > b {
+                            // all clear
+                        } else if a < b {
+                            cpu.rflags |= CF;
+                        } else {
+                            cpu.rflags |= ZF;
+                        }
                         cpu.lazy.op = FlagOp::External;
-                    }
-                }
-            }
-            0x6B | 0x16B | 0x26B => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
-                let src = if modrm & 0xC0 == 0xC0 {
-                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    cpu.regs[r]
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    match lane {
-                        LANE16 => try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
-                        LANE32 => try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
-                        _ => try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
-                    }
-                };
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
-                match lane {
-                    LANE16 => {
-                        let res = (src as i16 as i32).wrapping_mul(imm as i32);
-                        write_reg16(cpu, dst_reg, res as u16);
-                        let overflow = res != res as i16 as i32;
-                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
-                    }
-                    LANE32 => {
-                        let res = (src as i32 as i64).wrapping_mul(imm as i64);
-                        cpu.regs[dst_reg] = res as u32 as u64;
-                        let overflow = res != res as i32 as i64;
-                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
-                    }
-                    _ => {
-                        let res = (src as i64 as i128).wrapping_mul(imm as i128);
-                        cpu.regs[dst_reg] = res as u64;
-                        let overflow = res != res as i64 as i128;
-                        if overflow { cpu.rflags |= CF | OF; } else { cpu.rflags &= !(CF | OF); }
-                    }
-                }
-                cpu.lazy.op = FlagOp::External;
-            }
+        }
+        0x2A => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        if cpu.prefix.rep == 0xF3 {
+                            // CVTSI2SS
+                            let val = if lane == LANE64 {
+                                load_rm(cpu, ram, ram_size, modrm, LANE64) as i64 as f32
+                            } else {
+                                load_rm(cpu, ram, ram_size, modrm, LANE32) as i32 as f32
+                            };
+                            cpu.sse.xmm[dst][0] = (cpu.sse.xmm[dst][0] & 0xFFFFFFFF00000000) | val.to_bits() as u64;
+                        } else if cpu.prefix.rep == 0xF2 {
+                            // CVTSI2SD
+                            let val = if lane == LANE64 {
+                                load_rm(cpu, ram, ram_size, modrm, LANE64) as i64 as f64
+                            } else {
+                                load_rm(cpu, ram, ram_size, modrm, LANE32) as i32 as f64
+                            };
+                            cpu.sse.xmm[dst][0] = val.to_bits();
+                        } else {
+                            // CVTPI2PS / CVTPI2PD — not commonly used, ignore
+                        }
+        }
+        0x2C => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        if cpu.prefix.rep == 0xF3 {
+                            // CVTTSS2SI
+                            let val = if modrm & 0xC0 == 0xC0 {
+                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                f32::from_bits(cpu.sse.xmm[src][0] as u32)
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                f32::from_bits(try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr)))
+                            };
+                            if lane == LANE64 {
+                                cpu.regs[dst] = val as i64 as u64;
+                            } else {
+                                cpu.regs[dst] = val as i32 as u32 as u64;
+                            }
+                        } else if cpu.prefix.rep == 0xF2 {
+                            // CVTTSD2SI
+                            let val = if modrm & 0xC0 == 0xC0 {
+                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                f64::from_bits(cpu.sse.xmm[src][0])
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                f64::from_bits(try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr)))
+                            };
+                            if lane == LANE64 {
+                                cpu.regs[dst] = val as i64 as u64;
+                            } else {
+                                cpu.regs[dst] = val as i32 as u32 as u64;
+                            }
+                        }
+        }
+        0x2D => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        if cpu.prefix.rep == 0xF3 {
+                            // CVTSS2SI (rounds per MXCSR)
+                            let val = if modrm & 0xC0 == 0xC0 {
+                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                f32::from_bits(cpu.sse.xmm[src][0] as u32)
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                f32::from_bits(try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr)))
+                            };
+                            if lane == LANE64 {
+                                cpu.regs[dst] = libm::roundf(val) as i64 as u64;
+                            } else {
+                                cpu.regs[dst] = libm::roundf(val) as i32 as u32 as u64;
+                            }
+                        } else if cpu.prefix.rep == 0xF2 {
+                            // CVTSD2SI
+                            let val = if modrm & 0xC0 == 0xC0 {
+                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                f64::from_bits(cpu.sse.xmm[src][0])
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                f64::from_bits(try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr)))
+                            };
+                            if lane == LANE64 {
+                                cpu.regs[dst] = libm::round(val) as i64 as u64;
+                            } else {
+                                cpu.regs[dst] = libm::round(val) as i32 as u32 as u64;
+                            }
+                        }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // ENTER (0xC8)
-            // ============================================================
-            0xC8 | 0x1C8 | 0x2C8 => {
-                let alloc_size = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size)) as u64;
-                let _nesting = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                // Simplified: nesting level 0 only
-                if cpu.long_mode {
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
-                    try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], cpu.regs[RBP]));
-                    cpu.regs[RBP] = cpu.regs[RSP];
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(alloc_size);
-                } else {
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
-                    try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], cpu.regs[RBP] as u32));
-                    cpu.regs[RBP] = cpu.regs[RSP] & 0xFFFFFFFF;
-                    cpu.regs[RSP] = (cpu.regs[RSP].wrapping_sub(alloc_size)) & 0xFFFFFFFF;
-                }
-            }
+// ============================================================
+// 0F Page 3: op2 0x30-0x3F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_3(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0x31 => {
+                        let tsc = cpu.tsc;
+                        cpu.regs[RAX] = tsc & 0xFFFFFFFF;
+                        cpu.regs[RDX] = (tsc >> 32) & 0xFFFFFFFF;
+                        cpu.tsc += 100; // approximate increment
+        }
+        0x30 => {
+                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); return true; }
+                        let ecx = cpu.regs[RCX] as u32;
+                        let val = (cpu.regs[RDX] << 32) | (cpu.regs[RAX] & 0xFFFFFFFF);
+                        handle_wrmsr(cpu, ecx, val);
+        }
+        0x32 => {
+                        if cpu.cpl != 0 { raise_exception(cpu, EXC_GP, 0); return true; }
+                        let ecx = cpu.regs[RCX] as u32;
+                        let val = handle_rdmsr(cpu, ecx);
+                        cpu.regs[RAX] = val & 0xFFFFFFFF;
+                        cpu.regs[RDX] = (val >> 32) & 0xFFFFFFFF;
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
 
-            // ============================================================
-            // PUSH imm8/imm16/imm32 (0x6A, 0x68)
-            // ============================================================
-            0x6A | 0x16A | 0x26A => {
-                let imm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8 as i64 as u64;
-                if cpu.long_mode {
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
-                    try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], imm));
-                } else {
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
-                    try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], imm as u32));
-                }
-            }
-            0x68 | 0x168 | 0x268 => {
-                match lane {
-                    LANE16 => {
-                        let imm = try_or_fault!(cpu, fetch_imm16(cpu, ram, ram_size)) as u64;
-                        cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(2);
-                        try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, cpu.regs[RSP], imm as u16));
-                    }
-                    _ => {
-                        let imm = try_or_fault!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32 as i64 as u64;
+// ============================================================
+// 0F Page 4: op2 0x40-0x4F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_4(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0x40..=0x4F => {
+                        let cc = (op2 & 0x0F) as u8;
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst_reg = ((modrm >> 3) & 7) as usize
+                            | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let src_val = if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize
+                                | ((cpu.prefix.rex as usize & 1) << 3);
+                            cpu.regs[r]
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            match lane {
+                                LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr)) as u64,
+                                LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64,
+                                _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr)),
+                            }
+                        };
+                        if eval_cc(cpu, cc) {
+                            match lane {
+                                LANE16 => write_reg16(cpu, dst_reg, src_val as u16),
+                                LANE32 => cpu.regs[dst_reg] = src_val as u32 as u64,
+                                LANE64 => cpu.regs[dst_reg] = src_val,
+                                _ => {}
+                            }
+                        }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page 5: op2 0x50-0x5F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_5(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0x54 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        cpu.sse.xmm[dst][0] &= lo;
+                        cpu.sse.xmm[dst][1] &= hi;
+        }
+        0x55 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        cpu.sse.xmm[dst][0] = (!cpu.sse.xmm[dst][0]) & lo;
+                        cpu.sse.xmm[dst][1] = (!cpu.sse.xmm[dst][1]) & hi;
+        }
+        0x56 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        cpu.sse.xmm[dst][0] |= lo;
+                        cpu.sse.xmm[dst][1] |= hi;
+        }
+        0x57 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        cpu.sse.xmm[dst][0] ^= lo;
+                        cpu.sse.xmm[dst][1] ^= hi;
+        }
+        0x50 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                        if cpu.prefix.op_size {
+                            // MOVMSKPD — extract sign bits of 2 doubles
+                            let bit0 = (cpu.sse.xmm[src][0] >> 63) & 1;
+                            let bit1 = (cpu.sse.xmm[src][1] >> 63) & 1;
+                            cpu.regs[dst] = bit0 | (bit1 << 1);
+                        } else {
+                            // MOVMSKPS — extract sign bits of 4 floats
+                            let lo = cpu.sse.xmm[src][0];
+                            let hi = cpu.sse.xmm[src][1];
+                            let bit0 = (lo >> 31) & 1;
+                            let bit1 = (lo >> 63) & 1;
+                            let bit2 = (hi >> 31) & 1;
+                            let bit3 = (hi >> 63) & 1;
+                            cpu.regs[dst] = bit0 | (bit1 << 1) | (bit2 << 2) | (bit3 << 3);
+                        }
+        }
+        0x51 | 0x52 | 0x53 | 0x58 | 0x59 | 0x5A | 0x5B | 0x5C | 0x5D | 0x5E | 0x5F => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        exec_sse_arith(cpu, dst, lo, hi, op2);
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page 6: op2 0x60-0x6F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_6(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0x6E => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        if lane == LANE64 {
+                            // MOVQ xmm, r/m64
+                            let val = load_rm(cpu, ram, ram_size, modrm, LANE64);
+                            cpu.sse.xmm[dst][0] = val;
+                            cpu.sse.xmm[dst][1] = 0;
+                        } else {
+                            // MOVD xmm, r/m32
+                            let val = load_rm(cpu, ram, ram_size, modrm, LANE32);
+                            cpu.sse.xmm[dst][0] = val as u32 as u64;
+                            cpu.sse.xmm[dst][1] = 0;
+                        }
+        }
+        0x6F => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        cpu.sse.xmm[dst][0] = lo;
+                        cpu.sse.xmm[dst][1] = hi;
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page 7: op2 0x70-0x7F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_7(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0x7E => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if cpu.prefix.rep == 0xF3 {
+                            // MOVQ xmm, xmm/m64
+                            let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                            if modrm & 0xC0 == 0xC0 {
+                                let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                cpu.sse.xmm[dst][0] = cpu.sse.xmm[src][0];
+                                cpu.sse.xmm[dst][1] = 0;
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                cpu.sse.xmm[dst][0] = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
+                                cpu.sse.xmm[dst][1] = 0;
+                            }
+                        } else {
+                            // MOVD r/m32, xmm or MOVQ r/m64, xmm
+                            let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                            let val = cpu.sse.xmm[src][0];
+                            if lane == LANE64 {
+                                store_rm(cpu, ram, ram_size, modrm, LANE64, val);
+                            } else {
+                                store_rm(cpu, ram, ram_size, modrm, LANE32, val as u32 as u64);
+                            }
+                        }
+        }
+        0x7F => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        store_xmm_rm(cpu, ram, ram_size, modrm, cpu.sse.xmm[src][0], cpu.sse.xmm[src][1]);
+        }
+        0x70 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if cpu.prefix.op_size || cpu.prefix.rep == 0 {
+                            // PSHUFD: shuffle 32-bit dwords
+                            let dwords = [lo as u32, (lo >> 32) as u32, hi as u32, (hi >> 32) as u32];
+                            let r0 = dwords[(imm & 3) as usize];
+                            let r1 = dwords[((imm >> 2) & 3) as usize];
+                            let r2 = dwords[((imm >> 4) & 3) as usize];
+                            let r3 = dwords[((imm >> 6) & 3) as usize];
+                            cpu.sse.xmm[dst][0] = r0 as u64 | ((r1 as u64) << 32);
+                            cpu.sse.xmm[dst][1] = r2 as u64 | ((r3 as u64) << 32);
+                        } else if cpu.prefix.rep == 0xF3 {
+                            // PSHUFLW: shuffle low 4 words, high unchanged
+                            let words = [lo as u16, (lo >> 16) as u16, (lo >> 32) as u16, (lo >> 48) as u16];
+                            let r0 = words[(imm & 3) as usize] as u64;
+                            let r1 = words[((imm >> 2) & 3) as usize] as u64;
+                            let r2 = words[((imm >> 4) & 3) as usize] as u64;
+                            let r3 = words[((imm >> 6) & 3) as usize] as u64;
+                            cpu.sse.xmm[dst][0] = r0 | (r1 << 16) | (r2 << 32) | (r3 << 48);
+                            cpu.sse.xmm[dst][1] = hi;
+                        } else {
+                            // PSHUFHW: shuffle high 4 words, low unchanged
+                            let words = [hi as u16, (hi >> 16) as u16, (hi >> 32) as u16, (hi >> 48) as u16];
+                            let r0 = words[(imm & 3) as usize] as u64;
+                            let r1 = words[((imm >> 2) & 3) as usize] as u64;
+                            let r2 = words[((imm >> 4) & 3) as usize] as u64;
+                            let r3 = words[((imm >> 6) & 3) as usize] as u64;
+                            cpu.sse.xmm[dst][0] = lo;
+                            cpu.sse.xmm[dst][1] = r0 | (r1 << 16) | (r2 << 32) | (r3 << 48);
+                        }
+        }
+        0x77 => {
+                        cpu.fpu.tag = 0xFFFF;
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page 8: op2 0x80-0x8F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_8(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0x80..=0x8F => {
+                        let cc = (op2 & 0x0F) as u8;
+                        let rel = try_or_fault_page!(cpu, fetch_imm32(cpu, ram, ram_size)) as i32;
+                        if eval_cc(cpu, cc) {
+                            cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
+                            if !cpu.long_mode {
+                                cpu.rip &= 0xFFFFFFFF;
+                            }
+                        }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page 9: op2 0x90-0x9F
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_9(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0x90..=0x9F => {
+                        let cc = (op2 & 0x0F) as u8;
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let val = if eval_cc(cpu, cc) { 1u8 } else { 0u8 };
+                        if modrm & 0xC0 == 0xC0 {
+                            let reg = (modrm & 7) as usize
+                                | ((cpu.prefix.rex as usize & 1) << 3);
+                            write_reg8(cpu, reg, val);
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, val));
+                        }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page A: op2 0xA0-0xAF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_a(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0xA2 => {
+                        handle_cpuid(cpu);
+        }
+        0xAF => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let src = load_rm(cpu, ram, ram_size, modrm, lane);
+                        match lane {
+                            LANE16 => {
+                                let res = (cpu.regs[dst_reg] as u16 as i16 as i32).wrapping_mul(src as i16 as i32);
+                                write_reg16(cpu, dst_reg, res as u16);
+                                materialize_flags(cpu);
+                                if res as i16 as i32 != res { cpu.rflags |= CF | OF; }
+                                else { cpu.rflags &= !(CF | OF); }
+                                cpu.lazy.op = FlagOp::External;
+                            }
+                            LANE32 => {
+                                let res = (cpu.regs[dst_reg] as u32 as i32 as i64).wrapping_mul(src as i32 as i64);
+                                cpu.regs[dst_reg] = res as u32 as u64;
+                                materialize_flags(cpu);
+                                if res as i32 as i64 != res { cpu.rflags |= CF | OF; }
+                                else { cpu.rflags &= !(CF | OF); }
+                                cpu.lazy.op = FlagOp::External;
+                            }
+                            LANE64 => {
+                                let res = (cpu.regs[dst_reg] as i64 as i128).wrapping_mul(src as i64 as i128);
+                                cpu.regs[dst_reg] = res as u64;
+                                materialize_flags(cpu);
+                                if res as i64 as i128 != res { cpu.rflags |= CF | OF; }
+                                else { cpu.rflags &= !(CF | OF); }
+                                cpu.lazy.op = FlagOp::External;
+                            }
+                            _ => {}
+                        }
+        }
+        0xA0 => {
+                        let val = cpu.segs[SEG_FS].selector as u64;
                         if cpu.long_mode {
                             cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
-                            try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], imm));
+                            try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], val));
                         } else {
                             cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
-                            try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], imm as u32));
+                            try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], val as u32));
                         }
-                    }
-                }
-            }
-
-            // ============================================================
-            // LOOP/LOOPcc (0xE0-0xE2)
-            // ============================================================
-            0xE2 | 0x1E2 | 0x2E2 => {
-                let rel = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
-                cpu.regs[RCX] = cpu.regs[RCX].wrapping_sub(1);
-                if cpu.regs[RCX] != 0 {
-                    cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
-                }
-            }
-            0xE0 | 0x1E0 | 0x2E0 => {
-                // LOOPNZ
-                let rel = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
-                cpu.regs[RCX] = cpu.regs[RCX].wrapping_sub(1);
-                if cpu.regs[RCX] != 0 && !eval_cc(cpu, 4) { // ZF==0
-                    cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
-                }
-            }
-            0xE1 | 0x1E1 | 0x2E1 => {
-                // LOOPZ
-                let rel = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
-                cpu.regs[RCX] = cpu.regs[RCX].wrapping_sub(1);
-                if cpu.regs[RCX] != 0 && eval_cc(cpu, 4) { // ZF==1
-                    cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
-                }
-            }
-
-            // ============================================================
-            // CALL rel16 (0xE8 with 0x66 prefix — already handled)
-            // JMP short (0xEB — already handled)
-            // Jcc rel8 (0x70-0x7F — already handled)
-            // ============================================================
-
-            // ============================================================
-            // MOV segment (0x8C, 0x8E)
-            // ============================================================
-            0x8C | 0x18C | 0x28C => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let seg = ((modrm >> 3) & 7) as usize;
-                let val = if seg < 6 { cpu.segs[seg].selector } else { 0 };
-                if modrm & 0xC0 == 0xC0 {
-                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    write_reg16(cpu, r, val);
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, addr, val));
-                }
-            }
-            0x8E | 0x18E | 0x28E => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let seg = ((modrm >> 3) & 7) as usize;
-                let val = if modrm & 0xC0 == 0xC0 {
-                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                    cpu.regs[r] as u16
-                } else {
-                    let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                    try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
-                };
-                if seg < 6 {
-                    cpu.segs[seg].selector = val;
-                    // In long mode, only FS/GS base matters; others are effectively flat
-                }
-            }
-
-            // ============================================================
-            // POP r/m (0x8F /0)
-            // ============================================================
-            0x8F | 0x18F | 0x28F => {
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                let reg_field = (modrm >> 3) & 7;
-                if reg_field != 0 { raise_exception(cpu, EXC_UD, 0); continue; }
-                if cpu.long_mode {
-                    let val = try_or_fault!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
-                    if modrm & 0xC0 == 0xC0 {
-                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                        cpu.regs[r] = val;
-                    } else {
-                        let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                        try_or_fault!(cpu, mem::store_u64(cpu, ram, ram_size, addr, val));
-                    }
-                } else {
-                    let val = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
-                    cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
-                    if modrm & 0xC0 == 0xC0 {
-                        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
-                        cpu.regs[r] = val as u64;
-                    } else {
-                        let addr = try_or_fault!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
-                        try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, addr, val));
-                    }
-                }
-            }
-
-            // ============================================================
-            // XLAT/XLATB (0xD7) — AL = [RBX + unsigned(AL)]
-            // ============================================================
-            0xD7 | 0x1D7 | 0x2D7 => {
-                let addr = cpu.regs[RBX].wrapping_add(cpu.regs[RAX] & 0xFF);
-                let val = try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, addr));
-                write_reg8_al(cpu, val);
-            }
-
-            // ============================================================
-            // JCXZ/JECXZ/JRCXZ (0xE3) — Jump if counter is zero
-            // ============================================================
-            0xE3 | 0x1E3 | 0x2E3 => {
-                let rel = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size)) as i8;
-                let counter = if cpu.prefix.addr_size {
-                    cpu.regs[RCX] as u32 as u64
-                } else {
-                    cpu.regs[RCX]
-                };
-                if counter == 0 {
-                    cpu.rip = cpu.rip.wrapping_add(rel as i64 as u64);
-                    if !cpu.long_mode { cpu.rip &= 0xFFFFFFFF; }
-                }
-            }
-
-            // ============================================================
-            // String I/O: INSB (0x6C), INSW/D (0x6D), OUTSB (0x6E), OUTSW/D (0x6F)
-            // ============================================================
-            0x6C | 0x16C | 0x26C => {
-                // INSB: read byte from port DX, store to [RDI]
-                let port = cpu.regs[RDX] as u16;
-                let val = crate::pic::io_read(cpu, ram, ram_size, port, 1) as u8;
-                try_or_fault!(cpu, mem::store_u8(cpu, ram, ram_size, cpu.regs[RDI], val));
-                let df = (cpu.rflags & DF) != 0;
-                if df { cpu.regs[RDI] = cpu.regs[RDI].wrapping_sub(1); }
-                else { cpu.regs[RDI] = cpu.regs[RDI].wrapping_add(1); }
-            }
-            0x6D | 0x16D | 0x26D => {
-                // INSW/D: read word/dword from port DX, store to [RDI]
-                let port = cpu.regs[RDX] as u16;
-                let size = if lane == LANE16 { 2u8 } else { 4u8 };
-                let val = crate::pic::io_read(cpu, ram, ram_size, port, size);
-                if lane == LANE16 {
-                    try_or_fault!(cpu, mem::store_u16(cpu, ram, ram_size, cpu.regs[RDI], val as u16));
-                    let df = (cpu.rflags & DF) != 0;
-                    if df { cpu.regs[RDI] = cpu.regs[RDI].wrapping_sub(2); }
-                    else { cpu.regs[RDI] = cpu.regs[RDI].wrapping_add(2); }
-                } else {
-                    try_or_fault!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RDI], val));
-                    let df = (cpu.rflags & DF) != 0;
-                    if df { cpu.regs[RDI] = cpu.regs[RDI].wrapping_sub(4); }
-                    else { cpu.regs[RDI] = cpu.regs[RDI].wrapping_add(4); }
-                }
-            }
-            0x6E | 0x16E | 0x26E => {
-                // OUTSB: read byte from [RSI], write to port DX
-                let port = cpu.regs[RDX] as u16;
-                let val = try_or_fault!(cpu, mem::load_u8(cpu, ram, ram_size, cpu.regs[RSI]));
-                crate::pic::io_write(cpu, ram, ram_size, port, val as u32, 1);
-                let df = (cpu.rflags & DF) != 0;
-                if df { cpu.regs[RSI] = cpu.regs[RSI].wrapping_sub(1); }
-                else { cpu.regs[RSI] = cpu.regs[RSI].wrapping_add(1); }
-            }
-            0x6F | 0x16F | 0x26F => {
-                // OUTSW/D: read word/dword from [RSI], write to port DX
-                let port = cpu.regs[RDX] as u16;
-                if lane == LANE16 {
-                    let val = try_or_fault!(cpu, mem::load_u16(cpu, ram, ram_size, cpu.regs[RSI]));
-                    crate::pic::io_write(cpu, ram, ram_size, port, val as u32, 2);
-                    let df = (cpu.rflags & DF) != 0;
-                    if df { cpu.regs[RSI] = cpu.regs[RSI].wrapping_sub(2); }
-                    else { cpu.regs[RSI] = cpu.regs[RSI].wrapping_add(2); }
-                } else {
-                    let val = try_or_fault!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSI]));
-                    crate::pic::io_write(cpu, ram, ram_size, port, val, 4);
-                    let df = (cpu.rflags & DF) != 0;
-                    if df { cpu.regs[RSI] = cpu.regs[RSI].wrapping_sub(4); }
-                    else { cpu.regs[RSI] = cpu.regs[RSI].wrapping_add(4); }
-                }
-            }
-
-            // ============================================================
-            // FWAIT (0x9B) — no-op (single-threaded, no pending FPU exceptions)
-            // ============================================================
-            0x9B | 0x19B | 0x29B => {}
-
-            // ============================================================
-            // x87 FPU opcodes D8-DF
-            // ============================================================
-            0xD8 | 0x1D8 | 0x2D8 | 0xD9 | 0x1D9 | 0x2D9 |
-            0xDA | 0x1DA | 0x2DA | 0xDB | 0x1DB | 0x2DB |
-            0xDC | 0x1DC | 0x2DC | 0xDD | 0x1DD | 0x2DD |
-            0xDE | 0x1DE | 0x2DE | 0xDF | 0x1DF | 0x2DF => {
-                let fpu_op = (opcode & 7) as u8; // 0-7 maps to D8-DF
-                let modrm = try_or_fault!(cpu, fetch_imm8(cpu, ram, ram_size));
-                exec_fpu(cpu, ram, ram_size, fpu_op, modrm);
-            }
-
-            // ============================================================
-            // Default: unimplemented opcode → #UD
-            // ============================================================
-            _ => {
-                raise_exception(cpu, EXC_UD, 0);
-            }
         }
+        0xA8 => {
+                        let val = cpu.segs[SEG_GS].selector as u64;
+                        if cpu.long_mode {
+                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(8);
+                            try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, cpu.regs[RSP], val));
+                        } else {
+                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_sub(4);
+                            try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, cpu.regs[RSP], val as u32));
+                        }
+        }
+        0xA1 => {
+                        let val = if cpu.long_mode {
+                            let v = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
+                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
+                            v as u16
+                        } else {
+                            let v = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
+                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
+                            v as u16
+                        };
+                        cpu.segs[SEG_FS].selector = val;
+        }
+        0xA9 => {
+                        let val = if cpu.long_mode {
+                            let v = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, cpu.regs[RSP]));
+                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(8);
+                            v as u16
+                        } else {
+                            let v = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, cpu.regs[RSP]));
+                            cpu.regs[RSP] = cpu.regs[RSP].wrapping_add(4);
+                            v as u16
+                        };
+                        cpu.segs[SEG_GS].selector = val;
+        }
+        0xA3 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let bit_pos = cpu.regs[src_reg];
+                        let val = if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            match lane {
+                                LANE16 => cpu.regs[r] as u16 as u64,
+                                LANE32 => cpu.regs[r] as u32 as u64,
+                                _ => cpu.regs[r],
+                            }
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            let (op_bits, op_bytes) = match lane { LANE16 => (16u64, 2i64), LANE32 => (32, 4), _ => (64, 8) };
+                            let byte_offset = ((bit_pos as i64) >> if op_bits == 16 { 4 } else if op_bits == 32 { 5 } else { 6 }) * op_bytes;
+                            let eff_addr = addr.wrapping_add(byte_offset as u64);
+                            match lane {
+                                LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, eff_addr)) as u64,
+                                LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, eff_addr)) as u64,
+                                _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, eff_addr)),
+                            }
+                        };
+                        let mask = match lane { LANE16 => 15, LANE32 => 31, _ => 63 };
+                        let bit = (val >> (bit_pos & mask)) & 1;
+                        materialize_flags(cpu);
+                        cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
+                        cpu.lazy.op = FlagOp::External;
+        }
+        0xAB => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let bit_pos = cpu.regs[src_reg];
+                        let mask = match lane { LANE16 => 15u64, LANE32 => 31, _ => 63 };
+                        if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            let val = cpu.regs[r];
+                            let bit = (val >> (bit_pos & mask)) & 1;
+                            cpu.regs[r] = val | (1u64 << (bit_pos & mask));
+                            if lane == LANE32 { cpu.regs[r] = cpu.regs[r] as u32 as u64; }
+                            materialize_flags(cpu);
+                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
+                            cpu.lazy.op = FlagOp::External;
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            let (op_bits, op_bytes) = match lane { LANE16 => (16u64, 2i64), LANE32 => (32, 4), _ => (64, 8) };
+                            let byte_offset = ((bit_pos as i64) >> if op_bits == 16 { 4 } else if op_bits == 32 { 5 } else { 6 }) * op_bytes;
+                            let eff_addr = addr.wrapping_add(byte_offset as u64);
+                            let val = match lane {
+                                LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, eff_addr)) as u64,
+                                LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, eff_addr)) as u64,
+                                _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, eff_addr)),
+                            };
+                            let bit = (val >> (bit_pos & mask)) & 1;
+                            let new_val = val | (1u64 << (bit_pos & mask));
+                            match lane {
+                                LANE16 => { try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, eff_addr, new_val as u16)); }
+                                LANE32 => { try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, eff_addr, new_val as u32)); }
+                                _ => { try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, eff_addr, new_val)); }
+                            }
+                            materialize_flags(cpu);
+                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
+                            cpu.lazy.op = FlagOp::External;
+                        }
+        }
+        0xA4 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let fill = cpu.regs[src_reg];
+                        let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
+                        let res = exec_shld(dst, fill, imm as u64, lane);
+                        if res != u64::MAX {
+                            store_rm(cpu, ram, ram_size, modrm, lane, res);
+                        }
+        }
+        0xA5 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let fill = cpu.regs[src_reg];
+                        let count = cpu.regs[RCX] as u8;
+                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
+                        let res = exec_shld(dst, fill, count as u64, lane);
+                        if res != u64::MAX {
+                            store_rm(cpu, ram, ram_size, modrm, lane, res);
+                        }
+        }
+        0xAC => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let fill = cpu.regs[src_reg];
+                        let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
+                        let res = exec_shrd(dst, fill, imm as u64, lane);
+                        if res != u64::MAX {
+                            store_rm(cpu, ram, ram_size, modrm, lane, res);
+                        }
+        }
+        0xAD => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let fill = cpu.regs[src_reg];
+                        let count = cpu.regs[RCX] as u8;
+                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
+                        let res = exec_shrd(dst, fill, count as u64, lane);
+                        if res != u64::MAX {
+                            store_rm(cpu, ram, ram_size, modrm, lane, res);
+                        }
+        }
+        0xAE => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let reg_field = (modrm >> 3) & 7;
+                        if modrm & 0xC0 == 0xC0 {
+                            // mod=11: LFENCE(5), MFENCE(6), SFENCE(7) → no-op
+                            match reg_field {
+                                5 | 6 | 7 => {} // fence no-ops
+                                _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+                            }
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            match reg_field {
+                                2 => { // LDMXCSR
+                                    cpu.sse.mxcsr = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
+                                }
+                                3 => { // STMXCSR
+                                    try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.sse.mxcsr));
+                                }
+                                5 | 6 | 7 => {} // fence no-ops (memory forms)
+                                _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+                            }
+                        }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
     }
+    false
 }
+
+// ============================================================
+// 0F Page B: op2 0xB0-0xBF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_b(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0xB6 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst_reg = ((modrm >> 3) & 7) as usize
+                            | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let val = if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize
+                                | ((cpu.prefix.rex as usize & 1) << 3);
+                            read_reg8(cpu, r)
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
+                        };
+                        match lane {
+                            LANE16 => write_reg16(cpu, dst_reg, val as u16),
+                            _ => cpu.regs[dst_reg] = val as u64,
+                        }
+        }
+        0xB7 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst_reg = ((modrm >> 3) & 7) as usize
+                            | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let val = if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize
+                                | ((cpu.prefix.rex as usize & 1) << 3);
+                            cpu.regs[r] as u16
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
+                        };
+                        match lane {
+                            LANE16 => write_reg16(cpu, dst_reg, val),
+                            _ => cpu.regs[dst_reg] = val as u64,
+                        }
+        }
+        0xBE => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst_reg = ((modrm >> 3) & 7) as usize
+                            | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let val = if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize
+                                | ((cpu.prefix.rex as usize & 1) << 3);
+                            read_reg8(cpu, r)
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
+                        };
+                        match lane {
+                            LANE16 => write_reg16(cpu, dst_reg, val as i8 as u16),
+                            LANE32 => cpu.regs[dst_reg] = val as i8 as i32 as u32 as u64,
+                            LANE64 => cpu.regs[dst_reg] = val as i8 as i64 as u64,
+                            _ => {}
+                        }
+        }
+        0xBF => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst_reg = ((modrm >> 3) & 7) as usize
+                            | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let val = if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize
+                                | ((cpu.prefix.rex as usize & 1) << 3);
+                            cpu.regs[r] as u16
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
+                        };
+                        match lane {
+                            LANE16 => write_reg16(cpu, dst_reg, val),
+                            LANE32 => cpu.regs[dst_reg] = val as i16 as i32 as u32 as u64,
+                            LANE64 => cpu.regs[dst_reg] = val as i16 as i64 as u64,
+                            _ => {}
+                        }
+        }
+        0xBC => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let src = load_rm(cpu, ram, ram_size, modrm, lane);
+                        materialize_flags(cpu);
+                        match lane {
+                            LANE16 => {
+                                let v = src as u16;
+                                if v == 0 { cpu.rflags |= ZF; }
+                                else { cpu.rflags &= !ZF; write_reg16(cpu, dst_reg, v.trailing_zeros() as u16); }
+                            }
+                            LANE32 => {
+                                let v = src as u32;
+                                if v == 0 { cpu.rflags |= ZF; }
+                                else { cpu.rflags &= !ZF; cpu.regs[dst_reg] = v.trailing_zeros() as u64; }
+                            }
+                            _ => {
+                                if src == 0 { cpu.rflags |= ZF; }
+                                else { cpu.rflags &= !ZF; cpu.regs[dst_reg] = src.trailing_zeros() as u64; }
+                            }
+                        }
+                        cpu.lazy.op = FlagOp::External;
+        }
+        0xBD => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let src = load_rm(cpu, ram, ram_size, modrm, lane);
+                        materialize_flags(cpu);
+                        match lane {
+                            LANE16 => {
+                                let v = src as u16;
+                                if v == 0 { cpu.rflags |= ZF; }
+                                else { cpu.rflags &= !ZF; write_reg16(cpu, dst_reg, (15 - v.leading_zeros()) as u16); }
+                            }
+                            LANE32 => {
+                                let v = src as u32;
+                                if v == 0 { cpu.rflags |= ZF; }
+                                else { cpu.rflags &= !ZF; cpu.regs[dst_reg] = (31 - v.leading_zeros()) as u64; }
+                            }
+                            _ => {
+                                if src == 0 { cpu.rflags |= ZF; }
+                                else { cpu.rflags &= !ZF; cpu.regs[dst_reg] = (63 - src.leading_zeros()) as u64; }
+                            }
+                        }
+                        cpu.lazy.op = FlagOp::External;
+        }
+        0xB0 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let src = read_reg8(cpu, src_reg);
+                        let dst = if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            read_reg8(cpu, r)
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
+                        };
+                        let al = cpu.regs[RAX] as u8;
+                        let res = al.wrapping_sub(dst);
+                        set_lazy(cpu, FlagOp::SubB, al as u64, res as u64);
+                        if al == dst {
+                            if modrm & 0xC0 == 0xC0 {
+                                let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                write_reg8(cpu, r, src);
+                            } else {
+                                let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                                try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, src));
+                            }
+                        } else {
+                            write_reg8_al(cpu, dst);
+                        }
+        }
+        0xB1 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let src = cpu.regs[src_reg];
+                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
+                        match lane {
+                            LANE32 => {
+                                let a = cpu.regs[RAX] as u32;
+                                let d = dst as u32;
+                                let res = a.wrapping_sub(d);
+                                set_lazy(cpu, FlagOp::SubL, a as u64, res as u64);
+                                if a == d {
+                                    store_rm(cpu, ram, ram_size, modrm, lane, src);
+                                } else {
+                                    cpu.regs[RAX] = d as u64;
+                                }
+                            }
+                            LANE64 => {
+                                let a = cpu.regs[RAX];
+                                let res = a.wrapping_sub(dst);
+                                set_lazy(cpu, FlagOp::SubQ, a, res);
+                                if a == dst {
+                                    store_rm(cpu, ram, ram_size, modrm, lane, src);
+                                } else {
+                                    cpu.regs[RAX] = dst;
+                                }
+                            }
+                            _ => {}
+                        }
+        }
+        0xB3 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let bit_pos = cpu.regs[src_reg];
+                        let mask = match lane { LANE16 => 15u64, LANE32 => 31, _ => 63 };
+                        if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            let val = cpu.regs[r];
+                            let bit = (val >> (bit_pos & mask)) & 1;
+                            cpu.regs[r] = val & !(1u64 << (bit_pos & mask));
+                            if lane == LANE32 { cpu.regs[r] = cpu.regs[r] as u32 as u64; }
+                            materialize_flags(cpu);
+                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
+                            cpu.lazy.op = FlagOp::External;
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            let (op_bits, op_bytes) = match lane { LANE16 => (16u64, 2i64), LANE32 => (32, 4), _ => (64, 8) };
+                            let byte_offset = ((bit_pos as i64) >> if op_bits == 16 { 4 } else if op_bits == 32 { 5 } else { 6 }) * op_bytes;
+                            let eff_addr = addr.wrapping_add(byte_offset as u64);
+                            let val = match lane {
+                                LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, eff_addr)) as u64,
+                                LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, eff_addr)) as u64,
+                                _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, eff_addr)),
+                            };
+                            let bit = (val >> (bit_pos & mask)) & 1;
+                            let new_val = val & !(1u64 << (bit_pos & mask));
+                            match lane {
+                                LANE16 => { try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, eff_addr, new_val as u16)); }
+                                LANE32 => { try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, eff_addr, new_val as u32)); }
+                                _ => { try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, eff_addr, new_val)); }
+                            }
+                            materialize_flags(cpu);
+                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
+                            cpu.lazy.op = FlagOp::External;
+                        }
+        }
+        0xBB => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let bit_pos = cpu.regs[src_reg];
+                        let mask = match lane { LANE16 => 15u64, LANE32 => 31, _ => 63 };
+                        if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            let val = cpu.regs[r];
+                            let bit = (val >> (bit_pos & mask)) & 1;
+                            cpu.regs[r] = val ^ (1u64 << (bit_pos & mask));
+                            if lane == LANE32 { cpu.regs[r] = cpu.regs[r] as u32 as u64; }
+                            materialize_flags(cpu);
+                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
+                            cpu.lazy.op = FlagOp::External;
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            let (op_bits, op_bytes) = match lane { LANE16 => (16u64, 2i64), LANE32 => (32, 4), _ => (64, 8) };
+                            let byte_offset = ((bit_pos as i64) >> if op_bits == 16 { 4 } else if op_bits == 32 { 5 } else { 6 }) * op_bytes;
+                            let eff_addr = addr.wrapping_add(byte_offset as u64);
+                            let val = match lane {
+                                LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, eff_addr)) as u64,
+                                LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, eff_addr)) as u64,
+                                _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, eff_addr)),
+                            };
+                            let bit = (val >> (bit_pos & mask)) & 1;
+                            let new_val = val ^ (1u64 << (bit_pos & mask));
+                            match lane {
+                                LANE16 => { try_or_fault_page!(cpu, mem::store_u16(cpu, ram, ram_size, eff_addr, new_val as u16)); }
+                                LANE32 => { try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, eff_addr, new_val as u32)); }
+                                _ => { try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, eff_addr, new_val)); }
+                            }
+                            materialize_flags(cpu);
+                            cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
+                            cpu.lazy.op = FlagOp::External;
+                        }
+        }
+        0xBA => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let reg_field = (modrm >> 3) & 7;
+                        let val = load_rm(cpu, ram, ram_size, modrm, lane);
+                        let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let mask = match lane { LANE16 => 15u8, LANE32 => 31, _ => 63 };
+                        let bit_idx = imm & mask;
+                        let bit = (val >> bit_idx) & 1;
+                        match reg_field {
+                            4 => { // BT — read only
+                            }
+                            5 => { // BTS — set bit
+                                let new_val = val | (1u64 << bit_idx);
+                                store_rm(cpu, ram, ram_size, modrm, lane, new_val);
+                            }
+                            6 => { // BTR — clear bit
+                                let new_val = val & !(1u64 << bit_idx);
+                                store_rm(cpu, ram, ram_size, modrm, lane, new_val);
+                            }
+                            7 => { // BTC — complement bit
+                                let new_val = val ^ (1u64 << bit_idx);
+                                store_rm(cpu, ram, ram_size, modrm, lane, new_val);
+                            }
+                            _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+                        }
+                        materialize_flags(cpu);
+                        cpu.rflags = (cpu.rflags & !CF) | (bit * CF);
+                        cpu.lazy.op = FlagOp::External;
+        }
+        0xB2 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); return true; }
+                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                        match lane {
+                            LANE16 => {
+                                let val = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
+                                let sel = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(2)));
+                                write_reg16(cpu, dst_reg, val);
+                                cpu.segs[SEG_SS].selector = sel;
+                            }
+                            LANE32 => {
+                                let val = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
+                                let sel = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(4)));
+                                cpu.regs[dst_reg] = val as u64;
+                                cpu.segs[SEG_SS].selector = sel;
+                            }
+                            _ => {
+                                let val = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
+                                let sel = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(8)));
+                                cpu.regs[dst_reg] = val;
+                                cpu.segs[SEG_SS].selector = sel;
+                            }
+                        }
+        }
+        0xB4 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); return true; }
+                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                        match lane {
+                            LANE16 => {
+                                let val = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
+                                let sel = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(2)));
+                                write_reg16(cpu, dst_reg, val);
+                                cpu.segs[SEG_FS].selector = sel;
+                            }
+                            LANE32 => {
+                                let val = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
+                                let sel = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(4)));
+                                cpu.regs[dst_reg] = val as u64;
+                                cpu.segs[SEG_FS].selector = sel;
+                            }
+                            _ => {
+                                let val = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
+                                let sel = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(8)));
+                                cpu.regs[dst_reg] = val;
+                                cpu.segs[SEG_FS].selector = sel;
+                            }
+                        }
+        }
+        0xB5 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); return true; }
+                        let dst_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                        match lane {
+                            LANE16 => {
+                                let val = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr));
+                                let sel = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(2)));
+                                write_reg16(cpu, dst_reg, val);
+                                cpu.segs[SEG_GS].selector = sel;
+                            }
+                            LANE32 => {
+                                let val = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr));
+                                let sel = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(4)));
+                                cpu.regs[dst_reg] = val as u64;
+                                cpu.segs[SEG_GS].selector = sel;
+                            }
+                            _ => {
+                                let val = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
+                                let sel = try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr.wrapping_add(8)));
+                                cpu.regs[dst_reg] = val;
+                                cpu.segs[SEG_GS].selector = sel;
+                            }
+                        }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page C: op2 0xC0-0xCF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_c(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0xC8..=0xCF => {
+                        let r = (op2 & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                        match lane {
+                            LANE32 => cpu.regs[r] = (cpu.regs[r] as u32).swap_bytes() as u64,
+                            _ => cpu.regs[r] = cpu.regs[r].swap_bytes(),
+                        }
+        }
+        0xC0 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let src = read_reg8(cpu, src_reg);
+                        let dst = if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            read_reg8(cpu, r)
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            try_or_fault_page!(cpu, mem::load_u8(cpu, ram, ram_size, addr))
+                        };
+                        let res = dst.wrapping_add(src);
+                        write_reg8(cpu, src_reg, dst); // src reg gets old dst
+                        if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            write_reg8(cpu, r, res);
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            try_or_fault_page!(cpu, mem::store_u8(cpu, ram, ram_size, addr, res));
+                        }
+                        set_lazy(cpu, FlagOp::AddB, dst as u64, res as u64);
+        }
+        0xC1 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let src = cpu.regs[src_reg];
+                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
+                        match lane {
+                            LANE32 => {
+                                let res = (dst as u32).wrapping_add(src as u32);
+                                cpu.regs[src_reg] = dst as u32 as u64;
+                                store_rm(cpu, ram, ram_size, modrm, lane, res as u64);
+                                set_lazy(cpu, FlagOp::AddL, dst, res as u64);
+                            }
+                            LANE64 => {
+                                let res = dst.wrapping_add(src);
+                                cpu.regs[src_reg] = dst;
+                                store_rm(cpu, ram, ram_size, modrm, lane, res);
+                                set_lazy(cpu, FlagOp::AddQ, dst, res);
+                            }
+                            _ => {}
+                        }
+        }
+        0xC7 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let reg_field = (modrm >> 3) & 7;
+                        if reg_field != 1 || modrm & 0xC0 == 0xC0 {
+                            raise_exception(cpu, EXC_UD, 0); return true;
+                        }
+                        let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                        if lane == LANE64 {
+                            // CMPXCHG16B: compare RDX:RAX with m128
+                            let lo = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr));
+                            let hi = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, addr.wrapping_add(8)));
+                            if cpu.regs[RAX] == lo && cpu.regs[RDX] == hi {
+                                try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.regs[RBX]));
+                                try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr.wrapping_add(8), cpu.regs[RCX]));
+                                materialize_flags(cpu);
+                                cpu.rflags |= ZF;
+                                cpu.lazy.op = FlagOp::External;
+                            } else {
+                                cpu.regs[RAX] = lo;
+                                cpu.regs[RDX] = hi;
+                                materialize_flags(cpu);
+                                cpu.rflags &= !ZF;
+                                cpu.lazy.op = FlagOp::External;
+                            }
+                        } else {
+                            // CMPXCHG8B: compare EDX:EAX with m64
+                            let lo = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr)) as u64;
+                            let hi = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, addr.wrapping_add(4))) as u64;
+                            let cmp_val = (hi << 32) | lo;
+                            let eax_edx = ((cpu.regs[RDX] as u32 as u64) << 32) | (cpu.regs[RAX] as u32 as u64);
+                            if eax_edx == cmp_val {
+                                try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.regs[RBX] as u32));
+                                try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr.wrapping_add(4), cpu.regs[RCX] as u32));
+                                materialize_flags(cpu);
+                                cpu.rflags |= ZF;
+                                cpu.lazy.op = FlagOp::External;
+                            } else {
+                                cpu.regs[RAX] = lo;
+                                cpu.regs[RDX] = hi;
+                                materialize_flags(cpu);
+                                cpu.rflags &= !ZF;
+                                cpu.lazy.op = FlagOp::External;
+                            }
+                        }
+        }
+        0xC3 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); return true; }
+                        let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                        match lane {
+                            LANE32 => { try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.regs[src_reg] as u32)); }
+                            LANE64 => { try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.regs[src_reg])); }
+                            _ => { try_or_fault_page!(cpu, mem::store_u32(cpu, ram, ram_size, addr, cpu.regs[src_reg] as u32)); }
+                        }
+        }
+        0xC2 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let pred = imm & 7;
+                        if cpu.prefix.rep == 0xF3 {
+                            // CMPSS — scalar single
+                            let a = f32::from_bits(cpu.sse.xmm[dst][0] as u32);
+                            let b = f32::from_bits(lo as u32);
+                            let r = sse_cmp_f32(a, b, pred);
+                            cpu.sse.xmm[dst][0] = (cpu.sse.xmm[dst][0] & 0xFFFFFFFF00000000) | r as u64;
+                        } else if cpu.prefix.rep == 0xF2 {
+                            // CMPSD — scalar double
+                            let a = f64::from_bits(cpu.sse.xmm[dst][0]);
+                            let b = f64::from_bits(lo);
+                            let r = sse_cmp_f64(a, b, pred);
+                            cpu.sse.xmm[dst][0] = r;
+                        } else if cpu.prefix.op_size {
+                            // CMPPD — packed double
+                            let a0 = f64::from_bits(cpu.sse.xmm[dst][0]);
+                            let a1 = f64::from_bits(cpu.sse.xmm[dst][1]);
+                            let b0 = f64::from_bits(lo);
+                            let b1 = f64::from_bits(hi);
+                            cpu.sse.xmm[dst][0] = sse_cmp_f64(a0, b0, pred);
+                            cpu.sse.xmm[dst][1] = sse_cmp_f64(a1, b1, pred);
+                        } else {
+                            // CMPPS — packed single
+                            sse_cmpps(cpu, dst, lo, hi, pred);
+                        }
+        }
+        0xC6 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if cpu.prefix.op_size {
+                            // SHUFPD
+                            let d = [cpu.sse.xmm[dst][0], cpu.sse.xmm[dst][1]];
+                            let s = [lo, hi];
+                            cpu.sse.xmm[dst][0] = d[(imm & 1) as usize];
+                            cpu.sse.xmm[dst][1] = s[((imm >> 1) & 1) as usize];
+                        } else {
+                            // SHUFPS
+                            let d = [cpu.sse.xmm[dst][0] as u32, (cpu.sse.xmm[dst][0] >> 32) as u32,
+                                     cpu.sse.xmm[dst][1] as u32, (cpu.sse.xmm[dst][1] >> 32) as u32];
+                            let s = [lo as u32, (lo >> 32) as u32, hi as u32, (hi >> 32) as u32];
+                            let r0 = d[(imm & 3) as usize] as u64;
+                            let r1 = d[((imm >> 2) & 3) as usize] as u64;
+                            let r2 = s[((imm >> 4) & 3) as usize] as u64;
+                            let r3 = s[((imm >> 6) & 3) as usize] as u64;
+                            cpu.sse.xmm[dst][0] = r0 | (r1 << 32);
+                            cpu.sse.xmm[dst][1] = r2 | (r3 << 32);
+                        }
+        }
+        0xC4 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let val = if modrm & 0xC0 == 0xC0 {
+                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            cpu.regs[r] as u16
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
+                        };
+                        let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let sel = (imm & 7) as usize;
+                        let qword = sel >> 2;
+                        let word_in_qword = sel & 3;
+                        let shift = word_in_qword * 16;
+                        let mask = !(0xFFFFu64 << shift);
+                        cpu.sse.xmm[dst][qword] = (cpu.sse.xmm[dst][qword] & mask) | ((val as u64) << shift);
+        }
+        0xC5 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                        let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let sel = (imm & 7) as usize;
+                        let qword = sel >> 2;
+                        let word_in_qword = sel & 3;
+                        let val = (cpu.sse.xmm[src][qword] >> (word_in_qword * 16)) as u16;
+                        cpu.regs[dst] = val as u64;
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page D: op2 0xD0-0xDF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_d(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0xD6 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        if modrm & 0xC0 == 0xC0 {
+                            let dst_r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            cpu.sse.xmm[dst_r][0] = cpu.sse.xmm[src][0];
+                            cpu.sse.xmm[dst_r][1] = 0;
+                        } else {
+                            let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0]));
+                        }
+        }
+        0xD7 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let src = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                        let lo = cpu.sse.xmm[src][0];
+                        let hi = cpu.sse.xmm[src][1];
+                        let mut mask = 0u64;
+                        for i in 0..8 { mask |= ((lo >> (i * 8 + 7)) & 1) << i; }
+                        for i in 0..8 { mask |= ((hi >> (i * 8 + 7)) & 1) << (i + 8); }
+                        cpu.regs[dst] = mask;
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page E: op2 0xE0-0xEF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_e(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0xE7 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        if modrm & 0xC0 == 0xC0 { raise_exception(cpu, EXC_UD, 0); return true; }
+                        let src = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let addr = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                        try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr, cpu.sse.xmm[src][0]));
+                        try_or_fault_page!(cpu, mem::store_u64(cpu, ram, ram_size, addr.wrapping_add(8), cpu.sse.xmm[src][1]));
+        }
+        0xE6 => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                        if cpu.prefix.op_size {
+                            // CVTTPD2DQ: packed double → packed dword (truncate)
+                            let d0 = f64::from_bits(lo) as i32;
+                            let d1 = f64::from_bits(hi) as i32;
+                            cpu.sse.xmm[dst][0] = d0 as u32 as u64 | ((d1 as u32 as u64) << 32);
+                            cpu.sse.xmm[dst][1] = 0;
+                        } else if cpu.prefix.rep == 0xF3 {
+                            // CVTDQ2PD: packed dword → packed double
+                            let d0 = lo as u32 as i32 as f64;
+                            let d1 = (lo >> 32) as u32 as i32 as f64;
+                            cpu.sse.xmm[dst][0] = d0.to_bits();
+                            cpu.sse.xmm[dst][1] = d1.to_bits();
+                        } else if cpu.prefix.rep == 0xF2 {
+                            // CVTPD2DQ: packed double → packed dword (round)
+                            let d0 = libm::round(f64::from_bits(lo)) as i32;
+                            let d1 = libm::round(f64::from_bits(hi)) as i32;
+                            cpu.sse.xmm[dst][0] = d0 as u32 as u64 | ((d1 as u32 as u64) << 32);
+                            cpu.sse.xmm[dst][1] = 0;
+                        }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
+// ============================================================
+// 0F Page F: op2 0xF0-0xFF
+// ============================================================
+#[inline(always)]
+#[allow(unused_variables, unreachable_code)]
+unsafe fn exec_0f_page_f(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, lane: u32) -> bool {
+    match op2 {
+        0xF8..=0xFE => {
+                        let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                        let dst = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
+                        // Shift-by-immediate (0x71/72/73) have imm8 after modrm, not XMM source
+                        if op2 == 0x71 || op2 == 0x72 || op2 == 0x73 {
+                            let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
+                            let reg_field = (modrm >> 3) & 7;
+                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            exec_sse_shift_imm(cpu, r, op2, reg_field, imm);
+                        } else {
+                            let (lo, hi) = load_xmm_rm(cpu, ram, ram_size, modrm);
+                            exec_sse_int_op(cpu, dst, lo, hi, op2);
+                        }
+        }
+        _ => { raise_exception(cpu, EXC_UD, 0); return true; }
+    }
+    false
+}
+
 
 // ============================================================
 // ALU operation enum for helper functions
@@ -3604,7 +3907,7 @@ pub unsafe fn exec(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, mut budget: i32) 
 enum AluOp { Add, Or, Adc, Sbb, And, Sub, Xor, Cmp, Test }
 
 /// Load r/m value for the current operand size lane.
-#[inline(always)]
+#[inline]
 unsafe fn load_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32) -> u64 {
     if modrm & 0xC0 == 0xC0 {
         let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
@@ -3624,7 +3927,7 @@ unsafe fn load_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u
 }
 
 /// ALU op: r/m ← r/m OP r (ModR/M form, destination is r/m)
-#[inline(always)]
+#[inline]
 unsafe fn alu_op_rm_r(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32, op: AluOp, src: u64) {
     if modrm & 0xC0 == 0xC0 {
         let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
@@ -3685,7 +3988,7 @@ unsafe fn alu_op_rm_r(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lan
 }
 
 /// ALU op: r ← r OP r/m (ModR/M form, destination is reg)
-#[inline(always)]
+#[inline]
 unsafe fn alu_op_r_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32, op: AluOp, dst_reg: usize) {
     let src = load_rm(cpu, ram, ram_size, modrm, lane);
     match lane {
@@ -3711,7 +4014,7 @@ unsafe fn alu_op_r_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lan
     }
 }
 
-#[inline(always)]
+#[inline]
 fn do_alu16(dst: u16, src: u16, op: AluOp) -> (u16, FlagOp) {
     match op {
         AluOp::Add => (dst.wrapping_add(src), FlagOp::AddW),
@@ -3724,7 +4027,7 @@ fn do_alu16(dst: u16, src: u16, op: AluOp) -> (u16, FlagOp) {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn do_alu32(dst: u32, src: u32, op: AluOp) -> (u32, FlagOp) {
     match op {
         AluOp::Add => (dst.wrapping_add(src), FlagOp::AddL),
@@ -3737,7 +4040,7 @@ fn do_alu32(dst: u32, src: u32, op: AluOp) -> (u32, FlagOp) {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn do_alu64(dst: u64, src: u64, op: AluOp) -> (u64, FlagOp) {
     match op {
         AluOp::Add => (dst.wrapping_add(src), FlagOp::AddQ),
@@ -3751,7 +4054,7 @@ fn do_alu64(dst: u64, src: u64, op: AluOp) -> (u64, FlagOp) {
 }
 
 /// GRP1 imm8 ALU for byte operand
-#[inline(always)]
+#[inline]
 fn grp1_op8(dst: u8, src: u8, op_idx: u8) -> (u8, FlagOp) {
     match op_idx {
         0 => (dst.wrapping_add(src), FlagOp::AddB),
@@ -3766,7 +4069,7 @@ fn grp1_op8(dst: u8, src: u8, op_idx: u8) -> (u8, FlagOp) {
 }
 
 /// GRP1 r/m16/32/64, imm (0x81/0x83)
-#[inline(always)]
+#[inline]
 unsafe fn grp1_rm_imm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32, op_idx: u8, sign_ext: bool) {
     let alu_op = match op_idx {
         0 => AluOp::Add, 1 => AluOp::Or, 2 => AluOp::Adc, 3 => AluOp::Sbb,
@@ -3857,7 +4160,7 @@ unsafe fn grp1_rm_imm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lan
 }
 
 /// GRP2 shifts for 16/32/64-bit
-#[inline(always)]
+#[inline]
 unsafe fn grp2_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32, op_idx: u8, count: u8) {
     let count_mask = if lane == LANE64 { 0x3F } else { 0x1F };
     let count = count & count_mask;
@@ -3909,7 +4212,7 @@ unsafe fn grp2_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u
     }
 }
 
-#[inline(always)]
+#[inline]
 fn shift_op8(cpu: &mut Cpu, val: u8, count: u8, op: u8) -> u8 {
     let res = match op {
         4 | 6 => { // SHL
@@ -3944,7 +4247,7 @@ fn shift_op8(cpu: &mut Cpu, val: u8, count: u8, op: u8) -> u8 {
     res
 }
 
-#[inline(always)]
+#[inline]
 fn shift_op16(cpu: &mut Cpu, val: u16, count: u8, op: u8) -> u16 {
     match op {
         4 | 6 => {
@@ -3971,7 +4274,7 @@ fn shift_op16(cpu: &mut Cpu, val: u16, count: u8, op: u8) -> u16 {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn shift_op32(cpu: &mut Cpu, val: u32, count: u8, op: u8) -> u32 {
     match op {
         4 | 6 => {
@@ -3998,7 +4301,7 @@ fn shift_op32(cpu: &mut Cpu, val: u32, count: u8, op: u8) -> u32 {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn shift_op64(cpu: &mut Cpu, val: u64, count: u8, op: u8) -> u64 {
     match op {
         4 | 6 => {
@@ -4026,7 +4329,7 @@ fn shift_op64(cpu: &mut Cpu, val: u64, count: u8, op: u8) -> u64 {
 }
 
 /// GRP3 for 16/32/64-bit
-#[inline(always)]
+#[inline]
 unsafe fn grp3_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32) {
     let op_idx = (modrm >> 3) & 7;
     let val = load_rm(cpu, ram, ram_size, modrm, lane);
@@ -4185,7 +4488,7 @@ unsafe fn grp3_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u
 }
 
 /// Store to r/m (for GRP3 NOT/NEG)
-#[inline(always)]
+#[inline]
 unsafe fn store_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32, val: u64) {
     if modrm & 0xC0 == 0xC0 {
         let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
@@ -4210,7 +4513,7 @@ unsafe fn store_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: 
 }
 
 /// GRP5 — INC/DEC/CALL/JMP/PUSH r/m
-#[inline(always)]
+#[inline]
 unsafe fn grp5_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32) {
     let op_idx = (modrm >> 3) & 7;
     match op_idx {
@@ -4293,7 +4596,7 @@ unsafe fn grp5_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u
 // String operations
 // ============================================================
 
-#[inline(always)]
+#[inline]
 unsafe fn string_movsb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32) {
     let df = if cpu.rflags & DF != 0 { -1i64 } else { 1i64 };
     if cpu.prefix.rep != 0 {
@@ -4312,7 +4615,7 @@ unsafe fn string_movsb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32) {
     }
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn string_movs(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, lane: u32) {
     let size = match lane { LANE16 => 2i64, LANE32 => 4, _ => 8 };
     let df = if cpu.rflags & DF != 0 { -size } else { size };
@@ -4356,7 +4659,7 @@ unsafe fn string_movs(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, lane: u32) {
     }
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn string_stosb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32) {
     let val = cpu.regs[RAX] as u8;
     let df = if cpu.rflags & DF != 0 { -1i64 } else { 1i64 };
@@ -4372,7 +4675,7 @@ unsafe fn string_stosb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32) {
     }
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn string_stos(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, lane: u32) {
     let size = match lane { LANE16 => 2i64, LANE32 => 4, _ => 8 };
     let df = if cpu.rflags & DF != 0 { -size } else { size };
@@ -4396,7 +4699,7 @@ unsafe fn string_stos(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, lane: u32) {
     }
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn string_lodsb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32) {
     let df = if cpu.rflags & DF != 0 { -1i64 } else { 1i64 };
     let val = mem::load_u8(cpu, ram, ram_size, cpu.regs[RSI]).unwrap_or(0);
@@ -4404,7 +4707,7 @@ unsafe fn string_lodsb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32) {
     cpu.regs[RSI] = cpu.regs[RSI].wrapping_add(df as u64);
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn string_lods(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, lane: u32) {
     let size = match lane { LANE16 => 2i64, LANE32 => 4, _ => 8 };
     let df = if cpu.rflags & DF != 0 { -size } else { size };
@@ -4425,7 +4728,7 @@ unsafe fn string_lods(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, lane: u32) {
     cpu.regs[RSI] = cpu.regs[RSI].wrapping_add(df as u64);
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn string_cmpsb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32) {
     let df = if cpu.rflags & DF != 0 { -1i64 } else { 1i64 };
     if cpu.prefix.rep != 0 {
@@ -4451,7 +4754,7 @@ unsafe fn string_cmpsb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32) {
     }
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn string_cmps(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, lane: u32) {
     let size = match lane { LANE16 => 2i64, LANE32 => 4, _ => 8 };
     let df = if cpu.rflags & DF != 0 { -size } else { size };
@@ -4475,7 +4778,7 @@ unsafe fn string_cmps(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, lane: u32) {
     cpu.regs[RDI] = cpu.regs[RDI].wrapping_add(df as u64);
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn string_scasb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32) {
     let df = if cpu.rflags & DF != 0 { -1i64 } else { 1i64 };
     let al = cpu.regs[RAX] as u8;
@@ -4498,7 +4801,7 @@ unsafe fn string_scasb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32) {
     }
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn string_scas(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, lane: u32) {
     let size = match lane { LANE16 => 2i64, LANE32 => 4, _ => 8 };
     let df = if cpu.rflags & DF != 0 { -size } else { size };
@@ -4520,7 +4823,7 @@ unsafe fn string_scas(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, lane: u32) {
     cpu.regs[RDI] = cpu.regs[RDI].wrapping_add(df as u64);
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn load_from_addr(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, addr: u64, lane: u32) -> u64 {
     match lane {
         LANE16 => mem::load_u16(cpu, ram, ram_size, addr).unwrap_or(0) as u64,
@@ -4822,7 +5125,7 @@ unsafe fn write_phys_u64(ram: *mut u8, ram_size: u32, addr: u64, val: u64) {
 }
 
 /// Decode ModR/M addressing mode, return effective address.
-#[inline(always)]
+#[inline]
 unsafe fn decode_modrm_addr(
     cpu: &mut Cpu,
     ram: *mut u8,
@@ -4914,7 +5217,7 @@ unsafe fn decode_modrm_addr(
 }
 
 /// Decode SIB byte for addressing.
-#[inline(always)]
+#[inline]
 unsafe fn decode_sib(
     cpu: &mut Cpu,
     ram: *mut u8,
@@ -5079,7 +5382,7 @@ unsafe fn handle_rdmsr(cpu: &Cpu, ecx: u32) -> u64 {
 // ============================================================
 
 /// Byte ALU operation: alu_op 0=ADD, 1=OR, 2=ADC, 3=SBB, 4=AND, 5=SUB, 6=XOR, 7=CMP
-#[inline(always)]
+#[inline]
 unsafe fn alu_op_b(cpu: &mut Cpu, alu_op: usize, dst: u8, src: u8) -> (u8, FlagOp) {
     match alu_op {
         0 => (dst.wrapping_add(src), FlagOp::AddB),
@@ -5100,7 +5403,7 @@ unsafe fn alu_op_b(cpu: &mut Cpu, alu_op: usize, dst: u8, src: u8) -> (u8, FlagO
 }
 
 /// Ev,Gv ALU on register operands
-#[inline(always)]
+#[inline]
 unsafe fn alu_ev_gv_reg(cpu: &mut Cpu, alu_op: usize, dst_reg: usize, src_reg: usize, lane: u32) {
     let src = cpu.regs[src_reg];
     let dst = cpu.regs[dst_reg];
@@ -5124,7 +5427,7 @@ unsafe fn alu_ev_gv_reg(cpu: &mut Cpu, alu_op: usize, dst_reg: usize, src_reg: u
 }
 
 /// Ev,Gv ALU on memory destination
-#[inline(always)]
+#[inline]
 unsafe fn alu_ev_gv_mem(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, alu_op: usize, addr: u64, src_reg: usize, lane: u32) {
     let src = cpu.regs[src_reg];
     match lane {
@@ -5150,7 +5453,7 @@ unsafe fn alu_ev_gv_mem(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, alu_op: usiz
 }
 
 /// Gv,Ev ALU — destination is register, source is value
-#[inline(always)]
+#[inline]
 unsafe fn alu_gv_ev(cpu: &mut Cpu, alu_op: usize, dst_reg: usize, src: u64, lane: u32) {
     let dst = cpu.regs[dst_reg];
     match lane {
@@ -5172,7 +5475,7 @@ unsafe fn alu_gv_ev(cpu: &mut Cpu, alu_op: usize, dst_reg: usize, src: u64, lane
     }
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn alu_op_w(cpu: &mut Cpu, alu_op: usize, dst: u16, src: u16) -> (u16, FlagOp) {
     match alu_op {
         0 => (dst.wrapping_add(src), FlagOp::AddW),
@@ -5186,7 +5489,7 @@ unsafe fn alu_op_w(cpu: &mut Cpu, alu_op: usize, dst: u16, src: u16) -> (u16, Fl
     }
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn alu_op_l(cpu: &mut Cpu, alu_op: usize, dst: u32, src: u32) -> (u32, FlagOp) {
     match alu_op {
         0 => (dst.wrapping_add(src), FlagOp::AddL),
@@ -5200,7 +5503,7 @@ unsafe fn alu_op_l(cpu: &mut Cpu, alu_op: usize, dst: u32, src: u32) -> (u32, Fl
     }
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn alu_op_q(cpu: &mut Cpu, alu_op: usize, dst: u64, src: u64) -> (u64, FlagOp) {
     match alu_op {
         0 => (dst.wrapping_add(src), FlagOp::AddQ),
@@ -5218,7 +5521,7 @@ unsafe fn alu_op_q(cpu: &mut Cpu, alu_op: usize, dst: u64, src: u64) -> (u64, Fl
 // GRP1 Ev, imm helper
 // ============================================================
 
-#[inline(always)]
+#[inline]
 unsafe fn grp1_ev_imm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, alu_op: usize, lane: u32, sign_ext: bool) {
     let is_reg = modrm & 0xC0 == 0xC0;
     let rm = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
@@ -5279,7 +5582,7 @@ unsafe fn grp1_ev_imm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, alu
 // Shift/rotate helpers
 // ============================================================
 
-#[inline(always)]
+#[inline]
 unsafe fn shift_op_b(cpu: &mut Cpu, op: usize, val: u8, count: u8) -> u8 {
     let res = match op {
         0 => { // ROL
@@ -5310,7 +5613,7 @@ unsafe fn shift_op_b(cpu: &mut Cpu, op: usize, val: u8, count: u8) -> u8 {
     res
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn grp2_ev(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, shift_op: usize, count_raw: u8, lane: u32) {
     let rm = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
     let is_reg = modrm & 0xC0 == 0xC0;
@@ -5369,7 +5672,7 @@ unsafe fn grp2_ev(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, shift_o
 // GRP3 helpers (TEST/NOT/NEG/MUL/IMUL/DIV/IDIV)
 // ============================================================
 
-#[inline(always)]
+#[inline]
 unsafe fn grp3_eb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8) {
     let op = ((modrm >> 3) & 7) as usize;
     let rm = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
@@ -5433,7 +5736,7 @@ unsafe fn grp3_eb(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8) {
     }
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn grp3_ev(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32) {
     let op = ((modrm >> 3) & 7) as usize;
     let rm = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
@@ -5581,7 +5884,7 @@ unsafe fn grp3_ev(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u
 // GRP5 — INC/DEC/CALL/JMP/PUSH Ev
 // ============================================================
 
-#[inline(always)]
+#[inline]
 unsafe fn grp5(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32) {
     let op = ((modrm >> 3) & 7) as usize;
     let rm = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
@@ -5673,7 +5976,7 @@ unsafe fn grp5(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32)
 // (string helpers are defined earlier in the file, above this point)
 
 /// SHLD: double-precision left shift. Returns u64::MAX if count==0 (no-op sentinel).
-#[inline(always)]
+#[inline]
 unsafe fn exec_shld(dst: u64, fill: u64, count: u64, lane: u32) -> u64 {
     let mask = if lane == LANE64 { 63u64 } else { 31 };
     let count = count & mask;
@@ -5698,7 +6001,7 @@ unsafe fn exec_shld(dst: u64, fill: u64, count: u64, lane: u32) -> u64 {
 }
 
 /// SHRD: double-precision right shift. Returns u64::MAX if count==0 (no-op sentinel).
-#[inline(always)]
+#[inline]
 unsafe fn exec_shrd(dst: u64, fill: u64, count: u64, lane: u32) -> u64 {
     let mask = if lane == LANE64 { 63u64 } else { 31 };
     let count = count & mask;
@@ -5785,7 +6088,6 @@ fn fpu_compare(cpu: &mut Cpu, a: f64, b: f64) {
 }
 
 /// The main FPU dispatcher.
-#[inline(always)]
 unsafe fn exec_fpu(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, fpu_op: u8, modrm: u8) {
     let reg_field = (modrm >> 3) & 7;
     let is_mem = modrm & 0xC0 != 0xC0;
@@ -6310,7 +6612,7 @@ unsafe fn exec_fpu(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, fpu_op: u8, modrm
 }
 
 /// Convert 80-bit x87 extended (mantissa + exp/sign word) to f64.
-#[inline(always)]
+#[inline]
 fn ld80_to_f64(mantissa: u64, exp_sign: u16) -> f64 {
     let sign = (exp_sign >> 15) & 1;
     let exp = (exp_sign & 0x7FFF) as i32;
@@ -6330,7 +6632,7 @@ fn ld80_to_f64(mantissa: u64, exp_sign: u16) -> f64 {
 }
 
 /// Convert f64 to 80-bit x87 extended (mantissa, exp/sign word).
-#[inline(always)]
+#[inline]
 fn f64_to_ld80(val: f64) -> (u64, u16) {
     if val == 0.0 {
         let sign = if val.is_sign_negative() { 0x8000u16 } else { 0u16 };
@@ -6351,7 +6653,7 @@ fn f64_to_ld80(val: f64) -> (u64, u16) {
 }
 
 /// Simple frexp-like: extract (mantissa, exponent) where val = mantissa * 2^exp, 0.5 <= |mantissa| < 1
-#[inline(always)]
+#[inline]
 fn frexp_f64(val: f64) -> (f64, i32) {
     if val == 0.0 { return (0.0, 0); }
     let bits = val.to_bits();
@@ -6393,7 +6695,7 @@ unsafe fn store_xmm_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lo
 }
 
 /// SSE compare predicate for f32 — returns all-1s or all-0s mask.
-#[inline(always)]
+#[inline]
 fn sse_cmp_f32(a: f32, b: f32, pred: u8) -> u32 {
     let result = match pred {
         0 => a == b,             // EQ
@@ -6409,7 +6711,7 @@ fn sse_cmp_f32(a: f32, b: f32, pred: u8) -> u32 {
 }
 
 /// SSE compare predicate for f64 — returns all-1s or all-0s mask.
-#[inline(always)]
+#[inline]
 fn sse_cmp_f64(a: f64, b: f64, pred: u8) -> u64 {
     let result = match pred {
         0 => a == b,
@@ -6425,7 +6727,7 @@ fn sse_cmp_f64(a: f64, b: f64, pred: u8) -> u64 {
 }
 
 /// CMPPS — packed single compare
-#[inline(always)]
+#[inline]
 fn sse_cmpps(cpu: &mut Cpu, dst: usize, lo: u64, hi: u64, pred: u8) {
     let d_lo = cpu.sse.xmm[dst][0];
     let d_hi = cpu.sse.xmm[dst][1];
@@ -6438,7 +6740,6 @@ fn sse_cmpps(cpu: &mut Cpu, dst: usize, lo: u64, hi: u64, pred: u8) {
 }
 
 /// SSE float arithmetic dispatcher — handles 0x51-0x5F based on prefix.
-#[inline(always)]
 unsafe fn exec_sse_arith(cpu: &mut Cpu, dst: usize, lo: u64, hi: u64, op2: u8) {
     if cpu.prefix.rep == 0xF3 {
         // Scalar single (SS)
@@ -6544,7 +6845,6 @@ unsafe fn exec_sse_arith(cpu: &mut Cpu, dst: usize, lo: u64, hi: u64, op2: u8) {
 }
 
 /// SSE2 packed integer operations.
-#[inline(always)]
 fn exec_sse_int_op(cpu: &mut Cpu, dst: usize, lo: u64, hi: u64, op2: u8) {
     let d = &mut cpu.sse.xmm[dst];
     match op2 {
@@ -6873,7 +7173,6 @@ fn exec_sse_int_op(cpu: &mut Cpu, dst: usize, lo: u64, hi: u64, op2: u8) {
 }
 
 /// SSE2 shift-by-immediate (0x71/72/73 with reg_field selecting the operation).
-#[inline(always)]
 fn exec_sse_shift_imm(cpu: &mut Cpu, r: usize, op2: u8, reg_field: u8, imm: u8) {
     let d = &mut cpu.sse.xmm[r];
     let cnt = imm as u32;

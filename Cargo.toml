@@ -9,6 +9,14 @@ crate-type = ["cdylib"]
 [dependencies]
 libm = "0.2"
 
+[profile.dev]
+opt-level = 0
+debug = 0
+incremental = true
+codegen-units = 256
+
+# Release: fat LTO + CGU=1 reconstructs the monolithic interpreter from paged source.
+# Page functions with #[inline(always)] are fused back into exec() → one 660KB WASM function.
 [profile.release]
 opt-level = "z"
 lto = "fat"

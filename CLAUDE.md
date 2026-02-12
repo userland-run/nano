@@ -4,12 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**NanoVM** — a Rust reimplementation of Bellard's JSLinux/TinyEMU x86_64 emulator targeting WASM. The project has two parts:
+**NanoVM** — a Rust reimplementation of Bellard's JSLinux/TinyEMU x86_64 emulator targeting WASM. The project has three parts:
 
-1. **`jslinux/`** — Full extraction and decompilation of the original JSLinux Alpine x86_64 VM, captured from a live HAR trace of `bellard.org/jslinux/`. The original emulator is TinyEMU compiled from C to WASM via Emscripten. This is the reverse-engineering reference.
-2. **`specs/IDEA.md`** — Rust architecture spec for the reimplementation. Key constraints: monolithic interpreter function (compiles to WASM `br_table`), lazy EFLAGS, software TLB, cooperative scheduling, no dynamic dispatch in hot path, `#[repr(C)]` structs, `opt-level = "z"` + LTO.
-
-There is no build system, test suite, or runnable code yet — this is currently a static analysis / reverse-engineering project with the Rust implementation pending.
+1. **`src/`** — The Rust reimplementation. Compiles to a ~828KB WASM binary with a monolithic 660KB CPU interpreter function (via fat LTO fusion of paged source functions). Builds with `cargo build --target wasm32-unknown-unknown --release`.
+2. **`jslinux/`** — Full extraction and decompilation of the original JSLinux Alpine x86_64 VM, captured from a live HAR trace of `bellard.org/jslinux/`. The original emulator is TinyEMU compiled from C to WASM via Emscripten. This is the reverse-engineering reference.
+3. **`specs/IDEA.md`** — Rust architecture spec for the reimplementation. Key constraints: monolithic interpreter function (compiles to WASM `br_table`), lazy EFLAGS, software TLB, cooperative scheduling, no dynamic dispatch in hot path, `#[repr(C)]` structs, `opt-level = "z"` + LTO.
 
 ## VM Configuration (Original)
 
@@ -22,6 +21,156 @@ cmdline: "loglevel=3 console=hvc0 root=root rootfstype=9p rootflags=trans=virtio
 fs0: { file: "https://vfsync.org/u/os/alpine-x86_64" }  // 9p root filesystem via VFSync
 eth0: { driver: "user" }  // User-mode networking (SLiRP)
 ```
+
+---
+
+## Build System
+
+### Target & Toolchain
+- Target: `wasm32-unknown-unknown`
+- Build: `cargo build --target wasm32-unknown-unknown --release`
+- Check: `cargo check --target wasm32-unknown-unknown` (0 errors, 0 warnings)
+
+### Build Profiles
+
+```toml
+[profile.dev]
+opt-level = 0        # Fast iteration
+debug = 0
+incremental = true
+codegen-units = 256  # Max parallelism
+
+[profile.release]
+opt-level = "z"      # Size-optimize (best for interpreter i-cache)
+lto = "fat"          # Fat LTO fuses page functions back into monolith
+codegen-units = 1    # Single CGU for maximum optimization
+panic = "abort"
+strip = true
+```
+
+### Build Times & Binary Size
+
+| Profile | Time | Binary | Notes |
+|---------|------|--------|-------|
+| Dev | ~20s | N/A | Fast iteration, no optimization |
+| Release | ~3min | 828KB | Fat LTO reconstructs 660KB monolithic exec() |
+
+### Paged Dispatch & LTO Fusion
+
+The source code uses **paged dispatch** (32 page functions) for compiler ergonomics, but the WASM binary has a **single monolithic interpreter** thanks to LTO:
+
+1. **Source**: `exec()` dispatches to `exec_page_0..f()` and `exec_0f_page_0..f()` — all marked `#[inline(always)]`
+2. **Compile**: rustc compiles each page function as a manageable unit (no OOM)
+3. **Link**: Fat LTO inlines all page functions back into `exec()` → one 660KB WASM function
+4. **Result**: Bellard-style monolithic interpreter with br_table dispatch, identical to original architecture
+
+The refactoring script `refactor.py` performs the mechanical page splitting and can be re-run after adding new opcodes.
+
+---
+
+## NanoVM Source Architecture
+
+### Source Files
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `src/cpu.rs` | ~7400 | CPU interpreter: exec() dispatch + 16 main page fns + 16 0F page fns + helpers |
+| `src/types.rs` | — | `#[repr(C)]` CPU struct, PrefixState, constants (register indices, flags, exception vectors) |
+| `src/mem.rs` | — | Memory access: TLB lookup, page walk, load/store with fault handling |
+| `src/flags.rs` | — | Lazy EFLAGS: set_lazy(), eval_cc(), materialize_flags() |
+| `src/pic.rs` | — | 8259 PIC (dual master/slave, ICW/OCW state machine) |
+| `src/pit.rs` | — | 8254 PIT (timer, IRQ 0) |
+| `src/uart.rs` | — | 16550 UART (COM1, IRQ 4) |
+| `src/pci.rs` | — | PCI config space with BAR size probing |
+| `src/virtio.rs` | — | VirtIO common infrastructure |
+| `src/virtio_console.rs` | — | VirtIO console (TX/RX queues, console_write) |
+| `src/boot.rs` | — | Page tables, GDT, boot params, bzImage loader, VirtIO device registration |
+| `src/exports.rs` | — | WASM exports: vm_init, vm_start, vm_step, load_kernel, console_queue_char, malloc/free |
+| `web/nanovm.js` | — | JS host: WASM loader, import stubs, cooperative scheduler, keyboard |
+| `refactor.py` | ~460 | Mechanical refactoring script: splits monolithic match into paged dispatch |
+
+### CPU Dispatch Structure (cpu.rs)
+
+```
+exec() main loop:
+  1. Check budget, interrupts, halt state
+  2. Decode prefixes (REX, segment, 0x66, 0x67, LOCK, REP)
+  3. Fetch opcode, compute lane (LANE16/LANE32/LANE64)
+  4. match (opcode >> 4) → exec_page_X(cpu, ram, ram_size, opcode, lane)
+     └─ Each page: match opcode { ... } with try_or_fault_page!
+     └─ Page 0 contains 0x0F handler → match (op2 >> 4) → exec_0f_page_X(...)
+  5. if fault { continue } else { next iteration }
+```
+
+All page functions are `#[inline(always)]` — fat LTO fuses them into a single WASM function.
+
+### Macro Variants
+
+- **`try_or_fault!`** — in exec() main loop, uses `continue` on fault
+- **`try_or_fault_page!`** — in page functions, uses `return true` on fault (true = fault occurred)
+
+### Inline Annotation Policy
+
+| Category | Annotation | Examples |
+|----------|-----------|----------|
+| Tiny helpers | `#[inline(always)]` | fetch_imm8/16/32/64, read_reg8, write_reg8, raise_exception |
+| Medium helpers | `#[inline]` | grp1_ev_imm, decode_modrm_addr, string_*, shift_op*, alu_* |
+| Large helpers | none | exec_fpu, exec_sse_arith, exec_sse_int_op, exec_sse_shift_imm |
+| Page functions | `#[inline(always)]` | exec_page_0..f, exec_0f_page_0..f (fused by LTO) |
+
+### Page Breakdown (Main Dispatch)
+
+| Function | Opcodes | Content |
+|----------|---------|---------|
+| `exec_page_0` | 0x00-0x0F | ALU byte ops (ADD/OR), AL imm, **0x0F prefix** → 0F sub-dispatch |
+| `exec_page_1` | 0x10-0x1F | ALU ADC/SBB byte+word |
+| `exec_page_2` | 0x20-0x2F | AND/SUB byte+word |
+| `exec_page_3` | 0x30-0x3F | XOR/CMP byte+word |
+| `exec_page_4` | 0x40-0x4F | (REX — handled in prefix loop, UD in non-64-bit) |
+| `exec_page_5` | 0x50-0x5F | PUSH/POP reg |
+| `exec_page_6` | 0x60-0x6F | PUSH imm, IMUL, INS/OUTS |
+| `exec_page_7` | 0x70-0x7F | Jcc short |
+| `exec_page_8` | 0x80-0x8F | GRP1, TEST, XCHG, MOV r/m, LEA, MOV seg |
+| `exec_page_9` | 0x90-0x9F | NOP, XCHG AX, CBW/CWD, PUSHF/POPF, SAHF/LAHF |
+| `exec_page_a` | 0xA0-0xAF | MOV moffs, string ops, TEST AX imm |
+| `exec_page_b` | 0xB0-0xBF | MOV r8/r16/r32/r64 imm |
+| `exec_page_c` | 0xC0-0xCF | GRP2 imm, RET, MOV r/m imm, ENTER/LEAVE, INT, IRET |
+| `exec_page_d` | 0xD0-0xDF | GRP2 1/CL, XLAT, FPU D8-DF |
+| `exec_page_e` | 0xE0-0xEF | LOOP, JCXZ, IN/OUT, CALL/JMP |
+| `exec_page_f` | 0xF0-0xFF | HLT, CMC, GRP3, CLC/STC/CLI/STI/CLD/STD, GRP5 |
+
+### Page Breakdown (0F Sub-dispatch)
+
+| Function | op2 | Content |
+|----------|-----|---------|
+| `exec_0f_page_0` | 0x00-0x0F | GRP6/7, SYSCALL/SYSRET, WBINVD, UD2 |
+| `exec_0f_page_1` | 0x10-0x1F | SSE MOV (MOVUPS/SS/SD, MOVHPS/LPS) |
+| `exec_0f_page_2` | 0x20-0x2F | CR/DR MOV, SSE MOV/CVT, UCOMISS/SD |
+| `exec_0f_page_3` | 0x30-0x3F | RDTSC, RDMSR/WRMSR |
+| `exec_0f_page_4` | 0x40-0x4F | CMOVcc |
+| `exec_0f_page_5` | 0x50-0x5F | MOVMSKPS, SSE logical, SSE arith |
+| `exec_0f_page_6` | 0x60-0x6F | SSE packed int (PUNPCK, PACKSS, PCMPGT, MOVD/Q) |
+| `exec_0f_page_7` | 0x70-0x7F | PSHUFD, SSE shift imm, PCMPEQ, EMMS |
+| `exec_0f_page_8` | 0x80-0x8F | Jcc rel32 |
+| `exec_0f_page_9` | 0x90-0x9F | SETcc |
+| `exec_0f_page_a` | 0xA0-0xAF | PUSH/POP FS/GS, BT/BTS, SHLD/SHRD, IMUL |
+| `exec_0f_page_b` | 0xB0-0xBF | CMPXCHG, MOVZX, MOVSX, BTR/BTC, BSF/BSR |
+| `exec_0f_page_c` | 0xC0-0xCF | XADD, CMPPS, PINSRW/PEXTRW, SHUFPS, BSWAP |
+| `exec_0f_page_d` | 0xD0-0xDF | SSE packed int (PSRL, PMULLW, MOVQ) |
+| `exec_0f_page_e` | 0xE0-0xEF | SSE packed int (PAVGB, PMULHUW, POR, PADDSB) |
+| `exec_0f_page_f` | 0xF0-0xFF | SSE packed int (PSLLW, PMULUDQ, PSADBW, PADDB) |
+
+### Key Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| VirtIO console | PCI slot 1, BAR0 0xC000, IRQ 10 | Console device |
+| VirtIO 9p | PCI slot 2, BAR0 0xC040, IRQ 11 | Filesystem device |
+| PIC master | vectors 0x20-0x27 | Hardware interrupts 0-7 |
+| PIC slave | vectors 0x28-0x2F | Hardware interrupts 8-15 |
+| Kernel entry | 0x100000 | Physical load address |
+| Boot params | 0x90000 | Linux boot protocol struct |
+| Cmdline | 0x90880 | Kernel command line |
 
 ---
 
