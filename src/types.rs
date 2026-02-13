@@ -476,7 +476,7 @@ impl Cpu {
             kernel_gs_base: 0,
             tsc: 0,
             tsc_offset: 0,
-            apic_base: 0xFEE00000,
+            apic_base: 0xFEE00900, // base | BSP(bit8) | enable(bit11)
             segs: [SegmentReg::new(); 6],
             ldt: SegmentReg::new(),
             tr: SegmentReg::new(),

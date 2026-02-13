@@ -23,8 +23,8 @@ mod boot;
 // Panic handler required for no_std
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // In release builds, this compiles to unreachable.
-    // We call the host abort function to terminate.
+    // Log code 99 = Rust panic, then abort
+    unsafe { host::debug_log(99); }
     unsafe { host::abort_js(); }
     #[allow(unreachable_code)]
     loop {}

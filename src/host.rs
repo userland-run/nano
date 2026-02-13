@@ -57,4 +57,7 @@ extern "C" {
     pub fn abort_js() -> !;
     pub fn assert_fail(cond: u32, file: u32, line: u32, func: u32);
     pub fn exit(status: u32);
+
+    // Debug
+    pub fn debug_log(code: u32);
 }

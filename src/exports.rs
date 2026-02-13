@@ -78,6 +78,102 @@ pub unsafe extern "C" fn vm_step(budget: i32, now_ms: f64) -> i32 {
     crate::cpu::exec(&mut mach.cpu, mach.ram, mach.ram_size, budget)
 }
 
+/// Debug: read current RIP value.
+#[no_mangle]
+pub unsafe extern "C" fn debug_rip() -> u64 {
+    let m = read_machine();
+    if m.is_null() { return 0; }
+    (*m).cpu.rip
+}
+
+/// Debug: read last instruction start RIP.
+#[no_mangle]
+pub unsafe extern "C" fn debug_instr_rip() -> u64 {
+    let m = read_machine();
+    if m.is_null() { return 0; }
+    (*m).cpu.instr_start_rip
+}
+
+/// Debug: read CR2 (page fault address).
+#[no_mangle]
+pub unsafe extern "C" fn debug_cr2() -> u64 {
+    let m = read_machine();
+    if m.is_null() { return 0; }
+    (*m).cpu.cr2
+}
+
+/// Debug: read CR3 (page table base).
+#[no_mangle]
+pub unsafe extern "C" fn debug_cr3() -> u64 {
+    let m = read_machine();
+    if m.is_null() { return 0; }
+    (*m).cpu.cr3
+}
+
+/// Debug: read a GPR by index (0=RAX..15=R15).
+#[no_mangle]
+pub unsafe extern "C" fn debug_reg(idx: u32) -> u64 {
+    let m = read_machine();
+    if m.is_null() { return 0; }
+    if idx < 16 { (*m).cpu.regs[idx as usize] } else { 0 }
+}
+
+/// Debug: read a byte from guest physical memory.
+#[no_mangle]
+pub unsafe extern "C" fn debug_read_phys(addr: u32) -> u32 {
+    let m = read_machine();
+    if m.is_null() { return 0; }
+    let mach = &*m;
+    if addr < mach.ram_size as u32 {
+        *mach.ram.add(addr as usize) as u32
+    } else {
+        0xFF
+    }
+}
+
+/// Debug: read IDT limit.
+#[no_mangle]
+pub unsafe extern "C" fn debug_idt_limit() -> u32 {
+    let m = read_machine();
+    if m.is_null() { return 0; }
+    (*m).cpu.idt.limit as u32
+}
+
+/// Debug: read IDT base.
+#[no_mangle]
+pub unsafe extern "C" fn debug_idt_base() -> u64 {
+    let m = read_machine();
+    if m.is_null() { return 0; }
+    (*m).cpu.idt.base
+}
+
+/// Debug: dump PIT/PIC/RFLAGS state for interrupt chain diagnosis.
+/// Returns a packed u32: bits [0:15]=PIT reload, [16]=IF, [17:24]=IMR, [25]=IRR bit0, [26]=ISR bit0
+/// Also calls debug_log with detailed values.
+#[no_mangle]
+pub unsafe extern "C" fn debug_dump_irq_state() -> u32 {
+    let m = read_machine();
+    if m.is_null() { return 0; }
+    let mach = &*m;
+    // PIT channel 0 reload
+    crate::host::debug_log(0xD1000000 | mach.pit.channels[0].reload as u32);
+    // PIT channel 0 count
+    crate::host::debug_log(0xD7000000 | mach.pit.channels[0].count as u32);
+    // PIC master IMR
+    crate::host::debug_log(0xD2000000 | mach.pic_master.imr as u32);
+    // PIC master ISR
+    crate::host::debug_log(0xD3000000 | mach.pic_master.isr as u32);
+    // PIC master IRR
+    crate::host::debug_log(0xD4000000 | mach.pic_master.irr as u32);
+    // RFLAGS IF
+    crate::host::debug_log(0xD5000000 | ((mach.cpu.rflags >> 9) & 1) as u32);
+    // RIP low 24
+    crate::host::debug_log(0xD6000000 | (mach.cpu.rip as u32 & 0x00FFFFFF));
+    // PIC master irq_base
+    crate::host::debug_log(0xD8000000 | mach.pic_master.irq_base as u32);
+    0
+}
+
 /// Queue a character for the VM's console input (keyboard).
 #[no_mangle]
 pub unsafe extern "C" fn console_queue_char(ch: u32) {

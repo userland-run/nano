@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 libm = "0.2"
 
 [profile.dev]
-opt-level = 0
+opt-level = 1
 debug = 0
 incremental = true
 codegen-units = 256

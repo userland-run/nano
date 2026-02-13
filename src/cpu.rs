@@ -1788,6 +1788,73 @@ unsafe fn exec_page_c(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, opcode: u8, la
                     cpu.regs[RBP] = val as u64;
                 }
         }
+        // RETF imm16 — far return, pop IP + CS + release imm16 bytes
+        0xCA => {
+                let imm = try_or_fault_page!(cpu, fetch_imm16(cpu, ram, ram_size)) as u64;
+                if cpu.long_mode {
+                    let rsp = cpu.regs[RSP];
+                    let new_rip = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, rsp));
+                    let new_cs = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, rsp + 8));
+                    let old_cpl = cpu.cpl;
+                    let new_cpl = (new_cs as u16 & 3) as u8;
+                    cpu.rip = new_rip;
+                    cpu.segs[SEG_CS].selector = new_cs as u16;
+                    cpu.segs[SEG_CS].base = 0;
+                    cpu.segs[SEG_CS].limit = 0xFFFFFFFF;
+                    if new_cpl == 3 {
+                        cpu.segs[SEG_CS].flags = 0xA0FB;
+                    } else {
+                        cpu.segs[SEG_CS].flags = 0xA09B;
+                    }
+                    cpu.cpl = new_cpl;
+                    cpu.regs[RSP] = rsp.wrapping_add(16).wrapping_add(imm);
+                    if old_cpl != new_cpl {
+                        cpu.tlb.flush_all();
+                    }
+                } else {
+                    let rsp = cpu.regs[RSP];
+                    let new_eip = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, rsp));
+                    let new_cs = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, rsp + 4));
+                    cpu.rip = new_eip as u64;
+                    cpu.segs[SEG_CS].selector = new_cs as u16;
+                    cpu.segs[SEG_CS].base = 0;
+                    cpu.segs[SEG_CS].limit = 0xFFFFFFFF;
+                    cpu.regs[RSP] = rsp.wrapping_add(8).wrapping_add(imm);
+                }
+        }
+        // RETF — far return, pop IP + CS
+        0xCB => {
+                if cpu.long_mode {
+                    let rsp = cpu.regs[RSP];
+                    let new_rip = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, rsp));
+                    let new_cs = try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, rsp + 8));
+                    let old_cpl = cpu.cpl;
+                    let new_cpl = (new_cs as u16 & 3) as u8;
+                    cpu.rip = new_rip;
+                    cpu.segs[SEG_CS].selector = new_cs as u16;
+                    cpu.segs[SEG_CS].base = 0;
+                    cpu.segs[SEG_CS].limit = 0xFFFFFFFF;
+                    if new_cpl == 3 {
+                        cpu.segs[SEG_CS].flags = 0xA0FB;
+                    } else {
+                        cpu.segs[SEG_CS].flags = 0xA09B;
+                    }
+                    cpu.cpl = new_cpl;
+                    cpu.regs[RSP] = rsp.wrapping_add(16);
+                    if old_cpl != new_cpl {
+                        cpu.tlb.flush_all();
+                    }
+                } else {
+                    let rsp = cpu.regs[RSP];
+                    let new_eip = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, rsp));
+                    let new_cs = try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, rsp + 4));
+                    cpu.rip = new_eip as u64;
+                    cpu.segs[SEG_CS].selector = new_cs as u16;
+                    cpu.segs[SEG_CS].base = 0;
+                    cpu.segs[SEG_CS].limit = 0xFFFFFFFF;
+                    cpu.regs[RSP] = rsp.wrapping_add(8);
+                }
+        }
         0xC0 => {
                 let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                 let shift_op = ((modrm >> 3) & 7) as usize;
@@ -2157,15 +2224,15 @@ unsafe fn exec_0f_page_0(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
                                     try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
                                 };
                                 cpu.ldt.selector = sel;
-                                // Load LDT descriptor from GDT (simplified: just set base/limit from GDT entry)
+                                // Load LDT descriptor from GDT (GDT base is virtual in long mode)
                                 if sel != 0 {
-                                    let desc_addr = cpu.gdt.base + (sel as u64 & 0xFFF8);
-                                    let lo = read_phys_u32(ram, ram_size, desc_addr);
-                                    let hi = read_phys_u32(ram, ram_size, desc_addr + 4);
+                                    let desc_addr = cpu.gdt.base.wrapping_add(sel as u64 & 0xFFF8);
+                                    let lo = mem::load_u32(cpu, ram, ram_size, desc_addr).unwrap_or(0);
+                                    let hi = mem::load_u32(cpu, ram, ram_size, desc_addr.wrapping_add(4)).unwrap_or(0);
                                     let base = ((lo >> 16) as u64 & 0xFFFF) | (((hi & 0xFF) as u64) << 16) | (((hi >> 24) as u64) << 24);
                                     let limit = (lo & 0xFFFF) as u32 | ((hi & 0xF0000) as u32);
                                     if cpu.long_mode {
-                                        let base_hi = read_phys_u32(ram, ram_size, desc_addr + 8);
+                                        let base_hi = mem::load_u32(cpu, ram, ram_size, desc_addr.wrapping_add(8)).unwrap_or(0);
                                         cpu.ldt.base = base | ((base_hi as u64) << 32);
                                     } else {
                                         cpu.ldt.base = base;
@@ -2183,16 +2250,16 @@ unsafe fn exec_0f_page_0(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
                                     try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, addr))
                                 };
                                 cpu.tr.selector = sel;
-                                // Load TSS descriptor from GDT
-                                let desc_addr = cpu.gdt.base + (sel as u64 & 0xFFF8);
-                                let lo = read_phys_u32(ram, ram_size, desc_addr);
-                                let hi = read_phys_u32(ram, ram_size, desc_addr + 4);
+                                // Load TSS descriptor from GDT (GDT base is virtual in long mode)
+                                let desc_addr = cpu.gdt.base.wrapping_add(sel as u64 & 0xFFF8);
+                                let lo = mem::load_u32(cpu, ram, ram_size, desc_addr).unwrap_or(0);
+                                let hi = mem::load_u32(cpu, ram, ram_size, desc_addr.wrapping_add(4)).unwrap_or(0);
                                 let base = ((lo >> 16) as u64 & 0xFFFF) | (((hi & 0xFF) as u64) << 16) | (((hi >> 24) as u64) << 24);
                                 let limit = (lo & 0xFFFF) as u32 | ((hi & 0xF0000) as u32);
                                 cpu.tr.flags = hi & 0x00F0FF00;
                                 if cpu.long_mode {
                                     // 64-bit TSS descriptor is 16 bytes
-                                    let base_hi = read_phys_u32(ram, ram_size, desc_addr + 8);
+                                    let base_hi = mem::load_u32(cpu, ram, ram_size, desc_addr.wrapping_add(8)).unwrap_or(0);
                                     cpu.tr.base = base | ((base_hi as u64) << 32);
                                 } else {
                                     cpu.tr.base = base;
@@ -2200,7 +2267,7 @@ unsafe fn exec_0f_page_0(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
                                 cpu.tr.limit = limit;
                                 // Mark TSS as busy (set bit 1 of type field in GDT)
                                 let busy = hi | 0x200;
-                                write_phys_u32(ram, ram_size, desc_addr + 4, busy);
+                                let _ = mem::store_u32(cpu, ram, ram_size, desc_addr.wrapping_add(4), busy);
                             }
                             _ => {}
                         }
@@ -3159,11 +3226,11 @@ unsafe fn exec_0f_page_a(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
                         let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                         let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
                         let fill = cpu.regs[src_reg];
+                        let (dst, addr) = load_rm_addr(cpu, ram, ram_size, modrm, lane);
                         let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
                         let res = exec_shld(dst, fill, imm as u64, lane);
                         if res != u64::MAX {
-                            store_rm(cpu, ram, ram_size, modrm, lane, res);
+                            store_at(cpu, ram, ram_size, modrm, lane, res, addr);
                         }
         }
         0xA5 => {
@@ -3171,21 +3238,21 @@ unsafe fn exec_0f_page_a(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
                         let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
                         let fill = cpu.regs[src_reg];
                         let count = cpu.regs[RCX] as u8;
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
+                        let (dst, addr) = load_rm_addr(cpu, ram, ram_size, modrm, lane);
                         let res = exec_shld(dst, fill, count as u64, lane);
                         if res != u64::MAX {
-                            store_rm(cpu, ram, ram_size, modrm, lane, res);
+                            store_at(cpu, ram, ram_size, modrm, lane, res, addr);
                         }
         }
         0xAC => {
                         let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                         let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
                         let fill = cpu.regs[src_reg];
+                        let (dst, addr) = load_rm_addr(cpu, ram, ram_size, modrm, lane);
                         let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
                         let res = exec_shrd(dst, fill, imm as u64, lane);
                         if res != u64::MAX {
-                            store_rm(cpu, ram, ram_size, modrm, lane, res);
+                            store_at(cpu, ram, ram_size, modrm, lane, res, addr);
                         }
         }
         0xAD => {
@@ -3193,10 +3260,10 @@ unsafe fn exec_0f_page_a(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
                         let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
                         let fill = cpu.regs[src_reg];
                         let count = cpu.regs[RCX] as u8;
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
+                        let (dst, addr) = load_rm_addr(cpu, ram, ram_size, modrm, lane);
                         let res = exec_shrd(dst, fill, count as u64, lane);
                         if res != u64::MAX {
-                            store_rm(cpu, ram, ram_size, modrm, lane, res);
+                            store_at(cpu, ram, ram_size, modrm, lane, res, addr);
                         }
         }
         0xAE => {
@@ -3382,7 +3449,7 @@ unsafe fn exec_0f_page_b(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
                         let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                         let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
                         let src = cpu.regs[src_reg];
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
+                        let (dst, addr) = load_rm_addr(cpu, ram, ram_size, modrm, lane);
                         match lane {
                             LANE32 => {
                                 let a = cpu.regs[RAX] as u32;
@@ -3390,7 +3457,7 @@ unsafe fn exec_0f_page_b(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
                                 let res = a.wrapping_sub(d);
                                 set_lazy(cpu, FlagOp::SubL, a as u64, res as u64);
                                 if a == d {
-                                    store_rm(cpu, ram, ram_size, modrm, lane, src);
+                                    store_at(cpu, ram, ram_size, modrm, lane, src, addr);
                                 } else {
                                     cpu.regs[RAX] = d as u64;
                                 }
@@ -3400,7 +3467,7 @@ unsafe fn exec_0f_page_b(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
                                 let res = a.wrapping_sub(dst);
                                 set_lazy(cpu, FlagOp::SubQ, a, res);
                                 if a == dst {
-                                    store_rm(cpu, ram, ram_size, modrm, lane, src);
+                                    store_at(cpu, ram, ram_size, modrm, lane, src, addr);
                                 } else {
                                     cpu.regs[RAX] = dst;
                                 }
@@ -3483,7 +3550,21 @@ unsafe fn exec_0f_page_b(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
         0xBA => {
                         let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                         let reg_field = (modrm >> 3) & 7;
-                        let val = load_rm(cpu, ram, ram_size, modrm, lane);
+                        // Decode address ONCE to avoid double-consuming displacement bytes
+                        let is_mem = modrm & 0xC0 != 0xC0;
+                        let (val, addr) = if is_mem {
+                            let a = try_or_fault_page!(cpu, decode_modrm_addr(cpu, ram, ram_size, modrm));
+                            let v = match lane {
+                                LANE16 => try_or_fault_page!(cpu, mem::load_u16(cpu, ram, ram_size, a)) as u64,
+                                LANE32 => try_or_fault_page!(cpu, mem::load_u32(cpu, ram, ram_size, a)) as u64,
+                                _ => try_or_fault_page!(cpu, mem::load_u64(cpu, ram, ram_size, a)),
+                            };
+                            (v, a)
+                        } else {
+                            let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                            let v = match lane { LANE16 => cpu.regs[r] & 0xFFFF, LANE32 => cpu.regs[r] & 0xFFFFFFFF, _ => cpu.regs[r] };
+                            (v, 0)
+                        };
                         let imm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                         let mask = match lane { LANE16 => 15u8, LANE32 => 31, _ => 63 };
                         let bit_idx = imm & mask;
@@ -3491,17 +3572,26 @@ unsafe fn exec_0f_page_b(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
                         match reg_field {
                             4 => { // BT — read only
                             }
-                            5 => { // BTS — set bit
-                                let new_val = val | (1u64 << bit_idx);
-                                store_rm(cpu, ram, ram_size, modrm, lane, new_val);
-                            }
-                            6 => { // BTR — clear bit
-                                let new_val = val & !(1u64 << bit_idx);
-                                store_rm(cpu, ram, ram_size, modrm, lane, new_val);
-                            }
-                            7 => { // BTC — complement bit
-                                let new_val = val ^ (1u64 << bit_idx);
-                                store_rm(cpu, ram, ram_size, modrm, lane, new_val);
+                            5 | 6 | 7 => { // BTS/BTR/BTC
+                                let new_val = match reg_field {
+                                    5 => val | (1u64 << bit_idx),
+                                    6 => val & !(1u64 << bit_idx),
+                                    _ => val ^ (1u64 << bit_idx),
+                                };
+                                if is_mem {
+                                    match lane {
+                                        LANE16 => { let _ = mem::store_u16(cpu, ram, ram_size, addr, new_val as u16); }
+                                        LANE32 => { let _ = mem::store_u32(cpu, ram, ram_size, addr, new_val as u32); }
+                                        _ => { let _ = mem::store_u64(cpu, ram, ram_size, addr, new_val); }
+                                    }
+                                } else {
+                                    let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+                                    match lane {
+                                        LANE16 => write_reg16(cpu, r, new_val as u16),
+                                        LANE32 => { cpu.regs[r] = new_val as u32 as u64; }
+                                        _ => { cpu.regs[r] = new_val; }
+                                    }
+                                }
                             }
                             _ => { raise_exception(cpu, EXC_UD, 0); return true; }
                         }
@@ -3632,18 +3722,18 @@ unsafe fn exec_0f_page_c(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, op2: u8, la
                         let modrm = try_or_fault_page!(cpu, fetch_imm8(cpu, ram, ram_size));
                         let src_reg = ((modrm >> 3) & 7) as usize | ((cpu.prefix.rex as usize >> 2) & 1) << 3;
                         let src = cpu.regs[src_reg];
-                        let dst = load_rm(cpu, ram, ram_size, modrm, lane);
+                        let (dst, addr) = load_rm_addr(cpu, ram, ram_size, modrm, lane);
                         match lane {
                             LANE32 => {
                                 let res = (dst as u32).wrapping_add(src as u32);
                                 cpu.regs[src_reg] = dst as u32 as u64;
-                                store_rm(cpu, ram, ram_size, modrm, lane, res as u64);
+                                store_at(cpu, ram, ram_size, modrm, lane, res as u64, addr);
                                 set_lazy(cpu, FlagOp::AddL, dst, res as u64);
                             }
                             LANE64 => {
                                 let res = dst.wrapping_add(src);
                                 cpu.regs[src_reg] = dst;
-                                store_rm(cpu, ram, ram_size, modrm, lane, res);
+                                store_at(cpu, ram, ram_size, modrm, lane, res, addr);
                                 set_lazy(cpu, FlagOp::AddQ, dst, res);
                             }
                             _ => {}
@@ -3922,6 +4012,49 @@ unsafe fn load_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u
             LANE16 => mem::load_u16(cpu, ram, ram_size, addr).unwrap_or(0) as u64,
             LANE32 => mem::load_u32(cpu, ram, ram_size, addr).unwrap_or(0) as u64,
             _ => mem::load_u64(cpu, ram, ram_size, addr).unwrap_or(0),
+        }
+    }
+}
+
+/// Load from r/m and return (value, effective_address).
+/// For read-modify-write ops: decode address ONCE, reuse for store_at.
+#[inline]
+unsafe fn load_rm_addr(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32) -> (u64, u64) {
+    if modrm & 0xC0 == 0xC0 {
+        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+        let v = match lane {
+            LANE16 => cpu.regs[r] & 0xFFFF,
+            LANE32 => cpu.regs[r] & 0xFFFFFFFF,
+            _ => cpu.regs[r],
+        };
+        (v, 0)
+    } else {
+        let addr = decode_modrm_addr(cpu, ram, ram_size, modrm).unwrap_or(0);
+        let v = match lane {
+            LANE16 => mem::load_u16(cpu, ram, ram_size, addr).unwrap_or(0) as u64,
+            LANE32 => mem::load_u32(cpu, ram, ram_size, addr).unwrap_or(0) as u64,
+            _ => mem::load_u64(cpu, ram, ram_size, addr).unwrap_or(0),
+        };
+        (v, addr)
+    }
+}
+
+/// Store to r/m using a pre-decoded address (from load_rm_addr).
+/// Avoids double-decoding ModRM displacement bytes.
+#[inline]
+unsafe fn store_at(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u32, val: u64, addr: u64) {
+    if modrm & 0xC0 == 0xC0 {
+        let r = (modrm & 7) as usize | ((cpu.prefix.rex as usize & 1) << 3);
+        match lane {
+            LANE16 => write_reg16(cpu, r, val as u16),
+            LANE32 => { cpu.regs[r] = val as u32 as u64; }
+            _ => { cpu.regs[r] = val; }
+        }
+    } else {
+        match lane {
+            LANE16 => { let _ = mem::store_u16(cpu, ram, ram_size, addr, val as u16); }
+            LANE32 => { let _ = mem::store_u32(cpu, ram, ram_size, addr, val as u32); }
+            _ => { let _ = mem::store_u64(cpu, ram, ram_size, addr, val); }
         }
     }
 }
@@ -4518,42 +4651,42 @@ unsafe fn grp5_rm(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, modrm: u8, lane: u
     let op_idx = (modrm >> 3) & 7;
     match op_idx {
         0 => { // INC
-            let val = load_rm(cpu, ram, ram_size, modrm, lane);
+            let (val, addr) = load_rm_addr(cpu, ram, ram_size, modrm, lane);
             match lane {
                 LANE16 => {
                     let res = (val as u16).wrapping_add(1);
-                    store_rm(cpu, ram, ram_size, modrm, lane, res as u64);
+                    store_at(cpu, ram, ram_size, modrm, lane, res as u64, addr);
                     set_lazy(cpu, FlagOp::IncW, val, res as u64);
                 }
                 LANE32 => {
                     let res = (val as u32).wrapping_add(1);
-                    store_rm(cpu, ram, ram_size, modrm, lane, res as u64);
+                    store_at(cpu, ram, ram_size, modrm, lane, res as u64, addr);
                     set_lazy(cpu, FlagOp::IncL, val, res as u64);
                 }
                 LANE64 => {
                     let res = val.wrapping_add(1);
-                    store_rm(cpu, ram, ram_size, modrm, lane, res);
+                    store_at(cpu, ram, ram_size, modrm, lane, res, addr);
                     set_lazy(cpu, FlagOp::IncQ, val, res);
                 }
                 _ => {}
             }
         }
         1 => { // DEC
-            let val = load_rm(cpu, ram, ram_size, modrm, lane);
+            let (val, addr) = load_rm_addr(cpu, ram, ram_size, modrm, lane);
             match lane {
                 LANE16 => {
                     let res = (val as u16).wrapping_sub(1);
-                    store_rm(cpu, ram, ram_size, modrm, lane, res as u64);
+                    store_at(cpu, ram, ram_size, modrm, lane, res as u64, addr);
                     set_lazy(cpu, FlagOp::DecW, val, res as u64);
                 }
                 LANE32 => {
                     let res = (val as u32).wrapping_sub(1);
-                    store_rm(cpu, ram, ram_size, modrm, lane, res as u64);
+                    store_at(cpu, ram, ram_size, modrm, lane, res as u64, addr);
                     set_lazy(cpu, FlagOp::DecL, val, res as u64);
                 }
                 LANE64 => {
                     let res = val.wrapping_sub(1);
-                    store_rm(cpu, ram, ram_size, modrm, lane, res);
+                    store_at(cpu, ram, ram_size, modrm, lane, res, addr);
                     set_lazy(cpu, FlagOp::DecQ, val, res);
                 }
                 _ => {}
@@ -4840,6 +4973,12 @@ unsafe fn load_from_addr(cpu: &mut Cpu, ram: *mut u8, ram_size: u32, addr: u64, 
 /// Exceptions that push error codes: DF(8), TS(10), NP(11), SS(12), GP(13), PF(14), AC(17).
 #[inline(always)]
 unsafe fn raise_exception(cpu: &mut Cpu, vector: u32, error_code: u32) {
+    // Trace exceptions: emit data tags first, then EF triggers the log line
+    crate::host::debug_log(0xEC000000 | ((cpu.cr2 >> 32) as u32 & 0x00FFFFFF));
+    crate::host::debug_log(0xED000000 | (cpu.cr2 as u32 & 0x00FFFFFF));
+    crate::host::debug_log(0xEE000000 | ((cpu.instr_start_rip >> 32) as u32 & 0x00FFFFFF));
+    crate::host::debug_log(0xEF000000 | ((cpu.instr_start_rip as u32 & 0xFFFF) << 8) | (vector & 0xFF));
+
     // Rewind RIP to instruction start for fault-type exceptions
     cpu.rip = cpu.instr_start_rip;
 
@@ -4886,18 +5025,42 @@ unsafe fn deliver_interrupt(
     if idt_offset + 15 > cpu.idt.limit as u32 {
         // Double fault or triple fault
         if vector == EXC_DF {
-            // Triple fault → reset
+            // Triple fault → reset (code 1: IDT limit exceeded on double fault)
+            unsafe { crate::host::debug_log(0x10000 | vector); }
             crate::host::abort_js();
         }
+        // Log the original vector that triggered the IDT limit issue
+        unsafe { crate::host::debug_log(0x20000 | vector); }
         deliver_interrupt(cpu, ram, ram_size, EXC_DF, true, 0);
         return;
     }
 
-    // Read 16-byte IDT entry from physical memory
-    let idt_addr = cpu.idt.base + idt_offset as u64;
-    let e0 = read_phys_u32(ram, ram_size, idt_addr);
-    let e1 = read_phys_u32(ram, ram_size, idt_addr + 4);
-    let e2 = read_phys_u32(ram, ram_size, idt_addr + 8);
+    // Read 16-byte IDT entry (IDT base is a virtual address in long mode)
+    let idt_addr = cpu.idt.base.wrapping_add(idt_offset as u64);
+    let e0 = match mem::load_u32(cpu, ram, ram_size, idt_addr) {
+        Ok(v) => v,
+        Err(_) => {
+            if vector == EXC_DF { crate::host::debug_log(0x50000 | vector); crate::host::abort_js(); }
+            deliver_interrupt(cpu, ram, ram_size, EXC_DF, true, 0);
+            return;
+        }
+    };
+    let e1 = match mem::load_u32(cpu, ram, ram_size, idt_addr.wrapping_add(4)) {
+        Ok(v) => v,
+        Err(_) => {
+            if vector == EXC_DF { crate::host::debug_log(0x50000 | vector); crate::host::abort_js(); }
+            deliver_interrupt(cpu, ram, ram_size, EXC_DF, true, 0);
+            return;
+        }
+    };
+    let e2 = match mem::load_u32(cpu, ram, ram_size, idt_addr.wrapping_add(8)) {
+        Ok(v) => v,
+        Err(_) => {
+            if vector == EXC_DF { crate::host::debug_log(0x50000 | vector); crate::host::abort_js(); }
+            deliver_interrupt(cpu, ram, ram_size, EXC_DF, true, 0);
+            return;
+        }
+    };
 
     let offset_low = e0 & 0xFFFF;
     let selector = (e0 >> 16) & 0xFFFF;
@@ -4911,8 +5074,11 @@ unsafe fn deliver_interrupt(
     // Check present bit
     if present == 0 {
         if vector == EXC_DF {
+            // Triple fault (code 2: IDT entry not present on double fault)
+            unsafe { crate::host::debug_log(0x30000 | vector); }
             crate::host::abort_js();
         }
+        unsafe { crate::host::debug_log(0x40000 | vector); }
         deliver_interrupt(cpu, ram, ram_size, EXC_DF, true, 0);
         return;
     }
@@ -4947,45 +5113,46 @@ unsafe fn deliver_interrupt(
         // IST mechanism: load RSP from TSS IST entry
         // IST[n] is at TSS base + 36 + (n-1) * 8
         let tss_base = cpu.tr.base;
-        let ist_offset = 36 + ((ist as u64 - 1) * 8);
-        read_phys_u64(ram, ram_size, tss_base + ist_offset)
+        let ist_offset = 36u64.wrapping_add((ist as u64).wrapping_sub(1).wrapping_mul(8));
+        mem::load_u64(cpu, ram, ram_size, tss_base.wrapping_add(ist_offset)).unwrap_or(old_rsp)
     } else if old_cpl != target_cpl {
         // Privilege level change: load RSP from TSS.RSP0
         // RSP0 is at TSS base + 4
         let tss_base = cpu.tr.base;
-        read_phys_u64(ram, ram_size, tss_base + 4)
+        mem::load_u64(cpu, ram, ram_size, tss_base.wrapping_add(4)).unwrap_or(old_rsp)
     } else {
         // Same privilege: use current RSP
         old_rsp
     };
 
     // Set up new stack — push in order: SS, RSP, RFLAGS, CS, RIP [, error_code]
+    // Stack pushes use virtual addresses (through TLB)
     let mut rsp = new_rsp;
 
     // Push old SS
-    rsp -= 8;
-    write_phys_u64(ram, ram_size, rsp, old_ss as u64);
+    rsp = rsp.wrapping_sub(8);
+    let _ = mem::store_u64(cpu, ram, ram_size, rsp, old_ss as u64);
 
     // Push old RSP
-    rsp -= 8;
-    write_phys_u64(ram, ram_size, rsp, old_rsp);
+    rsp = rsp.wrapping_sub(8);
+    let _ = mem::store_u64(cpu, ram, ram_size, rsp, old_rsp);
 
     // Push RFLAGS
-    rsp -= 8;
-    write_phys_u64(ram, ram_size, rsp, old_rflags);
+    rsp = rsp.wrapping_sub(8);
+    let _ = mem::store_u64(cpu, ram, ram_size, rsp, old_rflags);
 
     // Push old CS
-    rsp -= 8;
-    write_phys_u64(ram, ram_size, rsp, old_cs as u64);
+    rsp = rsp.wrapping_sub(8);
+    let _ = mem::store_u64(cpu, ram, ram_size, rsp, old_cs as u64);
 
     // Push old RIP
-    rsp -= 8;
-    write_phys_u64(ram, ram_size, rsp, old_rip);
+    rsp = rsp.wrapping_sub(8);
+    let _ = mem::store_u64(cpu, ram, ram_size, rsp, old_rip);
 
     // Push error code if applicable
     if has_error_code {
-        rsp -= 8;
-        write_phys_u64(ram, ram_size, rsp, error_code as u64);
+        rsp = rsp.wrapping_sub(8);
+        let _ = mem::store_u64(cpu, ram, ram_size, rsp, error_code as u64);
     }
 
     // Update CPU state
@@ -5035,8 +5202,11 @@ unsafe fn deliver_interrupt_pm(
     let idt_offset = vector * 8;
     if idt_offset + 7 > cpu.idt.limit as u32 {
         if vector == EXC_DF {
+            // Triple fault (code 3: 32-bit IDT limit exceeded on double fault)
+            unsafe { crate::host::debug_log(0x50000 | vector); }
             crate::host::abort_js();
         }
+        unsafe { crate::host::debug_log(0x60000 | vector); }
         deliver_interrupt_pm(cpu, ram, ram_size, EXC_DF, true, 0);
         return;
     }
@@ -5323,8 +5493,17 @@ unsafe fn handle_cpuid(cpu: &mut Cpu) {
         1 => {
             cpu.regs[RAX] = 0x000306C3; // family/model/stepping
             cpu.regs[RBX] = 0x00010800;
-            cpu.regs[RCX] = 0x80202001; // SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT
-            cpu.regs[RDX] = 0x078BFBFF; // FPU, SSE, SSE2, etc.
+            // ECX: SSE3(0), CX16(13), HYPERVISOR(31)
+            // NOT: x2APIC(21), SSSE3(9), SSE4.1(19), SSE4.2(20), POPCNT(23)
+            cpu.regs[RCX] = (1 << 0) | (1 << 13) | (1u64 << 31);
+            // EDX: FPU(0), DE(2), PSE(3), TSC(4), MSR(5), PAE(6), CX8(8),
+            //       SEP(11), PGE(13), CMOV(15), PAT(16), CLFSH(19),
+            //       MMX(23), FXSR(24), SSE(25), SSE2(26)
+            // NOT: VME(1), MCE(7), MCA(14), MTRR(12), PSE36(17)
+            cpu.regs[RDX] = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5)
+                          | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 11) | (1 << 13) | (1 << 15)
+                          | (1 << 16) | (1 << 19) | (1 << 23) | (1 << 24) | (1 << 25)
+                          | (1 << 26);
         }
         0x80000000 => {
             cpu.regs[RAX] = 0x80000008;

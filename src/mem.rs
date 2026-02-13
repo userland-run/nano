@@ -37,7 +37,7 @@ pub unsafe fn tlb_lookup_read(cpu: &Cpu, vaddr: u64) -> Option<*const u8> {
     // Check all 4 ways
     for way in 0..TLB_WAYS {
         if set[way].tag == page {
-            let host = set[way].addend as usize + vaddr as u32 as usize;
+            let host = (set[way].addend).wrapping_add(vaddr as u32) as usize;
             return Some(host as *const u8);
         }
     }
@@ -53,7 +53,7 @@ pub unsafe fn tlb_lookup_write(cpu: &Cpu, vaddr: u64) -> Option<*mut u8> {
 
     for way in 0..TLB_WAYS {
         if set[way].tag == page {
-            let host = set[way].addend as usize + vaddr as u32 as usize;
+            let host = (set[way].addend).wrapping_add(vaddr as u32) as usize;
             return Some(host as *mut u8);
         }
     }
@@ -69,7 +69,7 @@ pub unsafe fn tlb_lookup_code(cpu: &Cpu, vaddr: u64) -> Option<*const u8> {
 
     for way in 0..TLB_WAYS {
         if set[way].tag == page {
-            let host = set[way].addend as usize + vaddr as u32 as usize;
+            let host = (set[way].addend).wrapping_add(vaddr as u32) as usize;
             return Some(host as *const u8);
         }
     }
@@ -85,8 +85,8 @@ pub unsafe fn tlb_insert_read(cpu: &mut Cpu, vaddr: u64, ram: *mut u8, phys: u64
     let set_idx = ((vaddr >> PAGE_SHIFT) as usize) & (TLB_SETS - 1);
 
     // Compute addend: host_ptr = addend + vaddr_low32
-    // ram + phys_page - vaddr_page_low32
-    let addend = ram as u32 + phys_page as u32 - page as u32;
+    // Wrapping arithmetic: intermediate overflow is intentional and cancels out
+    let addend = (ram as u32).wrapping_add(phys_page as u32).wrapping_sub(page as u32);
 
     // Shift entries down, insert at way 0
     let set = &mut cpu.tlb.read[set_idx];
@@ -104,7 +104,7 @@ pub unsafe fn tlb_insert_write(cpu: &mut Cpu, vaddr: u64, ram: *mut u8, phys: u6
     let phys_page = phys & !PAGE_MASK;
     let set_idx = ((vaddr >> PAGE_SHIFT) as usize) & (TLB_SETS - 1);
 
-    let addend = ram as u32 + phys_page as u32 - page as u32;
+    let addend = (ram as u32).wrapping_add(phys_page as u32).wrapping_sub(page as u32);
 
     let set = &mut cpu.tlb.write[set_idx];
     set[3] = set[2];
@@ -121,7 +121,7 @@ pub unsafe fn tlb_insert_code(cpu: &mut Cpu, vaddr: u64, ram: *mut u8, phys: u64
     let phys_page = phys & !PAGE_MASK;
     let set_idx = ((vaddr >> PAGE_SHIFT) as usize) & (TLB_SETS - 1);
 
-    let addend = ram as u32 + phys_page as u32 - page as u32;
+    let addend = (ram as u32).wrapping_add(phys_page as u32).wrapping_sub(page as u32);
 
     let set = &mut cpu.tlb.code[set_idx];
     set[3] = set[2];
@@ -136,6 +136,7 @@ pub unsafe fn tlb_insert_code(cpu: &mut Cpu, vaddr: u64, ram: *mut u8, phys: u64
 
 /// Walk 4-level page tables. Returns physical address.
 /// Sets Accessed/Dirty bits. Raises page fault on error.
+/// When paging is disabled (CR0.PG=0), returns identity mapping.
 pub unsafe fn walk_page_tables(
     cpu: &mut Cpu,
     ram: *mut u8,
@@ -144,6 +145,11 @@ pub unsafe fn walk_page_tables(
     write: bool,
     exec: bool,
 ) -> Result<u64, MemFault> {
+    // Non-paging mode: virtual = physical (identity mapping)
+    if cpu.cr0 & CR0_PG == 0 {
+        return Ok(vaddr & 0xFFFFFFFF); // 32-bit physical address space
+    }
+
     let cr3 = cpu.cr3;
 
     // PML4 entry
