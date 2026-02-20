@@ -7,7 +7,7 @@ A RISC-V Linux userland emulator compiled to WebAssembly. Runs BusyBox, Node.js,
 NanoVM emulates an RV64GC RISC-V CPU with ~80 Linux syscalls, enough to run:
 
 - **BusyBox** — echo, cat, ls, sort, grep, head, tail, and more
-- **Node.js v22** — full runtime with `require()`, fs, path, crypto, http, streams, Buffer, EventEmitter, async/await
+- **Node.js v25** — full runtime with `require()`, fs, path, crypto, http, streams, Buffer, EventEmitter, async/await
 - **npm toolchain** — TypeScript compiler, ESLint, Prettier
 
 Everything runs inside a single WASM module. The emulator handles memory management (brk/mmap), file I/O (via an in-memory POSIX filesystem), sockets, epoll, timerfds, futex-based threading, and ELF loading.
