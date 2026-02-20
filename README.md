@@ -1,0 +1,101 @@
+# NanoVM
+
+A RISC-V Linux userland emulator compiled to WebAssembly. Runs BusyBox, Node.js, and the full npm/TypeScript toolchain entirely in the browser — no server required.
+
+## What it does
+
+NanoVM emulates an RV64GC RISC-V CPU with ~80 Linux syscalls, enough to run:
+
+- **BusyBox** — echo, cat, ls, sort, grep, head, tail, and more
+- **Node.js v22** — full runtime with `require()`, fs, path, crypto, http, streams, Buffer, EventEmitter, async/await
+- **npm toolchain** — TypeScript compiler, ESLint, Prettier
+
+Everything runs inside a single WASM module. The emulator handles memory management (brk/mmap), file I/O (via an in-memory POSIX filesystem), sockets, epoll, timerfds, futex-based threading, and ELF loading.
+
+## Quick start
+
+```bash
+# Build the WASM module (~585KB without bundled binaries)
+make build
+
+# Run tests
+make test
+
+# Run a BusyBox command
+node test/run.mjs test/busybox --cmd echo "Hello from RISC-V"
+
+# Run a Node.js script
+node test/run.mjs test/node --cmd node -e "console.log(process.arch)"
+```
+
+## Web demo
+
+The demo is a browser-based IDE with a file tree, code editor, and console/preview panel:
+
+```bash
+make demo    # Builds WASM with bundled binaries + starts Vite dev server
+```
+
+Requires `test/busybox`, `test/node`, and `build/devenv.tar.gz`. See [docs/build.md](docs/build.md) for details.
+
+The demo includes examples that run inside the emulator: basic Node.js (hello world, filesystem, crypto), and HTTP servers with live preview in an iframe via a Service Worker bridge.
+
+## Architecture
+
+NanoVM follows Fabrice Bellard's approach to high-performance WASM interpreters:
+
+- **Monolithic `exec()` function** — Dense dispatch compiles to WASM `br_table` (O(1) jump tables). Source code is split across files with `#[inline(always)]`; fat LTO fuses everything into a single function.
+- **`#![no_std]` Rust** — No standard library, no heap allocation in the hot path. Zero dependencies (except `libm` for math).
+- **Minimal host boundary** — 5 WASM imports, ~30 exports. Filesystem I/O goes through a shared-memory protocol, not per-instruction callbacks.
+- **Cooperative threading** — clone/futex-based multithreading with context switching at syscall boundaries.
+
+The WASM binary is ~585KB without bundled binaries, or ~68MB with BusyBox + Node.js + devenv embedded.
+
+## Project structure
+
+```
+src/
+├── cpu.rs          RV64GC interpreter loop (instruction decode & dispatch)
+├── decode.rs       Instruction field extraction
+├── syscall.rs      Linux syscall dispatch (~80 syscalls)
+├── mem.rs          Guest memory read/write
+├── elf.rs          ELF loader (segments, argv/envp/auxv)
+├── types.rs        VM struct (12,680 bytes, #[repr(C)])
+├── exports.rs      WASM exports
+├── alloc.rs        Bump allocator
+├── host.rs         Host import declarations
+└── lib.rs          Crate root
+
+container/
+├── nanovm.mjs      Browser NanoVM wrapper (WASM + MemFS + virtual server)
+└── memfs.mjs       In-memory POSIX filesystem
+
+web/demo/           React + Vite IDE demo app
+test/               Test suite (Node.js runner + RISC-V ELF test binaries)
+build/              Devenv Docker build scripts
+```
+
+## Documentation
+
+- [Architecture](docs/architecture.md) — Design principles, memory layout, execution model, VM struct
+- [Syscalls](docs/syscalls.md) — Complete syscall reference with handling modes
+- [Host API](docs/host-api.md) — WASM imports/exports and FS_PENDING protocol
+- [Virtual Server](docs/virtual-server.md) — HTTP request injection for the preview iframe
+- [Build Guide](docs/build.md) — Build targets, feature flags, testing, devenv setup
+- [Demo](docs/demo.md) — Web IDE architecture and Service Worker bridge
+
+## Tests
+
+```
+$ make test
+============================================
+  NanoVM Test Suite
+============================================
+--- MemFS Unit Tests ---      50 passed
+--- ELF Execution Tests ---    6 passed (hello, test_suite, rvc, memory, syscalls, float)
+--- BusyBox Smoke Tests ---   17 passed (echo, cat, head, tail, sort, id, ...)
+--- Devenv Tool Tests ---      6 passed (node, tsc, npm, eslint, prettier)
+============================================
+  Results: 24 passed, 0 failed
+============================================
+```

@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>NanoVM RISC-V Test</title>
+<style>
+  body { font-family: monospace; background: #1e1e2e; color: #cdd6f4; padding: 20px; }
+  #output { white-space: pre-wrap; background: #11111b; padding: 16px; border-radius: 8px;
+            min-height: 200px; margin-top: 16px; border: 1px solid #313244; }
+  .ok { color: #a6e3a1; }
+  .err { color: #f38ba8; }
+  .info { color: #89b4fa; }
+  button { background: #89b4fa; color: #1e1e2e; border: none; padding: 8px 16px;
+           border-radius: 4px; cursor: pointer; font-family: monospace; font-size: 14px; }
+  button:hover { background: #b4befe; }
+  h1 { color: #cba6f7; }
+</style>
+</head>
+<body>
+<h1>NanoVM RISC-V Interpreter Test</h1>
+<button onclick="runTest()">Run hello.elf</button>
+<div id="output">Click "Run hello.elf" to start...\n</div>
+
+<script>
+const out = document.getElementById('output');
+function log(msg, cls) {
+  const span = document.createElement('span');
+  span.className = cls || '';
+  span.textContent = msg + '\n';
+  out.appendChild(span);
+  out.scrollTop = out.scrollHeight;
+}
+
+async function runTest() {
+  out.textContent = '';
+  log('=== NanoVM RISC-V Test ===', 'info');
+
+  // Check SharedArrayBuffer support
+  if (typeof SharedArrayBuffer === 'undefined') {
+    log('ERROR: SharedArrayBuffer not available!', 'err');
+    log('Ensure server sends COOP/COEP headers.', 'err');
+    return;
+  }
+  log('SharedArrayBuffer: available', 'ok');
+
+  // Create shared memory: 64 pages initial (4MB), 32768 max (2GB)
+  const memory = new WebAssembly.Memory({
+    initial: 64,
+    maximum: 32768,
+    shared: true
+  });
+  log('WASM Memory created: 64 pages (4MB) shared', 'ok');
+
+  // Console output buffer
+  let consoleOutput = '';
+
+  // Import object matching our WASM binary
+  const imports = {
+    env: {
+      memory: memory,
+      abort_js: () => { log('abort_js() called!', 'err'); },
+      debug_log: (val) => { log('debug_log: ' + val, 'info'); },
+      emscripten_random: () => Math.random(),
+      emscripten_date_now: () => Date.now(),
+      console_write: (fd, ptr, len) => {
+        const bytes = new Uint8Array(memory.buffer, ptr, len);
+        const text = new TextDecoder().decode(bytes);
+        consoleOutput += text;
+        // Display output in real-time
+        const span = document.createElement('span');
+        span.className = 'ok';
+        span.textContent = text;
+        out.appendChild(span);
+      }
+    }
+  };
+
+  try {
+    // Load WASM binary
+    log('Loading nanovm.wasm...', 'info');
+    const wasmResp = await fetch('../web/nanovm.wasm');
+    const wasmBytes = await wasmResp.arrayBuffer();
+    log('WASM loaded: ' + wasmBytes.byteLength + ' bytes', 'ok');
+
+    // Instantiate
+    const { instance } = await WebAssembly.instantiate(wasmBytes, imports);
+    const exports = instance.exports;
+    log('WASM instantiated. Exports: ' + Object.keys(exports).join(', '), 'ok');
+
+    // Check VM struct size
+    const structSize = exports.vm_struct_size();
+    log('vm_struct_size() = ' + structSize, 'info');
+
+    // Load ELF binary
+    log('Loading hello.elf...', 'info');
+    const elfResp = await fetch('hello.elf');
+    const elfBytes = new Uint8Array(await elfResp.arrayBuffer());
+    log('ELF loaded: ' + elfBytes.length + ' bytes', 'ok');
+
+    // Create VM with 128MB RAM
+    const RAM_SIZE = 128 * 1024 * 1024;
+    log('Creating VM with ' + (RAM_SIZE / 1024 / 1024) + 'MB RAM...', 'info');
+    const vmPtr = exports.vm_create(RAM_SIZE);
+    if (vmPtr === 0) {
+      log('ERROR: vm_create returned 0!', 'err');
+      return;
+    }
+    log('VM created at ptr=' + vmPtr, 'ok');
+
+    // Get RAM info
+    const ramPtr = exports.vm_ram_ptr(vmPtr);
+    const ramSize = exports.vm_ram_size(vmPtr);
+    log('RAM base=' + ramPtr + ' size=' + ramSize, 'info');
+
+    // Copy ELF into guest RAM at offset 0 (beginning of RAM region)
+    // The ELF is small, copy it to the start of RAM
+    const elfOffset = ramPtr; // physical offset in WASM memory
+    const memView = new Uint8Array(memory.buffer);
+    memView.set(elfBytes, elfOffset);
+    log('ELF copied to WASM memory at offset ' + elfOffset, 'ok');
+
+    // Load ELF - pass the physical WASM memory offset and size
+    log('Loading ELF via vm_load_elf...', 'info');
+    const loadResult = exports.vm_load_elf(vmPtr, elfOffset, elfBytes.length);
+    if (loadResult !== 0) {
+      log('ERROR: vm_load_elf returned ' + loadResult, 'err');
+      return;
+    }
+    log('ELF loaded successfully', 'ok');
+
+    // Check PC was set
+    const pc = exports.debug_pc(vmPtr);
+    log('Entry PC = 0x' + pc.toString(16), 'info');
+
+    // Run the interpreter
+    log('--- Running interpreter ---', 'info');
+    const BUDGET = 100000;
+    let totalSteps = 0;
+    let iterations = 0;
+    const maxIterations = 100;
+
+    while (iterations < maxIterations) {
+      iterations++;
+      const result = exports.vm_step(vmPtr, BUDGET);
+      totalSteps += (BUDGET - Math.max(0, result));
+
+      const status = exports.debug_status(vmPtr);
+      const currentPC = exports.debug_pc(vmPtr);
+
+      if (status === 3) {
+        // STATUS_FAULT - could be exit or actual fault
+        const exitCode = exports.vm_exit_code(vmPtr);
+        log('--- VM exited ---', 'info');
+        log('Exit code: ' + exitCode, exitCode === 0 ? 'ok' : 'err');
+        log('Total instructions: ~' + totalSteps, 'info');
+        log('PC at exit: 0x' + currentPC.toString(16), 'info');
+        break;
+      } else if (status === 6) {
+        // STATUS_FS_PENDING - FS request (shouldn't happen for our hello.elf
+        // since write to stdout goes directly via console_write)
+        log('FS_PENDING at PC=0x' + currentPC.toString(16), 'info');
+        // For now, just set response and continue
+        // Read the fs_request to see what syscall
+        const reqPtr = exports.vm_fs_request_ptr(vmPtr);
+        const syscallNr = new Int32Array(memory.buffer, reqPtr, 1)[0];
+        log('  FS syscall: ' + syscallNr, 'info');
+
+        // Write a simple success response
+        const respPtr = exports.vm_fs_response_ptr(vmPtr);
+        const respView = new DataView(memory.buffer);
+        // FsResponse: result (i64), error (i32), pad (i32), data_len (u32), pad2 (u32)
+        respView.setBigInt64(respPtr, 0n, true);  // result = 0
+        respView.setInt32(respPtr + 8, 0, true);   // error = 0
+        respView.setUint32(respPtr + 16, 0, true);  // data_len = 0
+
+        // Resume by re-calling vm_step (status needs to be reset)
+        // Set status back to OK (0) so vm_step accepts it
+        // Status is at offset 528 in VM struct
+        const statusOffset = vmPtr + 528;
+        new Int32Array(memory.buffer, statusOffset, 1)[0] = 0; // STATUS_OK
+        continue;
+      } else if (result <= 0 && status !== 0 && status !== 18) {
+        log('Unexpected status: ' + status + ' at PC=0x' + currentPC.toString(16), 'err');
+        const faultPC = exports.debug_fault_pc(vmPtr);
+        const faultAddr = exports.debug_fault_addr(vmPtr);
+        log('  fault_pc=0x' + faultPC.toString(16) + ' fault_addr=0x' + faultAddr.toString(16), 'err');
+
+        // Dump registers
+        for (let i = 0; i < 32; i += 4) {
+          let line = '';
+          for (let j = 0; j < 4; j++) {
+            const reg = exports.debug_reg(vmPtr, i + j);
+            line += 'x' + (i+j).toString().padStart(2) + '=' + '0x' + reg.toString(16).padStart(16,'0') + ' ';
+          }
+          log('  ' + line, 'err');
+        }
+        break;
+      }
+
+      // Budget exhausted, continue
+      if (result > 0) {
+        // Still OK, keep going
+      }
+    }
+
+    if (iterations >= maxIterations) {
+      log('Max iterations reached (' + maxIterations + ')', 'err');
+    }
+
+    log('', '');
+    log('Console output captured:', 'info');
+    log(JSON.stringify(consoleOutput), 'ok');
+
+  } catch (e) {
+    log('ERROR: ' + e.message, 'err');
+    log(e.stack, 'err');
+  }
+}
+</script>
+</body>
+</html>

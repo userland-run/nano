@@ -1,297 +1,395 @@
-// WASM exports — public API functions callable from JavaScript.
-// Mirrors the original TinyEMU export table.
-//
-// IMPORTANT: All global state (MACHINE, HEAP_PTR, HEAP_END) must use volatile
-// read/write. Without volatile, LTO + opt-level="z" eliminates stores to these
-// globals as "dead stores" because the compiler doesn't treat exported functions
-// as independently callable entry points. Volatile forces the compiler to
-// preserve every read and write.
+use crate::alloc;
+use crate::cpu;
+use crate::elf;
+use crate::host;
+use crate::mem;
+use crate::types::*;
 
-use crate::types::Machine;
+// ---------- VM lifecycle ----------
 
-// Global machine instance pointer
-static mut MACHINE: *mut Machine = core::ptr::null_mut();
-
-// Volatile accessors — prevent LTO from dead-store-eliminating global state
-#[inline(always)]
-unsafe fn read_machine() -> *mut Machine {
-    core::ptr::read_volatile(&raw const MACHINE)
-}
-#[inline(always)]
-unsafe fn write_machine(m: *mut Machine) {
-    core::ptr::write_volatile(&raw mut MACHINE, m);
-}
-#[inline(always)]
-unsafe fn read_heap_ptr() -> u32 {
-    core::ptr::read_volatile(&raw const HEAP_PTR)
-}
-#[inline(always)]
-unsafe fn write_heap_ptr(val: u32) {
-    core::ptr::write_volatile(&raw mut HEAP_PTR, val);
-}
-#[inline(always)]
-unsafe fn read_heap_end() -> u32 {
-    core::ptr::read_volatile(&raw const HEAP_END)
-}
-#[inline(always)]
-unsafe fn write_heap_end(val: u32) {
-    core::ptr::write_volatile(&raw mut HEAP_END, val);
-}
-
-/// Main entry point: parse config, create VM, boot kernel.
-/// Called from JS: vm_start(url, mem_size, cmdline, pwd, width, height, net_enabled, drive_url)
+/// Create a new VM instance. Takes RAM size as parameter.
+/// Allocates both the VM struct and the RAM region.
 #[no_mangle]
-pub unsafe extern "C" fn vm_start(
-    url: u32,
-    mem_size: u32,
-    cmdline: u32,
-    pwd: u32,
-    width: u32,
-    height: u32,
-    net_enabled: u32,
-    drive_url: u32,
-) {
-    crate::boot::vm_start_impl(url, mem_size, cmdline, pwd, width, height, net_enabled, drive_url);
-}
+pub extern "C" fn vm_create(ram_size: i32) -> i32 {
+    let struct_size = core::mem::size_of::<Vm>() as u32;
 
-/// Initialize the heap allocator. Must be called before vm_start.
-/// heap_start: byte offset in WASM linear memory where heap begins.
-/// heap_size: total bytes available for heap.
-#[no_mangle]
-pub unsafe extern "C" fn vm_init(heap_start: u32, heap_size: u32) {
-    init_heap(heap_start, heap_size);
-}
-
-/// Execute one timeslice of CPU instructions.
-/// `budget` is the max instructions to execute.
-/// `now_ms` is the wall-clock time from the host (Date.now()) for PIT timer.
-/// Returns remaining budget (<=0 means timeslice exhausted).
-#[no_mangle]
-pub unsafe extern "C" fn vm_step(budget: i32, now_ms: f64) -> i32 {
-    let m = read_machine();
-    if m.is_null() {
+    // Allocate RAM
+    let ram_ptr = alloc::malloc(ram_size as u32);
+    if ram_ptr == 0 {
         return 0;
     }
-    let mach = &mut *m;
-    // Advance PIT timer and fire IRQ 0 if needed
-    crate::pit::tick(&mut mach.cpu, now_ms);
-    crate::cpu::exec(&mut mach.cpu, mach.ram, mach.ram_size, budget)
-}
 
-/// Debug: read current RIP value.
-#[no_mangle]
-pub unsafe extern "C" fn debug_rip() -> u64 {
-    let m = read_machine();
-    if m.is_null() { return 0; }
-    (*m).cpu.rip
-}
-
-/// Debug: read last instruction start RIP.
-#[no_mangle]
-pub unsafe extern "C" fn debug_instr_rip() -> u64 {
-    let m = read_machine();
-    if m.is_null() { return 0; }
-    (*m).cpu.instr_start_rip
-}
-
-/// Debug: read CR2 (page fault address).
-#[no_mangle]
-pub unsafe extern "C" fn debug_cr2() -> u64 {
-    let m = read_machine();
-    if m.is_null() { return 0; }
-    (*m).cpu.cr2
-}
-
-/// Debug: read CR3 (page table base).
-#[no_mangle]
-pub unsafe extern "C" fn debug_cr3() -> u64 {
-    let m = read_machine();
-    if m.is_null() { return 0; }
-    (*m).cpu.cr3
-}
-
-/// Debug: read a GPR by index (0=RAX..15=R15).
-#[no_mangle]
-pub unsafe extern "C" fn debug_reg(idx: u32) -> u64 {
-    let m = read_machine();
-    if m.is_null() { return 0; }
-    if idx < 16 { (*m).cpu.regs[idx as usize] } else { 0 }
-}
-
-/// Debug: read a byte from guest physical memory.
-#[no_mangle]
-pub unsafe extern "C" fn debug_read_phys(addr: u32) -> u32 {
-    let m = read_machine();
-    if m.is_null() { return 0; }
-    let mach = &*m;
-    if addr < mach.ram_size as u32 {
-        *mach.ram.add(addr as usize) as u32
-    } else {
-        0xFF
+    // Zero the RAM
+    unsafe {
+        core::ptr::write_bytes(ram_ptr as *mut u8, 0, ram_size as usize);
     }
+
+    // Allocate VM struct (tracked via global offset, not malloc)
+    let vm_ptr = alloc::malloc(struct_size);
+    if vm_ptr == 0 {
+        return 0;
+    }
+
+    unsafe {
+        let vm = &mut *(vm_ptr as *mut Vm);
+        vm.init();
+        vm.ram_base = ram_ptr;
+        vm.ram_size = ram_size as u32;
+        vm.heap_ptr = ram_ptr;
+        // Stack at top of guest RAM
+        vm.stack_limit = ram_size as u64;
+
+        // Log creation for debug (also prevents debug_log from being DCE'd)
+        host::debug_log(vm_ptr as i32);
+    }
+
+    vm_ptr as i32
 }
 
-/// Debug: read IDT limit.
 #[no_mangle]
-pub unsafe extern "C" fn debug_idt_limit() -> u32 {
-    let m = read_machine();
-    if m.is_null() { return 0; }
-    (*m).cpu.idt.limit as u32
+pub unsafe extern "C" fn vm_init(vm_ptr: u32, ram_base: u32, ram_size: u32) {
+    let vm = &mut *(vm_ptr as *mut Vm);
+    vm.ram_base = ram_base;
+    vm.ram_size = ram_size;
+    vm.heap_ptr = ram_base + ram_size;
+    vm.status = STATUS_OK;
+
+    // Initialize the global allocator with memory after RAM
+    alloc::init(ram_base + ram_size);
 }
 
-/// Debug: read IDT base.
+/// Execute instructions. Returns remaining budget (0 = budget exhausted, <0 = trap/syscall).
 #[no_mangle]
-pub unsafe extern "C" fn debug_idt_base() -> u64 {
-    let m = read_machine();
-    if m.is_null() { return 0; }
-    (*m).cpu.idt.base
+pub unsafe extern "C" fn vm_step(vm_ptr: u32, budget: i32) -> i32 {
+    let vm = &mut *(vm_ptr as *mut Vm);
+    if vm.status != STATUS_OK && vm.status != STATUS_RUNNING {
+        return -1;
+    }
+    vm.status = STATUS_RUNNING;
+    let result = cpu::exec(vm, budget);
+    if vm.status == STATUS_RUNNING {
+        vm.status = STATUS_OK;
+    }
+    result
 }
 
-/// Debug: dump PIT/PIC/RFLAGS state for interrupt chain diagnosis.
-/// Returns a packed u32: bits [0:15]=PIT reload, [16]=IF, [17:24]=IMR, [25]=IRR bit0, [26]=ISR bit0
-/// Also calls debug_log with detailed values.
+/// Step for a thread (takes thread VM ptr)
 #[no_mangle]
-pub unsafe extern "C" fn debug_dump_irq_state() -> u32 {
-    let m = read_machine();
-    if m.is_null() { return 0; }
-    let mach = &*m;
-    // PIT channel 0 reload
-    crate::host::debug_log(0xD1000000 | mach.pit.channels[0].reload as u32);
-    // PIT channel 0 count
-    crate::host::debug_log(0xD7000000 | mach.pit.channels[0].count as u32);
-    // PIC master IMR
-    crate::host::debug_log(0xD2000000 | mach.pic_master.imr as u32);
-    // PIC master ISR
-    crate::host::debug_log(0xD3000000 | mach.pic_master.isr as u32);
-    // PIC master IRR
-    crate::host::debug_log(0xD4000000 | mach.pic_master.irr as u32);
-    // RFLAGS IF
-    crate::host::debug_log(0xD5000000 | ((mach.cpu.rflags >> 9) & 1) as u32);
-    // RIP low 24
-    crate::host::debug_log(0xD6000000 | (mach.cpu.rip as u32 & 0x00FFFFFF));
-    // PIC master irq_base
-    crate::host::debug_log(0xD8000000 | mach.pic_master.irq_base as u32);
+pub unsafe extern "C" fn vm_thread_step(vm_ptr: u32, budget: i32) -> i32 {
+    vm_step(vm_ptr, budget)
+}
+
+/// Load an ELF binary from guest memory
+#[no_mangle]
+pub unsafe extern "C" fn vm_load_elf(vm_ptr: u32, elf_offset: u32, elf_size: u32) -> i32 {
+    let vm = &mut *(vm_ptr as *mut Vm);
+    let result = elf::load(vm, elf_offset as u64, elf_size);
+    if result.entry == 0 {
+        return -1;
+    }
+
+    // Set up stack
+    let stack_top = vm.stack_limit;
+    let sp = stack_top - 4096; // Leave some space at top
+
+    // Write argv[0] onto stack area
+    let argv0_addr = sp - 64;
+    mem::write_bytes(vm.ram_base, argv0_addr, b"busybox\0");
+
+    let argv = [argv0_addr];
+    let envp: [u64; 0] = [];
+
+    let final_sp = elf::setup_stack(
+        vm,
+        sp - 128,
+        result.entry,
+        1,
+        &argv,
+        &envp,
+        result.phdr_addr,
+        result.phentsize,
+        result.phnum,
+    );
+
+    vm.pc = result.entry;
+    vm.x[2] = final_sp; // sp = x2
+
     0
 }
 
-/// Queue a character for the VM's console input (keyboard).
+/// Load a raw binary at a given address and set PC
 #[no_mangle]
-pub unsafe extern "C" fn console_queue_char(ch: u32) {
-    let m = read_machine();
-    if !m.is_null() {
-        let mach = &mut *m;
-        // Feed UART (for console=ttyS0)
-        mach.console_fifo.push(ch as u8);
-        crate::uart::on_char_received(mach);
-        // Feed VirtIO console RX (for console=hvc0)
-        crate::virtio_console::recv_char(mach, ch as u8);
-    }
-}
+pub unsafe extern "C" fn vm_load_raw(
+    vm_ptr: u32,
+    data_offset: u32,
+    data_size: u32,
+    load_addr: u32,
+    entry: u32,
+) -> i32 {
+    let vm = &mut *(vm_ptr as *mut Vm);
+    // Copy data into guest memory at load_addr
+    let src = data_offset as *const u8;
+    let dst = (vm.ram_base + load_addr) as *mut u8;
+    core::ptr::copy_nonoverlapping(src, dst, data_size as usize);
 
-/// Notify VM that terminal dimensions changed.
-#[no_mangle]
-pub unsafe extern "C" fn console_resize_event() {
-    // Terminal resize — will be handled by virtio console
-}
+    vm.pc = entry as u64;
+    vm.x[2] = vm.stack_limit - 4096; // initial stack
 
-/// Send keyboard event to graphical display.
-#[no_mangle]
-pub unsafe extern "C" fn display_key_event(_down: u32, _keycode: u32) {
-    // Graphical display keyboard input (Phase 11+)
-}
+    // Set up brk
+    let end = (load_addr + data_size) as u64;
+    vm.brk_start = (end + PAGE_SIZE - 1) & PAGE_MASK;
+    vm.brk_current = vm.brk_start;
+    vm.mmap_next_addr = vm.brk_start + 64 * 1024 * 1024;
 
-/// Send mouse event to graphical display.
-#[no_mangle]
-pub unsafe extern "C" fn display_mouse_event(_dx: u32, _dy: u32, _buttons: u32) {
-    // Graphical display mouse input
-}
-
-/// Send mouse wheel event.
-#[no_mangle]
-pub unsafe extern "C" fn display_wheel_event(_delta: u32) {
-    // Graphical display wheel input
-}
-
-/// Write an Ethernet frame to the virtual NIC.
-#[no_mangle]
-pub unsafe extern "C" fn net_write_packet(_buf: u32, _len: u32) -> u32 {
-    // Network packet from host → guest
     0
 }
 
-/// Set network link carrier state.
+/// Allocate a thread VM struct (for clone/pthread_create)
 #[no_mangle]
-pub unsafe extern "C" fn net_set_carrier(_carrier: u32) {
-    // Network carrier state change
-}
-
-/// Load a kernel bzImage into guest RAM.
-/// kernel_ptr points to the bzImage data in WASM linear memory.
-/// Returns 1 on success, 0 on failure.
-#[no_mangle]
-pub unsafe extern "C" fn load_kernel(kernel_ptr: u32, kernel_size: u32) -> u32 {
-    let m = read_machine();
-    if m.is_null() {
+pub unsafe extern "C" fn vm_alloc_thread(parent_ptr: u32) -> u32 {
+    let size = core::mem::size_of::<Vm>() as u32;
+    let child_ptr = alloc::malloc(size);
+    if child_ptr == 0 {
         return 0;
     }
-    let mach = &mut *m;
-    let kernel = kernel_ptr as *const u8;
-    if crate::boot::load_kernel(mach.ram, mach.ram_size, kernel, kernel_size) {
-        1
+
+    // Copy parent state
+    let src = parent_ptr as *const u8;
+    let dst = child_ptr as *mut u8;
+    core::ptr::copy_nonoverlapping(src, dst, size as usize);
+
+    let child = &mut *(child_ptr as *mut Vm);
+    child.parent_vm = parent_ptr;
+    child.tid += 1;
+    child.status = STATUS_OK;
+
+    child_ptr
+}
+
+/// Return from fork in child
+#[no_mangle]
+pub unsafe extern "C" fn vm_fork_return(vm_ptr: u32, child_sp: u64, child_tls: u64) {
+    let vm = &mut *(vm_ptr as *mut Vm);
+    vm.x[2] = child_sp;  // sp
+    vm.x[4] = child_tls;  // tp (thread pointer)
+    vm.x[10] = 0;         // a0 = 0 (child return value)
+    vm.tls_base = child_tls;
+}
+
+// ---------- FS protocol pointers ----------
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_fs_request_ptr(vm_ptr: u32) -> u32 {
+    let vm = &*(vm_ptr as *const Vm);
+    &vm.fs_request as *const _ as u32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_fs_response_ptr(vm_ptr: u32) -> u32 {
+    let vm = &*(vm_ptr as *const Vm);
+    &vm.fs_response as *const _ as u32
+}
+
+/// Thread FS request is at fixed offset 3972 within the VM struct
+#[no_mangle]
+pub extern "C" fn vm_thread_fs_request_ptr(vm_ptr: u32) -> u32 {
+    vm_ptr + THREAD_FS_OFFSET
+}
+
+/// Thread FS response follows thread FS request (296 bytes later)
+#[no_mangle]
+pub extern "C" fn vm_thread_fs_response_ptr(vm_ptr: u32) -> u32 {
+    vm_ptr + THREAD_FS_OFFSET + core::mem::size_of::<FsRequest>() as u32
+}
+
+// ---------- Memory info ----------
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_ram_ptr(vm_ptr: u32) -> u32 {
+    let vm = &*(vm_ptr as *const Vm);
+    vm.ram_base
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_ram_size(vm_ptr: u32) -> u32 {
+    let vm = &*(vm_ptr as *const Vm);
+    vm.ram_size
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_struct_ptr(vm_ptr: u32) -> u32 {
+    vm_ptr
+}
+
+#[no_mangle]
+pub extern "C" fn vm_struct_size() -> i32 {
+    core::mem::size_of::<Vm>() as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_exit_code(vm_ptr: u32) -> i32 {
+    let vm = &*(vm_ptr as *const Vm);
+    vm.exit_code
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_shared_efd_ptr(vm_ptr: u32) -> u32 {
+    let vm = &*(vm_ptr as *const Vm);
+    &vm.shared_efd as *const _ as u32
+}
+
+// ---------- Bundled binaries ----------
+// RISC-V ELF binaries embedded into WASM data section via include_bytes!.
+// Each has a feature gate; when disabled, returns ptr=0 size=0.
+
+// BusyBox (~1MB static RISC-V ELF)
+#[cfg(feature = "busybox")]
+static BUSYBOX_DATA: &[u8] = include_bytes!("../test/busybox");
+
+#[cfg(not(feature = "busybox"))]
+static BUSYBOX_DATA: &[u8] = &[];
+
+#[no_mangle]
+pub extern "C" fn vm_bundled_busybox_ptr() -> i32 {
+    BUSYBOX_DATA.as_ptr() as i32
+}
+
+#[no_mangle]
+pub extern "C" fn vm_bundled_busybox_size() -> i32 {
+    BUSYBOX_DATA.len() as i32
+}
+
+// Node.js (~52MB static RISC-V ELF)
+#[cfg(feature = "node")]
+static NODE_DATA: &[u8] = include_bytes!("../test/node");
+
+#[cfg(not(feature = "node"))]
+static NODE_DATA: &[u8] = &[];
+
+#[no_mangle]
+pub extern "C" fn vm_bundled_node_ptr() -> i32 {
+    NODE_DATA.as_ptr() as i32
+}
+
+#[no_mangle]
+pub extern "C" fn vm_bundled_node_size() -> i32 {
+    NODE_DATA.len() as i32
+}
+
+// Generic ELF (legacy — points to busybox if available, else empty)
+#[no_mangle]
+pub extern "C" fn vm_bundled_elf_ptr() -> i32 {
+    BUSYBOX_DATA.as_ptr() as i32
+}
+
+#[no_mangle]
+pub extern "C" fn vm_bundled_elf_size() -> i32 {
+    BUSYBOX_DATA.len() as i32
+}
+
+// ---------- Bundled devenv ----------
+// Complete JS dev environment (Node+npm, esbuild, TS, ESLint, Prettier, etc.)
+// embedded as a compressed tarball. Only included with `--features devenv`.
+
+#[cfg(feature = "devenv")]
+static DEVENV_DATA: &[u8] = include_bytes!("../build/devenv.tar.gz");
+
+#[cfg(not(feature = "devenv"))]
+static DEVENV_DATA: &[u8] = &[];
+
+#[no_mangle]
+pub extern "C" fn vm_bundled_devenv_ptr() -> i32 {
+    DEVENV_DATA.as_ptr() as i32
+}
+
+#[no_mangle]
+pub extern "C" fn vm_bundled_devenv_size() -> i32 {
+    DEVENV_DATA.len() as i32
+}
+
+// ---------- Debug ----------
+// Names match reference: debug_pc, debug_reg, debug_status, debug_read_guest,
+// debug_fault_pc, debug_fault_addr (no "_get_" prefix)
+
+#[no_mangle]
+pub unsafe extern "C" fn debug_pc(vm_ptr: u32) -> u64 {
+    let vm = &*(vm_ptr as *const Vm);
+    vm.pc
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn debug_reg(vm_ptr: u32, reg: u32) -> u64 {
+    let vm = &*(vm_ptr as *const Vm);
+    if reg < 32 {
+        vm.x[reg as usize]
     } else {
         0
     }
 }
 
-/// Import a file into the VM's filesystem.
 #[no_mangle]
-pub unsafe extern "C" fn fs_import_file(_name: u32, _buf: u32, _len: u32) {
-    // File upload from host
+pub unsafe extern "C" fn debug_status(vm_ptr: u32) -> i32 {
+    let vm = &*(vm_ptr as *const Vm);
+    vm.status
 }
 
-// ============================================================
-// Memory allocator
-// ============================================================
-
-// Simple bump allocator for WASM linear memory.
-// The original uses dlmalloc; we use a minimal implementation.
-
-static mut HEAP_PTR: u32 = 0;
-static mut HEAP_END: u32 = 0;
-
-/// Initialize the heap allocator.
-pub unsafe fn init_heap(start: u32, size: u32) {
-    write_heap_ptr((start + 7) & !7); // align to 8
-    write_heap_end(start + size);
-}
-
-/// Allocate memory from the heap.
 #[no_mangle]
-pub unsafe extern "C" fn malloc(size: u32) -> u32 {
-    let aligned_size = (size + 7) & !7;
-    let ptr = read_heap_ptr();
-    let end = read_heap_end();
-    if ptr + aligned_size > end {
-        return 0; // OOM
-    }
-    write_heap_ptr(ptr + aligned_size);
-    ptr
+pub unsafe extern "C" fn debug_read_guest(vm_ptr: u32, addr: u64) -> u32 {
+    let vm = &*(vm_ptr as *const Vm);
+    mem::read_u32(vm.ram_base, addr)
 }
 
-/// Free memory (no-op in bump allocator; original uses dlmalloc).
 #[no_mangle]
-pub unsafe extern "C" fn free(_ptr: u32) {
-    // Bump allocator doesn't free
+pub unsafe extern "C" fn debug_fault_pc(vm_ptr: u32) -> u64 {
+    let vm = &*(vm_ptr as *const Vm);
+    vm.fault_pc
 }
 
-// ============================================================
-// Machine access
-// ============================================================
-
-pub unsafe fn set_machine(m: *mut Machine) {
-    write_machine(m);
+#[no_mangle]
+pub unsafe extern "C" fn debug_fault_addr(vm_ptr: u32) -> u64 {
+    let vm = &*(vm_ptr as *const Vm);
+    vm.fault_addr
 }
 
-pub unsafe fn get_machine() -> *mut Machine {
-    read_machine()
+// ---------- Virtual Server ----------
+// JS host injects HTTP connections into the VM's socket layer.
+
+/// Inject an HTTP connection to a listening server on `port`.
+/// `req_ptr`/`req_len` point to raw HTTP request bytes in WASM linear memory.
+/// Returns connection ID (>= 0) for polling the response, or < 0 on error.
+#[no_mangle]
+pub unsafe extern "C" fn vm_inject_connection(
+    vm_ptr: u32,
+    port: u32,
+    req_ptr: u32,
+    req_len: u32,
+) -> i32 {
+    let vm = &mut *(vm_ptr as *mut Vm);
+    crate::syscall::inject_connection(vm, port as u16, req_ptr, req_len)
+}
+
+/// Read response bytes from a virtual connection into `dst_ptr`.
+/// Returns: >0 bytes copied, 0 = still waiting, -1 = response complete.
+#[no_mangle]
+pub unsafe extern "C" fn vm_read_response(
+    _vm_ptr: u32,
+    conn_id: i32,
+    dst_ptr: u32,
+    dst_len: u32,
+) -> i32 {
+    crate::syscall::read_response(conn_id, dst_ptr, dst_len)
+}
+
+/// Close a virtual connection (both sides).
+#[no_mangle]
+pub unsafe extern "C" fn vm_close_connection(_vm_ptr: u32, conn_id: i32) {
+    crate::syscall::close_connection(conn_id);
+}
+
+// ---------- Console ----------
+
+/// No-op: matches reference where console_queue_char aliases free()
+#[no_mangle]
+pub extern "C" fn console_queue_char(_ch: i32) {
+    // Intentionally empty - reference binary aliases this to free (no-op)
 }

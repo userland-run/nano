@@ -1,15 +1,14 @@
 # macOS
 .DS_Store
 
-jslinux/
+specs/
 
 # Rust
 target/
 Cargo.lock
 
 # WASM build artifacts
-*.wasm
-!jslinux/*.wasm
+
 pkg/
 
 # Editors
@@ -19,7 +18,11 @@ pkg/
 .idea/
 .vscode/
 
-# Deletable decompilation artifacts (see CLAUDE.md)
-jslinux/ghidra-monster-highpcode.c
-jslinux/ghidra-monster-chunks.c
-jslinux/x86_64emu-wasm.wasm.i64
+# Node
+node_modules
+
+# Large binaries (not stored in git)
+test/busybox
+test/node
+build/devenv.tar.gz
+web/nanovm.wasm

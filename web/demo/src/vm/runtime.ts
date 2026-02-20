@@ -18,8 +18,26 @@ export async function ensureVM(): Promise<any> {
   initPromise = (async () => {
     vmInstance = await NanoVM.create({
       ramMB: 512,
-      wasm: import.meta.env.BASE_URL + "container/nanovm.wasm",
+      wasm: import.meta.env.BASE_URL + "nanovm.wasm",
     });
+
+    // Load bundled devenv tarball if available
+    const exports = vmInstance._exports || vmInstance.exports;
+    if (exports?.vm_bundled_devenv_ptr && exports?.vm_bundled_devenv_size) {
+      const devenvPtr = exports.vm_bundled_devenv_ptr();
+      const devenvSize = exports.vm_bundled_devenv_size();
+      if (devenvPtr > 0 && devenvSize > 0) {
+        console.log(`[NanoVM] Loading bundled devenv (${(devenvSize / 1024 / 1024).toFixed(1)} MB compressed)...`);
+        const wasmMemory = vmInstance._memory || vmInstance.memory;
+        if (wasmMemory) {
+          const tarGz = new Uint8Array(wasmMemory.buffer, devenvPtr, devenvSize);
+          const tarGzCopy = new Uint8Array(tarGz);
+          await vmInstance.loadTarGz(tarGzCopy);
+          console.log(`[NanoVM] Devenv loaded into VFS`);
+        }
+      }
+    }
+
     vmReady = true;
   })();
 
