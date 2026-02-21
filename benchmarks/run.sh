@@ -10,7 +10,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 BENCH_DIR="benchmarks"
-NODE_ELF="test/node"
+NODE_ELF="images/node"
 RUN_MJS="test/run.mjs"
 TIMEOUT=120
 

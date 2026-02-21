@@ -29,16 +29,16 @@ Tests are in `test/` and run via Node.js:
 ```bash
 bash test/run_tests.sh              # Run tests (requires web/nanovm.wasm)
 bash test/run_tests.sh --build      # Build test ELFs first (requires cross-compiler)
-bash test/run_tests.sh --devenv     # Include devenv tool tests (requires bundled WASM + test/node)
+bash test/run_tests.sh --devenv     # Include devenv tool tests (requires bundled WASM + images/node)
 
 # Run single ELF test:
 node test/run.mjs test/hello.elf
 
 # Run busybox command:
-node test/run.mjs test/busybox --cmd echo Hello
+node test/run.mjs images/busybox --cmd echo Hello
 
 # Run with syscall tracing:
-node test/run.mjs test/busybox --trace --cmd ls /tmp
+node test/run.mjs images/busybox --trace --cmd ls /tmp
 ```
 
 **Test phases**: MemFS unit tests → ELF execution (hello, test_suite, test_rvc, test_memory, test_syscalls, test_float) → BusyBox smoke tests (17 applets) → Devenv tool tests (node, tsc, npm, eslint, prettier).

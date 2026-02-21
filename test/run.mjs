@@ -3,7 +3,7 @@
  * NanoVM RISC-V interpreter test - runs a RISC-V ELF on the command line via Node.js + WASM.
  *
  * Usage:  node test/run.mjs [path-to-elf]
- *         node test/run.mjs test/busybox --cmd ls /tmp
+ *         node test/run.mjs images/busybox --cmd ls /tmp
  * Default ELF: test/hello.elf
  */
 import { readFileSync } from "fs";

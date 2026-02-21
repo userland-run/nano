@@ -21,8 +21,9 @@ pkg/
 # Node
 node_modules
 
-# Large binaries (not stored in git)
-test/busybox
-test/node
+# Build artifacts
 build/devenv.tar.gz
 web/nanovm.wasm
+
+.claude
+CLAUDE.md

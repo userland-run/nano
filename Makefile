@@ -19,8 +19,8 @@ build-bundled:
 
 # Build WASM with all bundled binaries (busybox + node + devenv)
 build-demo:
-	@test -f test/busybox || (echo "ERROR: test/busybox not found." && exit 1)
-	@test -f test/node || (echo "ERROR: test/node not found." && exit 1)
+	@test -f images/busybox || (echo "ERROR: images/busybox not found." && exit 1)
+	@test -f images/node || (echo "ERROR: images/node not found." && exit 1)
 	@test -f build/devenv.tar.gz || (echo "ERROR: build/devenv.tar.gz not found. Run 'make devenv' first." && exit 1)
 	cargo build --target $(WASM_TARGET) --release --features demo
 	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nanovm.wasm
@@ -40,7 +40,7 @@ test-build:
 test: build
 	bash test/run_tests.sh
 
-# Run all tests including devenv tool tests (requires build-bundled + test/node)
+# Run all tests including devenv tool tests (requires build-bundled + images/node)
 test-devenv: build-bundled
 	bash test/run_tests.sh --devenv
 

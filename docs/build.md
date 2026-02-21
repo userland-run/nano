@@ -25,8 +25,8 @@ make clean            # Remove build artifacts
 
 | Feature | What it embeds | Size impact |
 |---------|---------------|-------------|
-| `busybox` | `test/busybox` (static RISC-V ELF) | ~1MB |
-| `node` | `test/node` (static RISC-V ELF) | ~52MB |
+| `busybox` | `images/busybox` (static RISC-V ELF) | ~1MB |
+| `node` | `images/node` (static RISC-V ELF) | ~52MB |
 | `devenv` | `build/devenv.tar.gz` (npm, tsc, eslint, prettier) | ~15MB |
 | `demo` | All of the above | ~68MB |
 
@@ -78,10 +78,10 @@ bash test/run_tests.sh --verbose    # With instruction tracing
 node test/run.mjs test/hello.elf
 
 # BusyBox command:
-node test/run.mjs test/busybox --cmd echo Hello
+node test/run.mjs images/busybox --cmd echo Hello
 
 # With syscall tracing:
-node test/run.mjs test/busybox --trace --cmd ls /
+node test/run.mjs images/busybox --trace --cmd ls /
 ```
 
 ### Test phases
@@ -109,7 +109,7 @@ make demo         # Builds WASM with demo features + starts vite dev server
 ```
 
 This:
-1. Checks that `test/busybox`, `test/node`, and `build/devenv.tar.gz` exist
+1. Checks that `images/busybox`, `images/node`, and `build/devenv.tar.gz` exist
 2. Builds WASM with `--features demo` (embeds all three)
 3. Copies the WASM to `web/demo/public/nanovm.wasm`
 4. Starts the Vite dev server

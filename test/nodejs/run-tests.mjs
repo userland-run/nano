@@ -16,10 +16,10 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '../..');
 const runner = resolve(root, 'test/run.mjs');
-const nodeElf = resolve(root, 'test/node');
+const nodeElf = resolve(root, 'images/node');
 
 if (!existsSync(nodeElf)) {
-  console.error('ERROR: test/node binary not found. Build it first with: bash build/node-riscv/build.sh');
+  console.error('ERROR: images/node binary not found. Build it first with: bash build/node-riscv/build.sh');
   process.exit(1);
 }
 

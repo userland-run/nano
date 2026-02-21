@@ -1,12 +1,12 @@
 #!/bin/bash
 # Build Node.js v25.4.0 as a static RISC-V 64-bit ELF
-# Output: ../../test/node (statically-linked riscv64 ELF)
+# Output: ../../images/node (statically-linked riscv64 ELF)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 IMAGE_NAME="nanovm-node-riscv"
-OUTPUT="$PROJECT_ROOT/test/node"
+OUTPUT="$PROJECT_ROOT/images/node"
 
 echo "=== Building Node.js v25.4.0 for RISC-V 64-bit ==="
 echo "    Docker image: $IMAGE_NAME"

@@ -8,8 +8,8 @@ crate-type = ["cdylib"]
 
 [features]
 default = []
-busybox = []  # Embed test/busybox RISC-V ELF into WASM data section (~1MB)
-node = []     # Embed test/node RISC-V ELF into WASM data section (~52MB)
+busybox = []  # Embed images/busybox RISC-V ELF into WASM data section (~1MB)
+node = []     # Embed images/node RISC-V ELF into WASM data section (~52MB)
 devenv = []   # Embed build/devenv.tar.gz into WASM data section
 demo = ["busybox", "node", "devenv"]  # All bundled: full demo
 

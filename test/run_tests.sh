@@ -122,7 +122,7 @@ echo ""
 # ============================================================
 
 echo "--- BusyBox Smoke Tests ---"
-BUSYBOX="$SCRIPT_DIR/busybox"
+BUSYBOX="$PROJECT_ROOT/images/busybox"
 
 if [ ! -f "$BUSYBOX" ]; then
     skip "BusyBox smoke tests" "busybox binary not found"
@@ -176,7 +176,7 @@ echo ""
 # ============================================================
 
 echo "--- Devenv Tool Tests ---"
-NODE_BIN="$SCRIPT_DIR/node"
+NODE_BIN="$PROJECT_ROOT/images/node"
 BUNDLED_WASM="$PROJECT_ROOT/target/wasm32-unknown-unknown/release/nanovm.wasm"
 
 # Devenv tests need: bundled WASM + node binary
@@ -193,7 +193,7 @@ fi
 if [ "$HAS_BUNDLED" -eq 0 ]; then
     skip "Devenv tool tests" "no bundled WASM - run 'make build-bundled' then use --devenv"
 elif [ ! -f "$NODE_BIN" ]; then
-    skip "Devenv tool tests" "test/node binary not found"
+    skip "Devenv tool tests" "images/node binary not found"
 else
     # Run a devenv tool via: node <js_path> --version
     run_devenv_tool() {

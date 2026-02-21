@@ -22,10 +22,10 @@ make build
 make test
 
 # Run a BusyBox command
-node test/run.mjs test/busybox --cmd echo "Hello from RISC-V"
+node test/run.mjs images/busybox --cmd echo "Hello from RISC-V"
 
 # Run a Node.js script
-node test/run.mjs test/node --cmd node -e "console.log(process.arch)"
+node test/run.mjs images/node --cmd node -e "console.log(process.arch)"
 ```
 
 ## Web demo
@@ -36,7 +36,7 @@ The demo is a browser-based IDE with a file tree, code editor, and console/previ
 make demo    # Builds WASM with bundled binaries + starts Vite dev server
 ```
 
-Requires `test/busybox`, `test/node`, and `build/devenv.tar.gz`. See [docs/build.md](docs/build.md) for details.
+Requires `images/busybox`, `images/node`, and `build/devenv.tar.gz`. See [docs/build.md](docs/build.md) for details.
 
 The demo includes examples that run inside the emulator: basic Node.js (hello world, filesystem, crypto), and HTTP servers with live preview in an iframe via a Service Worker bridge.
 
