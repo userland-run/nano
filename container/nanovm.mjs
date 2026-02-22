@@ -3,7 +3,7 @@
  *
  * Usage:
  *   import { NanoVM } from "@container/nanovm.mjs";
- *   const vm = await NanoVM.create({ ramMB: 512, wasm: "/nanovm.wasm" });
+ *   const vm = await NanoVM.create({ ramMB: 512, wasm: "/nano.wasm" });
  *   vm.addFile("/hello.js", 'console.log("Hello!")');
  *   const { exitCode, stdout } = await vm.node("/hello.js");
  */
@@ -83,7 +83,7 @@ class NanoVM {
    * Create a new NanoVM instance.
    * @param {Object} opts
    * @param {number} opts.ramMB - RAM size in megabytes (default 512)
-   * @param {string} opts.wasm - URL to the nanovm.wasm file
+   * @param {string} opts.wasm - URL to the nano.wasm file
    * @param {string} [opts.busyboxUrl] - URL to busybox ELF (if not bundled)
    * @param {string} [opts.nodeUrl] - URL to node ELF (if not bundled)
    */
@@ -98,7 +98,7 @@ class NanoVM {
     this._ramMB = ramMB;
 
     // Fetch WASM binary
-    const wasmUrl = typeof wasm === "string" ? wasm : "/nanovm.wasm";
+    const wasmUrl = typeof wasm === "string" ? wasm : "/nano.wasm";
     const wasmResponse = await fetch(wasmUrl);
     if (!wasmResponse.ok) throw new Error(`Failed to fetch WASM: ${wasmResponse.status}`);
     const wasmBytes = await wasmResponse.arrayBuffer();
@@ -122,7 +122,7 @@ class NanoVM {
         emscripten_random() { return Math.random(); },
         emscripten_date_now() { return Date.now(); },
         console_write(fd, ptr, len) {
-          const bytes = new Uint8Array(self._memory.buffer, ptr, len);
+          const bytes = new Uint8Array(self._memory.buffer, ptr, len).slice();
           const text = new TextDecoder().decode(bytes);
           self._stdout += text;
           if (self._onStdout) self._onStdout(text);
@@ -559,7 +559,7 @@ class NanoVM {
     const cwdBytes = new Uint8Array(this._memory.buffer, this._vmPtr + 3680, 256);
     let end = 0;
     while (end < 256 && cwdBytes[end] !== 0) end++;
-    return new TextDecoder().decode(cwdBytes.subarray(0, end)) || "/";
+    return new TextDecoder().decode(cwdBytes.slice(0, end)) || "/";
   }
 
   _resolvePath(path) {
@@ -629,12 +629,12 @@ class NanoVM {
     // Read null-terminated path (offset +40, max 256 bytes)
     const pathBytes = new Uint8Array(this._memory.buffer, reqPtr + 40, 256);
     let pe = 0; while (pe < 256 && pathBytes[pe] !== 0) pe++;
-    const rawPath = pe > 0 ? new TextDecoder().decode(pathBytes.subarray(0, pe)) : "";
+    const rawPath = pe > 0 ? new TextDecoder().decode(pathBytes.slice(0, pe)) : "";
 
     // Read path2 for rename (offset +296, max 256 bytes)
     const path2Bytes = new Uint8Array(this._memory.buffer, reqPtr + 296, 256);
     let pe2 = 0; while (pe2 < 256 && path2Bytes[pe2] !== 0) pe2++;
-    const rawPath2 = pe2 > 0 ? new TextDecoder().decode(path2Bytes.subarray(0, pe2)) : "";
+    const rawPath2 = pe2 > 0 ? new TextDecoder().decode(path2Bytes.slice(0, pe2)) : "";
 
     const path = this._resolvePath(rawPath);
     const path2 = rawPath2 ? this._resolvePath(rawPath2) : "";

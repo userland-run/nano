@@ -77,8 +77,8 @@ async function runTest() {
 
   try {
     // Load WASM binary
-    log('Loading nanovm.wasm...', 'info');
-    const wasmResp = await fetch('../web/nanovm.wasm');
+    log('Loading nano.wasm...', 'info');
+    const wasmResp = await fetch('../wasm/nano.wasm');
     const wasmBytes = await wasmResp.arrayBuffer();
     log('WASM loaded: ' + wasmBytes.byteLength + ' bytes', 'ok');
 

@@ -11,15 +11,16 @@ The Rust toolchain is pinned in `rust-toolchain.toml`. The WASM target is added 
 ## Build Targets
 
 ```bash
-make build            # Minimal WASM (~585KB) — no bundled binaries
-make build-bundled    # WASM with devenv tools (requires build/devenv.tar.gz)
-make build-demo       # WASM with busybox + node + devenv (requires all three)
+make build            # Default: fully-bundled wasm/nano.wasm (~68MB)
+make build-minimal    # Bare emulator (~585KB) — no bundled binaries
 make clean            # Remove build artifacts
 ```
 
 ### What gets built
 
-`cargo build --target wasm32-unknown-unknown --release` produces a `.wasm` file which is copied to `web/nanovm.wasm`.
+`cargo build --target wasm32-unknown-unknown --release` produces a `.wasm` file which is copied to `wasm/nano.wasm`.
+
+The default build embeds busybox, node, and devenv tools. Use `build-minimal` for a fast build without bundled binaries.
 
 ### Feature flags
 
@@ -28,7 +29,7 @@ make clean            # Remove build artifacts
 | `busybox` | `images/busybox` (static RISC-V ELF) | ~1MB |
 | `node` | `images/node` (static RISC-V ELF) | ~52MB |
 | `devenv` | `build/devenv.tar.gz` (npm, tsc, eslint, prettier) | ~15MB |
-| `demo` | All of the above | ~68MB |
+| `demo` | All of the above (default) | ~68MB |
 
 Binaries are embedded via `include_bytes!` into the WASM data section. When a feature is disabled, the corresponding `vm_bundled_*_ptr()` returns 0 and `vm_bundled_*_size()` returns 0.
 
@@ -66,11 +67,11 @@ cargo build --target wasm32-unknown-unknown
 ## Running Tests
 
 ```bash
-make test             # Build + run all tests
+make test             # Build minimal + run all tests
 make test-devenv      # Build bundled + run all tests including devenv tools
 
 # Individual test commands:
-bash test/run_tests.sh              # Run tests (requires web/nanovm.wasm)
+bash test/run_tests.sh              # Run tests (requires wasm/nano.wasm)
 bash test/run_tests.sh --build      # Build test ELFs first (needs riscv64 cross-compiler)
 bash test/run_tests.sh --verbose    # With instruction tracing
 
@@ -105,13 +106,13 @@ The build script is at `build/devenv/build.sh`. It uses a multi-stage Docker bui
 ## Running the Demo
 
 ```bash
-make demo         # Builds WASM with demo features + starts vite dev server
+make demo         # Builds bundled WASM + starts vite dev server
 ```
 
 This:
 1. Checks that `images/busybox`, `images/node`, and `build/devenv.tar.gz` exist
-2. Builds WASM with `--features demo` (embeds all three)
-3. Copies the WASM to `web/demo/public/nanovm.wasm`
+2. Builds WASM with all features (embeds all three)
+3. Copies `wasm/nano.wasm` to `web/demo/public/nano.wasm`
 4. Starts the Vite dev server
 
 Visit `http://localhost:5173/nano/` to see the demo.
@@ -119,8 +120,8 @@ Visit `http://localhost:5173/nano/` to see the demo.
 ### Manual demo setup
 
 ```bash
-make build-demo                          # Build the WASM
+make build                               # Build the bundled WASM
 mkdir -p web/demo/public
-cp web/nanovm.wasm web/demo/public/
+cp wasm/nano.wasm web/demo/public/
 cd web/demo && npm install && npm run dev
 ```

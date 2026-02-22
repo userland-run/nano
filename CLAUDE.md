@@ -9,13 +9,13 @@ NanoVM is a `#![no_std]` Rust WebAssembly emulator implementing an **RV64 RISC-V
 ## Build Commands
 
 ```bash
-make build          # Release build → web/nanovm.wasm
-make build-bundled  # Build with embedded devenv (Node.js, npm, tsc, eslint, prettier)
+make build          # Default: fully-bundled wasm/nano.wasm (busybox + node + devenv)
+make build-minimal  # Bare emulator (~585KB) — no bundled binaries
 make devenv         # Build devenv Docker image + extract tarball (slow first time)
-make clean          # cargo clean + remove web/nanovm.wasm
-make serve          # Build + serve web/ on localhost:8080
+make clean          # cargo clean + remove wasm/nano.wasm
+make serve          # Build + serve wasm/ on localhost:8080
 make demo           # Build + copy WASM to demo + start vite dev server
-make test           # Build + run all tests (ELF + MemFS + BusyBox)
+make test           # Build minimal + run all tests (ELF + MemFS + BusyBox)
 make test-devenv    # Build bundled + run all tests including devenv tools
 
 # Fast iteration (type-check only, no linking):
@@ -27,7 +27,7 @@ cargo check --target wasm32-unknown-unknown
 Tests are in `test/` and run via Node.js:
 
 ```bash
-bash test/run_tests.sh              # Run tests (requires web/nanovm.wasm)
+bash test/run_tests.sh              # Run tests (requires wasm/nano.wasm)
 bash test/run_tests.sh --build      # Build test ELFs first (requires cross-compiler)
 bash test/run_tests.sh --devenv     # Include devenv tool tests (requires bundled WASM + images/node)
 
@@ -51,7 +51,7 @@ node test/run.mjs images/busybox --trace --cmd ls /tmp
 - **Release profile**: `opt-level = "z"`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`
 - **Dev profile**: `opt-level = 1`, `codegen-units = 256` (fast incremental builds)
 - **WASM memory**: 1MB stack, 4MB initial, 512MB max (set in `.cargo/config.toml`)
-- **Features**: `devenv` — embeds `build/devenv.tar.gz` into the WASM data section
+- **Features**: `demo` (default) — embeds busybox + node + devenv into the WASM data section
 
 ## Architecture
 

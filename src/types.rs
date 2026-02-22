@@ -80,7 +80,7 @@ pub struct FsResponse {
 }
 
 /// Main VM struct - 12680 bytes total
-/// Offsets match reference nanovm.wasm binary for JS host compatibility.
+/// Offsets match reference nano.wasm binary for JS host compatibility.
 ///
 /// Layout:
 ///   0..560     CPU state (x, pc, f, fcsr, status, fault info)

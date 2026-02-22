@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "predeploy": "mkdir -p public/container && cp ../../container/nanovm.mjs ../../container/nanovm.wasm public/container/",
+    "predeploy": "mkdir -p public && cp ../../wasm/nano.wasm public/nano.wasm",
     "deploy": "npm run predeploy && npm run build && echo '' > dist/.gitignore && npx gh-pages -d dist --dotfiles --no-history"
   },
   "dependencies": {

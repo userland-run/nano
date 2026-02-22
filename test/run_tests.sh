@@ -5,14 +5,13 @@
 # Usage: bash test/run_tests.sh [--build] [--verbose] [--devenv]
 #   --build   Build test ELFs before running (requires cross-compiler)
 #   --verbose Pass --verbose to ELF runner for instruction tracing
-#   --devenv  Use bundled WASM for devenv tool tests (make build-bundled)
+#   --devenv  Include devenv tool tests (requires bundled WASM from 'make build')
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-WASM="$PROJECT_ROOT/web/nanovm.wasm"
-WASM_BUNDLED="$PROJECT_ROOT/target/wasm32-unknown-unknown/release/nanovm.wasm"
+WASM="$PROJECT_ROOT/wasm/nano.wasm"
 RUNNER="$SCRIPT_DIR/run.mjs"
 
 BUILD=0
@@ -177,21 +176,16 @@ echo ""
 
 echo "--- Devenv Tool Tests ---"
 NODE_BIN="$PROJECT_ROOT/images/node"
-BUNDLED_WASM="$PROJECT_ROOT/target/wasm32-unknown-unknown/release/nanovm.wasm"
 
-# Devenv tests need: bundled WASM + node binary
-# Use --devenv flag to opt in, or auto-detect if web/nanovm.wasm is bundled (>1MB)
+# Devenv tests need: bundled WASM (>1MB) + node binary + --devenv flag
 WASM_SIZE=$(wc -c < "$WASM" | tr -d ' ')
 HAS_BUNDLED=0
-if [ "$DEVENV" -eq 1 ] && [ -f "$BUNDLED_WASM" ]; then
+if [ "$DEVENV" -eq 1 ] && [ "$WASM_SIZE" -gt 1000000 ]; then
     HAS_BUNDLED=1
-elif [ "$WASM_SIZE" -gt 1000000 ]; then
-    HAS_BUNDLED=1
-    BUNDLED_WASM="$WASM"
 fi
 
 if [ "$HAS_BUNDLED" -eq 0 ]; then
-    skip "Devenv tool tests" "no bundled WASM - run 'make build-bundled' then use --devenv"
+    skip "Devenv tool tests" "no bundled WASM - run 'make build' then use --devenv"
 elif [ ! -f "$NODE_BIN" ]; then
     skip "Devenv tool tests" "images/node binary not found"
 else
@@ -201,7 +195,7 @@ else
         local timeout_secs="${4:-120}"
 
         local output exit_code
-        output=$(NANOVM_WASM="$BUNDLED_WASM" NANOVM_RAM_MB=1800 timeout "$timeout_secs" node "$RUNNER" "$NODE_BIN" --cmd node "$js_path" --version 2>/dev/null)
+        output=$(NANOVM_WASM="$WASM" NANOVM_RAM_MB=1800 timeout "$timeout_secs" node "$RUNNER" "$NODE_BIN" --cmd node "$js_path" --version 2>/dev/null)
         exit_code=$?
 
         if [ $exit_code -eq 124 ]; then
@@ -220,7 +214,7 @@ else
         local timeout_secs="${4:-120}"
 
         local output exit_code
-        output=$(NANOVM_WASM="$BUNDLED_WASM" NANOVM_RAM_MB=1800 timeout "$timeout_secs" node "$RUNNER" "$NODE_BIN" --cmd node -e "$script" 2>/dev/null)
+        output=$(NANOVM_WASM="$WASM" NANOVM_RAM_MB=1800 timeout "$timeout_secs" node "$RUNNER" "$NODE_BIN" --cmd node -e "$script" 2>/dev/null)
         exit_code=$?
 
         if [ $exit_code -eq 124 ]; then

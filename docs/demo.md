@@ -22,7 +22,7 @@ The demo is a browser-based IDE that runs Node.js and BusyBox inside the RISC-V 
 │              └───────┬────────┘                  │
 │                      │                           │
 │              ┌───────▼────────┐                  │
-│              │  nanovm.wasm   │ RV64 Emulator    │
+│              │   nano.wasm    │ RV64 Emulator    │
 │              └────────────────┘                  │
 │                                                  │
 │  ┌─ Service Worker (sw.js) ──────────────────┐  │
@@ -38,7 +38,7 @@ The demo is a browser-based IDE that runs Node.js and BusyBox inside the RISC-V 
 web/demo/
 ├── index.html
 ├── public/
-│   ├── nanovm.wasm          ← copied by `make demo`
+│   ├── nano.wasm            ← copied by `make demo`
 │   └── sw.js                ← Service Worker
 ├── src/
 │   ├── App.tsx              ← Main app (VM init, file open, run/stop)
@@ -68,7 +68,7 @@ container/                   ← Shared between demo and tests
 ### Startup
 
 1. `App.tsx` calls `ensureVM()` which creates a `NanoVM` instance
-2. NanoVM fetches `nanovm.wasm`, instantiates it, creates a VM with 512MB RAM
+2. NanoVM fetches `nano.wasm`, instantiates it, creates a VM with 512MB RAM
 3. Bundled ELFs (busybox, node) are detected and loaded from the WASM data section
 4. If the devenv tarball is bundled, it's extracted into the VFS
 5. Example files from `examples.ts` are written into the VFS at `/examples/`

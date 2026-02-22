@@ -23,7 +23,7 @@ node_modules
 
 # Build artifacts
 build/devenv.tar.gz
-web/nanovm.wasm
+web/demo/public/nano.wasm
 
 .claude
 CLAUDE.md

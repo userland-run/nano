@@ -16,7 +16,7 @@ const root = resolve(__dirname, "..");
 
 // --- Load binaries ---
 const elfPath = process.argv[2] || resolve(__dirname, "hello.elf");
-const wasmPath = process.env.NANOVM_WASM || resolve(root, "web/nanovm.wasm");
+const wasmPath = process.env.NANOVM_WASM || resolve(root, "wasm/nano.wasm");
 
 const wasmBytes = readFileSync(wasmPath);
 const elfBytes = readFileSync(elfPath);

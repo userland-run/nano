@@ -17,8 +17,8 @@ export async function ensureVM(): Promise<any> {
 
   initPromise = (async () => {
     vmInstance = await NanoVM.create({
-      ramMB: 512,
-      wasm: import.meta.env.BASE_URL + "nanovm.wasm",
+      ramMB: 1500,
+      wasm: import.meta.env.BASE_URL + "nano.wasm",
     });
 
     // Load bundled devenv tarball if available
@@ -57,7 +57,7 @@ export async function runBusybox(
   return vm.run(command, {
     onStdout: opts.onStdout,
     stdin: opts.stdin,
-    maxSteps: 2_000_000,
+    maxSteps: 20_000_000,
   });
 }
 
@@ -69,7 +69,7 @@ export async function runNode(
   return vm.node(...args, {
     onStdout: opts.onStdout,
     stdin: opts.stdin,
-    maxSteps: opts.maxSteps || 2_000_000,
+    maxSteps: opts.maxSteps || 2_000_000_000,
   });
 }
 

@@ -105,7 +105,7 @@ export default function App() {
         let result;
         if (cmd.startsWith("node ")) {
           const args = cmd.slice(5).split(/\s+/);
-          result = await runtime.runNode(args, { onStdout, maxSteps: 50_000_000 });
+          result = await runtime.runNode(args, { onStdout, maxSteps: 2_000_000_000 });
         } else {
           result = await runtime.runBusybox(cmd, { onStdout });
         }
