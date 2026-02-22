@@ -23,6 +23,8 @@ node_modules
 
 # Build artifacts
 build/devenv.tar.gz
+build/busybox.gz
+build/node.gz
 
 .claude
 CLAUDE.md

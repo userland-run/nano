@@ -8,6 +8,8 @@ build:
 	@test -f images/busybox || (echo "ERROR: images/busybox not found." && exit 1)
 	@test -f images/node || (echo "ERROR: images/node not found." && exit 1)
 	@test -f build/devenv.tar.gz || (echo "ERROR: build/devenv.tar.gz not found. Run 'make devenv' first." && exit 1)
+	gzip -9 -k -f images/busybox && mv images/busybox.gz build/busybox.gz
+	gzip -9 -k -f images/node && mv images/node.gz build/node.gz
 	cargo build --target $(WASM_TARGET) --release
 	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.wasm
 

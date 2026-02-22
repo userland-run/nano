@@ -148,8 +148,8 @@ class NanoVM {
     this._memfs = new MemFS();
     this._seedFS();
 
-    // Load bundled ELFs if available
-    this._loadBundledElfs();
+    // Load bundled ELFs if available (decompresses gzipped data)
+    await this._loadBundledElfs();
 
     // Fetch external ELFs if needed and URLs provided
     if (!this._busyboxElf && busyboxUrl) {
@@ -218,28 +218,56 @@ class NanoVM {
     m.createFile("/test/nums.txt", "1\n2\n3\n4\n5\n");
   }
 
-  _loadBundledElfs() {
+  async _gunzip(compressed) {
+    const ds = new DecompressionStream("gzip");
+    const writer = ds.writable.getWriter();
+    const reader = ds.readable.getReader();
+    const chunks = [];
+    const readAll = (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+    })();
+    writer.write(compressed);
+    writer.close();
+    await readAll;
+    const totalLen = chunks.reduce((a, c) => a + c.length, 0);
+    const result = new Uint8Array(totalLen);
+    let off = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, off);
+      off += chunk.length;
+    }
+    return result;
+  }
+
+  async _loadBundledElfs() {
     const X = this._exports;
 
-    // Bundled busybox
+    // Bundled busybox (gzip-compressed)
     const bbPtr = typeof X.vm_bundled_busybox_ptr === "function" ? X.vm_bundled_busybox_ptr() : 0;
     const bbSize = typeof X.vm_bundled_busybox_size === "function" ? X.vm_bundled_busybox_size() : 0;
     if (bbPtr > 0 && bbSize > 0) {
-      this._busyboxElf = new Uint8Array(this._memory.buffer, bbPtr, bbSize).slice();
+      const compressed = new Uint8Array(this._memory.buffer, bbPtr, bbSize).slice();
+      this._busyboxElf = await this._gunzip(compressed);
     }
 
-    // Bundled node
+    // Bundled node (gzip-compressed)
     const nodePtr = typeof X.vm_bundled_node_ptr === "function" ? X.vm_bundled_node_ptr() : 0;
     const nodeSize = typeof X.vm_bundled_node_size === "function" ? X.vm_bundled_node_size() : 0;
     if (nodePtr > 0 && nodeSize > 0) {
-      this._nodeElf = new Uint8Array(this._memory.buffer, nodePtr, nodeSize).slice();
+      const compressed = new Uint8Array(this._memory.buffer, nodePtr, nodeSize).slice();
+      this._nodeElf = await this._gunzip(compressed);
     }
 
-    // Generic bundled ELF (fallback for both)
+    // Generic bundled ELF (fallback for both — also gzip-compressed)
     const elfPtr = typeof X.vm_bundled_elf_ptr === "function" ? X.vm_bundled_elf_ptr() : 0;
     const elfSize = typeof X.vm_bundled_elf_size === "function" ? X.vm_bundled_elf_size() : 0;
     if (elfPtr > 0 && elfSize > 0) {
-      const elfBytes = new Uint8Array(this._memory.buffer, elfPtr, elfSize).slice();
+      const compressed = new Uint8Array(this._memory.buffer, elfPtr, elfSize).slice();
+      const elfBytes = await this._gunzip(compressed);
       if (!this._busyboxElf) this._busyboxElf = elfBytes;
       if (!this._nodeElf) this._nodeElf = elfBytes;
     }
