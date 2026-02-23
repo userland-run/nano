@@ -10,6 +10,588 @@ extern "C" {
 }
 
 // =====================================================================
+// Basic Block Cache — pre-decoded instruction sequences for hot loops
+// =====================================================================
+
+const MAX_BLOCK_OPS: usize = 32;
+const BLOCK_CACHE_SIZE: usize = 4096; // direct-mapped, power-of-2
+
+// Op IDs — dense u8 identifiers for pre-decoded instructions
+const OP_LD: u8 = 0;
+const OP_LW: u8 = 1;
+const OP_LWU: u8 = 2;
+const OP_LOAD_OTHER: u8 = 3; // LB/LBU/LH/LHU — dispatch by f3
+const OP_SD: u8 = 4;
+const OP_SW: u8 = 5;
+const OP_STORE_OTHER: u8 = 6; // SB/SH — dispatch by f3
+const OP_ADDI: u8 = 7;
+const OP_ANDI: u8 = 8;
+const OP_ORI: u8 = 9;
+const OP_XORI: u8 = 10;
+const OP_SLTI: u8 = 11; // SLTI/SLTIU by f3
+const OP_SLLI: u8 = 12;
+const OP_SRLI: u8 = 13;
+const OP_SRAI: u8 = 14;
+const OP_ADDIW: u8 = 15;
+const OP_IMM32_SHIFT: u8 = 16; // SLLIW/SRLIW/SRAIW
+const OP_ADD: u8 = 17;
+const OP_SUB: u8 = 18;
+const OP_OP_BITWISE: u8 = 19; // AND/OR/XOR by f3
+const OP_OP_SHIFT: u8 = 20; // SLL/SRL/SRA by f3+f7b5
+const OP_OP_CMP: u8 = 21; // SLT/SLTU by f3
+const OP_MUL: u8 = 22; // MUL/MULH/MULHSU/MULHU by f3
+const OP_DIV: u8 = 23; // DIV/DIVU/REM/REMU by f3
+const OP_ADDW: u8 = 24;
+const OP_SUBW: u8 = 25;
+const OP_OP32_SHIFT: u8 = 26; // SLLW/SRLW/SRAW
+const OP_OP32_MULDIV: u8 = 27; // MULW/DIVW/REMW
+const OP_LUI: u8 = 28;
+const OP_AUIPC: u8 = 29;
+const OP_JAL: u8 = 30; // terminator
+const OP_JALR: u8 = 31; // terminator
+const OP_BEQ: u8 = 32; // terminator
+const OP_BNE: u8 = 33; // terminator
+const OP_BRANCH_OTHER: u8 = 34; // BLT/BGE/BLTU/BGEU — terminator
+const OP_ECALL: u8 = 35; // terminator
+const OP_FENCE: u8 = 36;
+const OP_CSR: u8 = 37;
+const OP_FP_LOAD: u8 = 38; // FLD/FLW
+const OP_FP_STORE: u8 = 39; // FSD/FSW
+const OP_FP_OP: u8 = 40; // all FP ops — imm = raw insn
+const OP_AMO: u8 = 41; // all AMO — imm = raw insn
+const OP_UNKNOWN: u8 = 63; // fallback — terminates block
+
+// Packed instruction: single u64 per op
+// Upper 32 bits: op_id:8 | rd:5 | rs1:5 | rs2:5 | f3:3 | f7b5:1 | step4:1 | reserved:4
+// Lower 32 bits: pre-extracted immediate (as u32, interpret as i32)
+//
+// step4: 0 = step is 2 (RVC origin), 1 = step is 4 (32-bit)
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BlockEntry {
+    start_pc: u64,                      // tag (0 = empty slot)
+    packed: [u64; MAX_BLOCK_OPS],       // packed op+imm (1 load per insn)
+    len: u16,                           // number of ops
+    total_budget: u16,                  // instruction count (for budget)
+    _pad: u32,
+}
+
+const EMPTY_BLOCK: BlockEntry = BlockEntry {
+    start_pc: 0,
+    packed: [0; MAX_BLOCK_OPS],
+    len: 0,
+    total_budget: 0,
+    _pad: 0,
+};
+
+static mut BLOCKS: [BlockEntry; BLOCK_CACHE_SIZE] = [EMPTY_BLOCK; BLOCK_CACHE_SIZE];
+/// Clear the block cache (call on program load or self-modifying code)
+pub fn reset_blocks() {
+    unsafe {
+        for i in 0..BLOCK_CACHE_SIZE {
+            BLOCKS[i].start_pc = 0;
+        }
+    }
+}
+
+/// Classify a 32-bit instruction into (op_id, immediate)
+#[inline(always)]
+fn classify_insn(insn: u32) -> (u8, i32) {
+    let opcode = insn & 0x7f;
+    let opcode_5 = (opcode >> 2) & 0x1f;
+    let funct3 = (insn >> 12) & 0x7;
+    let funct7 = (insn >> 25) & 0x7f;
+
+    match opcode_5 {
+        // LOAD
+        0x00 => {
+            let imm = imm_i(insn);
+            match funct3 {
+                3 => (OP_LD, imm),
+                2 => (OP_LW, imm),
+                6 => (OP_LWU, imm),
+                _ => (OP_LOAD_OTHER, imm),
+            }
+        }
+        // LOAD-FP
+        0x01 => (OP_FP_LOAD, imm_i(insn)),
+        // FENCE
+        0x03 => (OP_FENCE, 0),
+        // OP-IMM
+        0x04 => {
+            let imm = imm_i(insn);
+            match funct3 {
+                0 => (OP_ADDI, imm),
+                7 => (OP_ANDI, imm),
+                6 => (OP_ORI, imm),
+                4 => (OP_XORI, imm),
+                2 | 3 => (OP_SLTI, imm),
+                1 => (OP_SLLI, imm),
+                5 => {
+                    if (insn >> 26) & 0x10 != 0 { (OP_SRAI, imm) } else { (OP_SRLI, imm) }
+                }
+                _ => (OP_UNKNOWN, 0),
+            }
+        }
+        // AUIPC
+        0x05 => (OP_AUIPC, (insn & 0xFFFFF000) as i32),
+        // OP-IMM-32
+        0x06 => {
+            let imm = imm_i(insn);
+            match funct3 {
+                0 => (OP_ADDIW, imm),
+                1 | 5 => (OP_IMM32_SHIFT, imm),
+                _ => (OP_UNKNOWN, 0),
+            }
+        }
+        // STORE
+        0x08 => {
+            let imm = imm_s(insn);
+            match funct3 {
+                3 => (OP_SD, imm),
+                2 => (OP_SW, imm),
+                _ => (OP_STORE_OTHER, imm),
+            }
+        }
+        // STORE-FP
+        0x09 => (OP_FP_STORE, imm_s(insn)),
+        // AMO
+        0x0B => (OP_AMO, insn as i32),
+        // OP
+        0x0C => {
+            if funct7 == 1 {
+                // M-extension
+                if funct3 < 4 { (OP_MUL, 0) } else { (OP_DIV, 0) }
+            } else {
+                match funct3 {
+                    0 => if funct7 == 0x20 { (OP_SUB, 0) } else { (OP_ADD, 0) },
+                    4 | 6 | 7 => (OP_OP_BITWISE, 0),
+                    1 | 5 => (OP_OP_SHIFT, 0),
+                    2 | 3 => (OP_OP_CMP, 0),
+                    _ => (OP_UNKNOWN, 0),
+                }
+            }
+        }
+        // LUI
+        0x0D => (OP_LUI, (insn & 0xFFFFF000) as i32),
+        // OP-32
+        0x0E => {
+            if funct7 == 1 {
+                (OP_OP32_MULDIV, 0)
+            } else {
+                match funct3 {
+                    0 => if funct7 == 0x20 { (OP_SUBW, 0) } else { (OP_ADDW, 0) },
+                    1 | 5 => (OP_OP32_SHIFT, 0),
+                    _ => (OP_UNKNOWN, 0),
+                }
+            }
+        }
+        // FMADD/FMSUB/FNMSUB/FNMADD/OP-FP
+        0x10 | 0x11 | 0x12 | 0x13 | 0x14 => (OP_FP_OP, insn as i32),
+        // BRANCH
+        0x18 => {
+            let imm = imm_b(insn);
+            match funct3 {
+                0 => (OP_BEQ, imm),
+                1 => (OP_BNE, imm),
+                _ => (OP_BRANCH_OTHER, imm),
+            }
+        }
+        // JALR
+        0x19 => (OP_JALR, (insn as i32) >> 20),
+        // JAL
+        0x1B => (OP_JAL, imm_j(insn)),
+        // SYSTEM
+        0x1C => {
+            if funct3 == 0 {
+                if insn == 0x00000073 { (OP_ECALL, 0) }
+                else { (OP_UNKNOWN, 0) }
+            } else {
+                (OP_CSR, insn as i32)
+            }
+        }
+        _ => (OP_UNKNOWN, 0),
+    }
+}
+
+// =====================================================================
+// Block builder — pre-decode instructions into packed op arrays
+// =====================================================================
+
+#[inline(never)] // cold path, don't bloat exec()
+unsafe fn build_block(blk: &mut BlockEntry, start_pc: u64, base: u32) {
+    blk.start_pc = start_pc;
+    let mut pc = start_pc;
+    let mut count = 0u16;
+    let mut total = 0u16;
+
+    while (count as usize) < MAX_BLOCK_OPS {
+        let raw = ((base + pc as u32) as *const u32).read_unaligned();
+        let (insn, step): (u32, u8) = if raw & 3 != 3 {
+            let expanded = decode::expand_compressed(raw as u16);
+            if expanded == 0 { break; }
+            (expanded, 2)
+        } else {
+            (raw, 4)
+        };
+
+        let (op_id, imm) = classify_insn(insn);
+        if op_id == OP_UNKNOWN { break; }
+
+        // Non-integer ops: end block BEFORE adding (baseline interpreter handles them)
+        match op_id {
+            OP_FP_LOAD | OP_FP_STORE | OP_FP_OP | OP_AMO | OP_CSR => break,
+            _ => {}
+        }
+
+        let rd = ((insn >> 7) & 0x1f) as u32;
+        let rs1 = ((insn >> 15) & 0x1f) as u32;
+        let rs2 = ((insn >> 20) & 0x1f) as u32;
+        let f3 = ((insn >> 12) & 0x7) as u32;
+        let f7_bit5 = ((insn >> 30) & 1) as u32;
+
+        let step4 = if step == 4 { 1u32 } else { 0u32 };
+        let op_word = op_id as u32
+            | (rd << 8)
+            | (rs1 << 13)
+            | (rs2 << 18)
+            | (f3 << 23)
+            | (f7_bit5 << 26)
+            | (step4 << 27);
+
+        let idx = count as usize;
+        blk.packed[idx] = ((op_word as u64) << 32) | (imm as u32 as u64);
+        count += 1;
+        total += step as u16;
+        pc = pc.wrapping_add(step as u64);
+
+        // Stop at terminators (included in block — exec_block has handlers)
+        match op_id {
+            OP_JAL | OP_JALR | OP_BEQ | OP_BNE | OP_BRANCH_OTHER | OP_ECALL => break,
+            _ => {}
+        }
+    }
+
+    blk.len = count;
+    blk.total_budget = count; // match main loop: 1 budget per instruction
+}
+
+// =====================================================================
+// Block runner — execute pre-decoded blocks with minimal dispatch
+// =====================================================================
+
+#[inline(always)]
+unsafe fn exec_block(
+    blk: &BlockEntry,
+    base: u32,
+    x: &mut [u64; 32],
+    _f: &mut [u64; 32],
+    _fcsr: &mut u32,
+    vm: &mut Vm,
+    remaining: &mut i32,
+) -> u64 {
+    let mut pc = blk.start_pc;
+
+    loop {
+        // Budget check once per block iteration
+        if *remaining < blk.total_budget as i32 {
+            break;
+        }
+        *remaining -= blk.total_budget as i32;
+
+        pc = blk.start_pc;
+        let mut i = 0usize;
+        let len = blk.len as usize;
+        let mut loop_back = false;
+
+        while i < len {
+            let p = blk.packed[i];
+            let op = (p >> 32) as u32;
+            let imm = p as u32 as i32;
+            let step: u64 = if op & (1 << 27) != 0 { 4 } else { 2 };
+            let op_id = (op & 0xFF) as u8;
+            let rd = ((op >> 8) & 0x1f) as usize;
+            let rs1 = ((op >> 13) & 0x1f) as usize;
+            let rs2 = ((op >> 18) & 0x1f) as usize;
+            let f3 = (op >> 23) & 0x7;
+            let f7b5 = (op >> 26) & 1;
+
+            // Integer-only block dispatch — no FP/AMO/CSR handlers
+            // (blocks are terminated before those ops in build_block)
+            match op_id {
+                OP_LD => {
+                    let addr = x[rs1].wrapping_add(imm as i64 as u64);
+                    if rd != 0 { x[rd] = mem::read_u64(base, addr); }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_LW => {
+                    let addr = x[rs1].wrapping_add(imm as i64 as u64);
+                    if rd != 0 { x[rd] = mem::read_i32(base, addr) as i64 as u64; }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_LWU => {
+                    let addr = x[rs1].wrapping_add(imm as i64 as u64);
+                    if rd != 0 { x[rd] = mem::read_u32(base, addr) as u64; }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_LOAD_OTHER => {
+                    let addr = x[rs1].wrapping_add(imm as i64 as u64);
+                    if rd != 0 {
+                        x[rd] = match f3 {
+                            0 => mem::read_i8(base, addr) as i64 as u64,
+                            1 => mem::read_i16(base, addr) as i64 as u64,
+                            4 => mem::read_u8(base, addr) as u64,
+                            5 => mem::read_u16(base, addr) as u64,
+                            _ => 0,
+                        };
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_SD => {
+                    let addr = x[rs1].wrapping_add(imm as i64 as u64);
+                    mem::write_u64(base, addr, x[rs2]);
+                    pc = pc.wrapping_add(step);
+                }
+                OP_SW => {
+                    let addr = x[rs1].wrapping_add(imm as i64 as u64);
+                    mem::write_u32(base, addr, x[rs2] as u32);
+                    pc = pc.wrapping_add(step);
+                }
+                OP_STORE_OTHER => {
+                    let addr = x[rs1].wrapping_add(imm as i64 as u64);
+                    match f3 {
+                        0 => mem::write_u8(base, addr, x[rs2] as u8),
+                        1 => mem::write_u16(base, addr, x[rs2] as u16),
+                        _ => {}
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_ADDI => {
+                    if rd != 0 { x[rd] = x[rs1].wrapping_add(imm as i64 as u64); }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_ANDI => {
+                    if rd != 0 { x[rd] = x[rs1] & (imm as i64 as u64); }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_ORI => {
+                    if rd != 0 { x[rd] = x[rs1] | (imm as i64 as u64); }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_XORI => {
+                    if rd != 0 { x[rd] = x[rs1] ^ (imm as i64 as u64); }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_SLTI => {
+                    if rd != 0 {
+                        x[rd] = if f3 == 2 {
+                            if (x[rs1] as i64) < (imm as i64) { 1 } else { 0 }
+                        } else {
+                            if x[rs1] < (imm as i64 as u64) { 1 } else { 0 }
+                        };
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_SLLI => {
+                    if rd != 0 {
+                        let shamt = (imm as u32) & 0x3f;
+                        x[rd] = x[rs1] << shamt;
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_SRLI => {
+                    if rd != 0 {
+                        let shamt = (imm as u32) & 0x3f;
+                        x[rd] = x[rs1] >> shamt;
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_SRAI => {
+                    if rd != 0 {
+                        let shamt = (imm as u32) & 0x3f;
+                        x[rd] = ((x[rs1] as i64) >> shamt) as u64;
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_ADDIW => {
+                    if rd != 0 {
+                        x[rd] = (x[rs1] as i32).wrapping_add(imm as i32) as i64 as u64;
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_IMM32_SHIFT => {
+                    if rd != 0 {
+                        let v = x[rs1] as i32;
+                        let shamt = (imm as u32) & 0x1f;
+                        x[rd] = (match f3 {
+                            1 => v << shamt,                                    // SLLIW
+                            5 => if f7b5 != 0 { v >> shamt }                  // SRAIW
+                                 else { ((v as u32) >> shamt) as i32 },        // SRLIW
+                            _ => v,
+                        }) as i64 as u64;
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_ADD => {
+                    if rd != 0 { x[rd] = x[rs1].wrapping_add(x[rs2]); }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_SUB => {
+                    if rd != 0 { x[rd] = x[rs1].wrapping_sub(x[rs2]); }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_OP_BITWISE => {
+                    if rd != 0 {
+                        x[rd] = match f3 {
+                            4 => x[rs1] ^ x[rs2],
+                            6 => x[rs1] | x[rs2],
+                            7 => x[rs1] & x[rs2],
+                            _ => x[rs1],
+                        };
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_OP_SHIFT => {
+                    if rd != 0 {
+                        let shamt = (x[rs2] & 0x3f) as u32;
+                        x[rd] = match f3 {
+                            1 => x[rs1] << shamt,
+                            5 => if f7b5 != 0 { ((x[rs1] as i64) >> shamt) as u64 }
+                                 else { x[rs1] >> shamt },
+                            _ => x[rs1],
+                        };
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_OP_CMP => {
+                    if rd != 0 {
+                        x[rd] = match f3 {
+                            2 => if (x[rs1] as i64) < (x[rs2] as i64) { 1 } else { 0 },
+                            3 => if x[rs1] < x[rs2] { 1 } else { 0 },
+                            _ => 0,
+                        };
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_MUL => {
+                    if rd != 0 { x[rd] = exec_mul_div_64(x[rs1], x[rs2], f3); }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_DIV => {
+                    if rd != 0 { x[rd] = exec_mul_div_64(x[rs1], x[rs2], f3); }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_ADDW => {
+                    if rd != 0 { x[rd] = (x[rs1] as i32).wrapping_add(x[rs2] as i32) as i64 as u64; }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_SUBW => {
+                    if rd != 0 { x[rd] = (x[rs1] as i32).wrapping_sub(x[rs2] as i32) as i64 as u64; }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_OP32_SHIFT => {
+                    if rd != 0 {
+                        let v = x[rs1] as i32;
+                        let shamt = (x[rs2] & 0x1f) as u32;
+                        x[rd] = (match f3 {
+                            1 => v << shamt,
+                            5 => if f7b5 != 0 { v >> shamt } else { ((v as u32) >> shamt) as i32 },
+                            _ => v,
+                        }) as i64 as u64;
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_OP32_MULDIV => {
+                    if rd != 0 { x[rd] = exec_mul_div_32(x[rs1] as i32, x[rs2] as i32, f3); }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_LUI => {
+                    if rd != 0 { x[rd] = imm as i64 as u64; }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_AUIPC => {
+                    if rd != 0 { x[rd] = pc.wrapping_add(imm as i64 as u64); }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_FENCE => {
+                    pc = pc.wrapping_add(step);
+                }
+                // === Terminators ===
+                OP_JAL => {
+                    if rd != 0 { x[rd] = pc.wrapping_add(step); }
+                    let target = pc.wrapping_add(imm as i64 as u64);
+                    if target == blk.start_pc {
+                        loop_back = true;
+                        break;
+                    }
+                    x[0] = 0;
+                    return target;
+                }
+                OP_JALR => {
+                    let target = x[rs1].wrapping_add(imm as i64 as u64) & !1;
+                    if rd != 0 { x[rd] = pc.wrapping_add(step); }
+                    x[0] = 0;
+                    return target;
+                }
+                OP_BEQ => {
+                    if x[rs1] == x[rs2] {
+                        let target = pc.wrapping_add(imm as i64 as u64);
+                        if target == blk.start_pc { loop_back = true; break; }
+                        x[0] = 0;
+                        return target;
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_BNE => {
+                    if x[rs1] != x[rs2] {
+                        let target = pc.wrapping_add(imm as i64 as u64);
+                        if target == blk.start_pc { loop_back = true; break; }
+                        x[0] = 0;
+                        return target;
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_BRANCH_OTHER => {
+                    let taken = match f3 {
+                        4 => (x[rs1] as i64) < (x[rs2] as i64),
+                        5 => (x[rs1] as i64) >= (x[rs2] as i64),
+                        6 => x[rs1] < x[rs2],
+                        7 => x[rs1] >= x[rs2],
+                        _ => false,
+                    };
+                    if taken {
+                        let target = pc.wrapping_add(imm as i64 as u64);
+                        if target == blk.start_pc { loop_back = true; break; }
+                        x[0] = 0;
+                        return target;
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_ECALL => {
+                    vm.x = *x; vm.pc = pc.wrapping_add(step);
+                    vm.f = *_f; vm.fcsr = *_fcsr;
+                    syscall::handle(vm);
+                    *x = vm.x; pc = vm.pc; *_f = vm.f; *_fcsr = vm.fcsr;
+                    x[0] = 0;
+                    return pc;
+                }
+                _ => {
+                    pc = pc.wrapping_add(step);
+                }
+            }
+            i += 1;
+        }
+        if !loop_back {
+            break;
+        }
+        // loop_back: branch went to start_pc, re-check budget and re-execute
+    }
+    x[0] = 0;
+    pc
+}
+
+// =====================================================================
 // RVC immediate helpers — extract offsets/immediates directly from
 // the 16-bit compressed instruction (as u32 for ergonomics)
 // =====================================================================
@@ -134,13 +716,13 @@ fn c_addi4spn_v(i: u32) -> u64 {
 
 #[inline(always)]
 unsafe fn try_exec_rvc(
-    hw: u16,
+    raw: u32,
     base: u32,
     x: &mut [u64; 32],
     f: &mut [u64; 32],
     pc: &mut u64,
 ) -> bool {
-    let i = hw as u32;
+    let i = raw & 0xFFFF;
     let op = i & 0x3;
     let f3 = (i >> 13) & 0x7;
 
@@ -217,7 +799,27 @@ unsafe fn try_exec_rvc(
         // C.NOP / C.ADDI
         8 => {
             let rd = ((i >> 7) & 0x1f) as usize;
-            if rd != 0 { x[rd] = x[rd].wrapping_add(c_imm6s(i) as u64); }
+            if rd != 0 {
+                x[rd] = x[rd].wrapping_add(c_imm6s(i) as u64);
+                // Fusion: C.ADDI + C.BEQZ/C.BNEZ (loop counter pattern)
+                // Only fuse forward branches — backward branches go through block cache
+                let next_hw = raw >> 16;
+                if next_hw & 0xC003 == 0xC001 {
+                    let br_rs1 = (((next_hw >> 7) & 0x7) + 8) as usize;
+                    if br_rs1 == rd {
+                        let off = c_br_off(next_hw);
+                        if off >= 0 {
+                            let cond = if next_hw & 0x2000 != 0 { x[rd] != 0 } else { x[rd] == 0 };
+                            if cond {
+                                *pc = (*pc + 2).wrapping_add(off as u64);
+                            } else {
+                                *pc = pc.wrapping_add(4);
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
             *pc = pc.wrapping_add(2);
             true
         }
@@ -226,6 +828,23 @@ unsafe fn try_exec_rvc(
             let rd = ((i >> 7) & 0x1f) as usize;
             if rd == 0 { return false; }
             x[rd] = (x[rd] as i32).wrapping_add(c_imm6s(i) as i32) as i64 as u64;
+            // Fusion: C.ADDIW + C.BEQZ/C.BNEZ — only fuse forward branches
+            let next_hw = raw >> 16;
+            if next_hw & 0xC003 == 0xC001 {
+                let br_rs1 = (((next_hw >> 7) & 0x7) + 8) as usize;
+                if br_rs1 == rd {
+                    let off = c_br_off(next_hw);
+                    if off >= 0 {
+                        let cond = if next_hw & 0x2000 != 0 { x[rd] != 0 } else { x[rd] == 0 };
+                        if cond {
+                            *pc = (*pc + 2).wrapping_add(off as u64);
+                        } else {
+                            *pc = pc.wrapping_add(4);
+                        }
+                        return true;
+                    }
+                }
+            }
             *pc = pc.wrapping_add(2);
             true
         }
@@ -243,6 +862,11 @@ unsafe fn try_exec_rvc(
                 let imm = c_addi16sp(i);
                 if imm == 0 { return false; }
                 x[2] = x[2].wrapping_add(imm as u64);
+                // Fusion: C.ADDI16SP + C.JR ra (function epilogue pattern)
+                if raw >> 16 == 0x8082 {
+                    *pc = x[1] & !1;
+                    return true;
+                }
             } else if rd != 0 {
                 let imm = c_lui_v(i);
                 if imm == 0 { return false; }
@@ -280,14 +904,18 @@ unsafe fn try_exec_rvc(
         }
         // C.J
         13 => {
-            *pc = pc.wrapping_add(c_j_off(i) as u64);
+            let off = c_j_off(i);
+            if off < 0 { return false; } // backward jump — fall through to block cache
+            *pc = pc.wrapping_add(off as u64);
             true
         }
         // C.BEQZ
         14 => {
             let rs1 = (((i >> 7) & 0x7) + 8) as usize;
             if x[rs1] == 0 {
-                *pc = pc.wrapping_add(c_br_off(i) as u64);
+                let off = c_br_off(i);
+                if off < 0 { return false; } // backward — fall through to block cache
+                *pc = pc.wrapping_add(off as u64);
             } else {
                 *pc = pc.wrapping_add(2);
             }
@@ -297,7 +925,9 @@ unsafe fn try_exec_rvc(
         15 => {
             let rs1 = (((i >> 7) & 0x7) + 8) as usize;
             if x[rs1] != 0 {
-                *pc = pc.wrapping_add(c_br_off(i) as u64);
+                let off = c_br_off(i);
+                if off < 0 { return false; } // backward — fall through to block cache
+                *pc = pc.wrapping_add(off as u64);
             } else {
                 *pc = pc.wrapping_add(2);
             }
@@ -336,6 +966,15 @@ unsafe fn try_exec_rvc(
             if rd == 0 { return false; }
             let addr = x[2].wrapping_add(c_ldsp_off(i));
             x[rd] = ((base + addr as u32) as *const u64).read_unaligned();
+            // Fusion: C.LDSP + C.JR (load + indirect jump pattern)
+            let next_hw = raw >> 16;
+            if next_hw & 0xF07F == 0x8002 {
+                let jr_rs1 = ((next_hw >> 7) & 0x1f) as usize;
+                if jr_rs1 == rd {
+                    *pc = x[rd] & !1;
+                    return true;
+                }
+            }
             *pc = pc.wrapping_add(2);
             true
         }
@@ -432,8 +1071,7 @@ pub unsafe fn exec(vm: &mut Vm, budget: i32) -> i32 {
 
         if raw & 0x3 != 0x3 {
             // 16-bit compressed instruction — try direct dispatch
-            if try_exec_rvc(raw as u16, base, &mut x, &mut f, &mut pc) {
-                x[0] = 0;
+            if try_exec_rvc(raw, base, &mut x, &mut f, &mut pc) {
                 continue;
             }
             // Fallback: expand to 32-bit
@@ -551,7 +1189,22 @@ pub unsafe fn exec(vm: &mut Vm, budget: i32) -> i32 {
                 let taken = exec_branch(&x, funct3, rs1, rs2);
                 if taken {
                     let imm = imm_b(insn);
-                    pc = pc.wrapping_add(imm as i64 as u64);
+                    let target = pc.wrapping_add(imm as i64 as u64);
+                    if imm < 0 {
+                        // Backward branch — check block cache
+                        let idx = (target >> 1) as usize & (BLOCK_CACHE_SIZE - 1);
+                        let blk = &mut BLOCKS[idx];
+                        if blk.start_pc == target || blk.start_pc == 0 {
+                            if blk.start_pc == 0 { build_block(blk, target, base); }
+                            pc = exec_block(blk, base, &mut x, &mut f, &mut fcsr, vm, &mut remaining);
+                            if vm.status != STATUS_OK && vm.status != STATUS_RUNNING {
+                                remaining = 0;
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                    pc = target;
                 } else {
                     pc = pc.wrapping_add(step);
                 }
@@ -571,7 +1224,21 @@ pub unsafe fn exec(vm: &mut Vm, budget: i32) -> i32 {
                 if rd != 0 {
                     x[rd] = pc.wrapping_add(step);
                 }
-                pc = pc.wrapping_add(imm as i64 as u64);
+                let target = pc.wrapping_add(imm as i64 as u64);
+                if imm < 0 {
+                    let idx = (target >> 1) as usize & (BLOCK_CACHE_SIZE - 1);
+                    let blk = &mut BLOCKS[idx];
+                    if blk.start_pc == target || blk.start_pc == 0 {
+                        if blk.start_pc == 0 { build_block(blk, target, base); }
+                        pc = exec_block(blk, base, &mut x, &mut f, &mut fcsr, vm, &mut remaining);
+                        if vm.status != STATUS_OK && vm.status != STATUS_RUNNING {
+                            remaining = 0;
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                pc = target;
             }
             // SYSTEM
             0x1C => {
@@ -613,7 +1280,6 @@ pub unsafe fn exec(vm: &mut Vm, budget: i32) -> i32 {
             }
         }
 
-        x[0] = 0;
     }
 
     // Write back state

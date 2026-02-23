@@ -29,6 +29,12 @@ PASS=0
 FAIL=0
 SKIP=0
 
+# For bundled builds (--devenv), the WASM data section is ~137MB.
+# Reduce RAM to avoid exceeding the 2GB WASM memory limit.
+if [ "$DEVENV" -eq 1 ]; then
+    export NANOVM_RAM_MB=1800
+fi
+
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[0;33m'

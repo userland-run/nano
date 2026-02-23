@@ -25,9 +25,11 @@ console.error(`WASM: ${wasmPath} (${wasmBytes.length} bytes)`);
 console.error(`ELF:  ${elfPath} (${elfBytes.length} bytes)`);
 
 // --- Create shared memory ---
-// Default 2GB (32768 pages). NANOVM_RAM_MB overrides for bundled builds where
-// the data section already consumes a large chunk of the 2GB address space.
-const RAM_MB = parseInt(process.env.NANOVM_RAM_MB || "2000", 10);
+// Auto-detect bundled builds: if WASM > 1MB, reserve headroom for the data section.
+// NANOVM_RAM_MB env var overrides auto-detection.
+const wasmSizeMB = wasmBytes.length / (1024 * 1024);
+const defaultRAM = wasmSizeMB > 1 ? Math.floor(2000 - wasmSizeMB - 20) : 2000;
+const RAM_MB = parseInt(process.env.NANOVM_RAM_MB || String(defaultRAM), 10);
 const ramPages = Math.floor((RAM_MB * 1024 * 1024) / 65536);
 const maxPages = 32768; // 2GB hard max
 const memory = new WebAssembly.Memory({ initial: Math.min(ramPages, maxPages), maximum: maxPages, shared: true });

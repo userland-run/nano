@@ -388,6 +388,12 @@ pub unsafe extern "C" fn vm_close_connection(_vm_ptr: u32, conn_id: i32) {
 
 // ---------- Console ----------
 
+/// Clear the block cache (call on ELF load or self-modifying code)
+#[no_mangle]
+pub extern "C" fn vm_reset_blocks() {
+    cpu::reset_blocks();
+}
+
 /// No-op: matches reference where console_queue_char aliases free()
 #[no_mangle]
 pub extern "C" fn console_queue_char(_ch: i32) {
