@@ -639,8 +639,8 @@ function processFsRequest() {
 console.error("--- execution start ---");
 
 const verbose = process.argv.includes("--verbose") || process.argv.includes("-v");
-const BUDGET   = verbose ? 1 : 10_000;
-const MAX_ITER = verbose ? 50000 : 20_000_000;
+const BUDGET   = verbose ? 1 : 100_000;
+const MAX_ITER = verbose ? 50000 : 2_000_000;
 let totalInsns = 0;
 let lastReport = Date.now();
 
@@ -710,6 +710,16 @@ for (let iter = 0; iter < MAX_ITER; iter++) {
       const a0 = Number(dv.getBigInt64(vmPtr + 80, true));
       console.error(`  [fs] syscall ${nr} → ${a0}`);
     }
+    continue;
+  }
+
+  if (status === 7) {
+    // STATUS_EPOLL_BLOCKED – VM is blocked in epoll_wait with a listening socket.
+    // In CLI mode, set a0 = -EINTR to let libuv retry. This creates a busy loop
+    // but keeps the server alive for testing purposes.
+    const dv = new DataView(memory.buffer);
+    dv.setBigInt64(vmPtr + 80, BigInt(-4), true); // a0 = -EINTR
+    dv.setInt32(vmPtr + 528, 0, true); // STATUS_OK
     continue;
   }
 

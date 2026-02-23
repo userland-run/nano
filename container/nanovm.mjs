@@ -33,10 +33,11 @@ const FD_ENTRY_SIZE = 24;
 const MAX_FDS       = 64;
 
 // Status codes
-const STATUS_OK         = 0;
-const STATUS_FAULT      = 3;
-const STATUS_FS_PENDING = 6;
-const STATUS_RUNNING    = 18;
+const STATUS_OK             = 0;
+const STATUS_FAULT          = 3;
+const STATUS_FS_PENDING     = 6;
+const STATUS_EPOLL_BLOCKED  = 7;
+const STATUS_RUNNING        = 18;
 
 // Syscall numbers (RISC-V Linux)
 const SYS_GETCWD     = 17;
@@ -169,6 +170,19 @@ class NanoVM {
     // Virtual server — bridges SW HTTP requests into VM sockets
     this._pendingConnections = []; // { connId, resolve, responseChunks }
     this._virtualServer = new VirtualServer(this);
+
+    // Pre-warm WASM JIT: run a trivial busybox command so the browser's
+    // optimizing compiler (TurboFan) starts compiling exec() in the background.
+    if (this._busyboxElf) {
+      const savedStdout = this._stdout;
+      const savedOnStdout = this._onStdout;
+      this._onStdout = null;
+      try {
+        await this.run("echo warmup", { maxSteps: 2_000_000 });
+      } catch (_) {}
+      this._stdout = savedStdout;
+      this._onStdout = savedOnStdout;
+    }
   }
 
   _seedFS() {
@@ -384,25 +398,49 @@ class NanoVM {
     this._setupArgv(argv, extraEnv);
 
     // Execution loop with periodic yielding
-    const BUDGET = 10_000;
+    const BUDGET = 100_000;
     const maxIter = Math.ceil(maxSteps / BUDGET);
+    let yieldCounter = 0;
+    let stepCounter = 0;
+    // Detect server mode: once stdout contains "listening", keep loop alive
+    let serverMode = false;
 
     for (let iter = 0; iter < maxIter; iter++) {
       try {
         X.vm_step(this._vmPtr, BUDGET);
       } catch (e) {
+        console.error("[nanovm] vm_step threw:", e);
         return { exitCode: -1, stdout: this._stdout };
       }
 
+      stepCounter++;
       const status = X.debug_status(this._vmPtr);
 
       if (status === STATUS_FAULT) {
-        const code = X.vm_exit_code(this._vmPtr);
-        return { exitCode: code, stdout: this._stdout };
+        return { exitCode: X.vm_exit_code(this._vmPtr), stdout: this._stdout };
       }
 
       if (status === STATUS_FS_PENDING) {
         this._processFsRequest();
+        iter--; // FS operations don't consume execution budget
+        // Yield periodically during heavy FS activity to keep UI responsive
+        if (++yieldCounter % 200 === 0) {
+          await new Promise(r => setTimeout(r, 0));
+        }
+        continue;
+      }
+
+      if (status === STATUS_EPOLL_BLOCKED) {
+        serverMode = true;
+        // VM is blocked in epoll_wait with a listening socket.
+        // Yield to the event loop so service worker requests can arrive,
+        // then set a0 = -EINTR so libuv retries epoll_wait.
+        await new Promise(r => setTimeout(r, 0));
+        this._pollConnections();
+        const dv = new DataView(this._memory.buffer);
+        dv.setBigInt64(this._vmPtr + 80, BigInt(-4), true); // a0 = -EINTR
+        dv.setInt32(this._vmPtr + 528, STATUS_OK, true); // reset status
+        iter--; // don't consume execution budget while blocked
         continue;
       }
 
@@ -410,11 +448,19 @@ class NanoVM {
         return { exitCode: -1, stdout: this._stdout };
       }
 
+      // Auto-detect server mode: if stdout contains "listening", keep alive
+      if (!serverMode && /listening/i.test(this._stdout)) {
+        serverMode = true;
+      }
+
+      // In server mode, don't consume iteration budget
+      if (serverMode) iter--;
+
       // Poll pending virtual connections for response data
       this._pollConnections();
 
-      // Yield to event loop every 50 iterations (~500K instructions)
-      if (iter > 0 && iter % 50 === 0) {
+      // Yield to event loop every 5 steps (~500K instructions) to keep UI responsive
+      if (stepCounter % 5 === 0) {
         await new Promise(r => setTimeout(r, 0));
       }
     }
@@ -439,26 +485,43 @@ class NanoVM {
         // Copy response bytes from WASM memory
         const bytes = new Uint8Array(this._memory.buffer, scratchPtr, n);
         conn.responseChunks.push(new Uint8Array(bytes));
+        conn.stalePollCount = 0;
       } else if (n === -1) {
         // Connection closed — response is complete
-        X.vm_close_connection(this._vmPtr, conn.connId);
-        const total = conn.responseChunks.reduce((s, c) => s + c.length, 0);
-        const result = new Uint8Array(total);
-        let off = 0;
-        for (const chunk of conn.responseChunks) {
-          result.set(chunk, off);
-          off += chunk.length;
+        this._resolveConnection(X, conn, pending, i);
+      } else if (conn.responseChunks.length > 0) {
+        // n === 0 but we already have data — server may be waiting for
+        // client-side close (HTTP Connection: close deadlock).
+        // After a few stale polls, force-close to break the deadlock.
+        conn.stalePollCount = (conn.stalePollCount || 0) + 1;
+        if (conn.stalePollCount >= 10) {
+          this._resolveConnection(X, conn, pending, i);
         }
-        conn.resolve(result);
-        pending.splice(i, 1);
       }
-      // n === 0 means still waiting — keep polling
     }
+  }
+
+  _resolveConnection(X, conn, pending, i) {
+    X.vm_close_connection(this._vmPtr, conn.connId);
+    const total = conn.responseChunks.reduce((s, c) => s + c.length, 0);
+    const result = new Uint8Array(total);
+    let off = 0;
+    for (const chunk of conn.responseChunks) {
+      result.set(chunk, off);
+      off += chunk.length;
+    }
+    conn.resolve(result);
+    pending.splice(i, 1);
   }
 
   _resetVM() {
     const dv = new DataView(this._memory.buffer);
     const v = this._vmPtr;
+
+    // Reset Rust static mut globals (sockets, epoll, eventfd, timerfd)
+    if (this._exports.vm_reset_statics) {
+      this._exports.vm_reset_statics();
+    }
 
     // Zero entire VM struct
     new Uint8Array(this._memory.buffer, v, VM_STRUCT_SIZE).fill(0);

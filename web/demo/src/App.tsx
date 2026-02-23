@@ -1,13 +1,76 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import TopBar from "./components/TopBar";
-import FileTree from "./components/FileTree";
+import { Provider, ProgressCircle, Text, Heading } from "@react-spectrum/s2";
+// @ts-ignore
+import { style } from "@react-spectrum/s2/style" with { type: "macro" };
+import { Allotment } from "allotment";
+import "allotment/dist/style.css";
+import "./allotment-overrides.css";
+import Toolbar from "./components/Toolbar";
+import Sidebar from "./components/Sidebar";
 import Editor from "./components/Editor";
-import Preview from "./components/Preview";
+import OutputPanel from "./components/OutputPanel";
 import { ensureVM } from "./vm/runtime";
 import { loadExamples } from "./vm/examples";
 import { registerServiceWorker } from "./vm/sw-bridge";
 import * as runtime from "./vm/runtime";
 import type { RuntimeMode, RightPanelTab, DemoManifest } from "./types";
+
+// Layer 1: app shell background — visible as gutters between panels
+const appStyles = style({
+  display: "flex",
+  flexDirection: "column",
+  height: "screen",
+  backgroundColor: "layer-1",
+}) as unknown as string;
+
+// Workspace: outer padding creates gutter around the edges
+const bodyStyles = style({
+  display: "flex",
+  flexGrow: 1,
+  overflow: "hidden",
+  padding: 4,
+}) as unknown as string;
+
+// Floating panel base — absolute inset creates gutter revealing layer-1
+const panelBase = {
+  position: "absolute" as const,
+  inset: 4,
+  overflow: "hidden" as const,
+  borderRadius: 8,
+  display: "flex" as const,
+  flexDirection: "column" as const,
+  backgroundColor: "white",
+};
+
+// Main column fills its pane — contains nested vertical allotment
+const mainColumnStyles = style({
+  width: "full",
+  height: "full",
+}) as unknown as string;
+
+const centerStyles = style({
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  justifyContent: "center",
+  height: "screen",
+  gap: 16,
+  backgroundColor: "layer-1",
+  fontFamily: "sans",
+}) as unknown as string;
+
+const errorStyles = style({
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  justifyContent: "center",
+  height: "screen",
+  gap: 16,
+  padding: 32,
+  textAlign: "center",
+  backgroundColor: "layer-1",
+  fontFamily: "sans",
+}) as unknown as string;
 
 export default function App() {
   const [ready, setReady] = useState(false);
@@ -21,9 +84,9 @@ export default function App() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [command, setCommand] = useState("");
   const [treeKey, setTreeKey] = useState(0);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const runAbortRef = useRef<(() => void) | null>(null);
 
-  // Initialize VM and load examples
   useEffect(() => {
     (async () => {
       try {
@@ -58,17 +121,6 @@ export default function App() {
     setFileContent(content);
   }, []);
 
-  // Detect if the current file's directory has a demo.json with previewPort
-  const getPreviewPort = useCallback(async (filePath: string): Promise<number | null> => {
-    const dir = filePath.substring(0, filePath.lastIndexOf("/"));
-    const manifest = await runtime.readFile(dir + "/demo.json");
-    if (!manifest) return null;
-    try {
-      const demo: DemoManifest = JSON.parse(manifest);
-      return demo.previewPort || null;
-    } catch { return null; }
-  }, []);
-
   const handleRun = useCallback(async () => {
     if (running || !command.trim()) return;
     setRunning(true);
@@ -77,16 +129,17 @@ export default function App() {
     setRightTab("console");
 
     let serverDetected = false;
+    let fullOutput = "";
 
     const onStdout = (chunk: string) => {
       setOutput((prev) => [...prev, chunk]);
+      fullOutput += chunk;
 
-      // Auto-detect server start: look for "listening" in output
-      if (!serverDetected && /listening/i.test(chunk)) {
+      if (!serverDetected && /listening/i.test(fullOutput)) {
         serverDetected = true;
-        // Extract port from output like "port 8080" or ":8080"
-        const portMatch = chunk.match(/(?:port\s+|:)(\d{2,5})/i);
+        const portMatch = fullOutput.match(/(?:port\s+|:)(\d{2,5})/i);
         const port = portMatch ? parseInt(portMatch[1], 10) : 8080;
+        console.log(`[app] Server detected on port ${port}, setting preview URL`);
         setPreviewUrl(`${import.meta.env.BASE_URL}sw/${port}/`);
         setRightTab("preview");
       }
@@ -95,11 +148,8 @@ export default function App() {
     const cmd = command.trim();
     let aborted = false;
 
-    // Store abort function so Stop can cancel
     runAbortRef.current = () => { aborted = true; };
 
-    // Fire-and-forget: don't await, so the UI stays responsive
-    // The VM step loop yields to the event loop, allowing SW messages to flow
     const runPromise = (async () => {
       try {
         let result;
@@ -127,14 +177,12 @@ export default function App() {
   }, [command, running]);
 
   const handleStop = useCallback(async () => {
-    // Signal abort so the run callback doesn't update state
     if (runAbortRef.current) runAbortRef.current();
 
     setRunning(false);
     setPreviewUrl(null);
     setOutput((prev) => [...prev, "\n[stopped]\n"]);
 
-    // Reset VM to kill the running process
     await runtime.resetVFS();
     const vm = await ensureVM();
     await loadExamples(vm);
@@ -155,57 +203,86 @@ export default function App() {
     setFileContent("");
   }, []);
 
+  const handleClearOutput = useCallback(() => {
+    setOutput([]);
+  }, []);
+
   if (error) {
     return (
-      <div className="app-error">
-        <h2>Failed to initialize NanoVM</h2>
-        <p>{error}</p>
-        <p>Make sure you have built the container: <code>make container-full</code></p>
-      </div>
+      <Provider locale="en-US">
+        <div className={errorStyles}>
+          <Heading level={2}>Failed to initialize nano</Heading>
+          <Text>{error}</Text>
+          <Text>Make sure you have built the container: <Text styles={style({ fontFamily: "code", fontSize: "code-sm" })}>make build</Text></Text>
+        </div>
+      </Provider>
     );
   }
 
   if (!ready) {
     return (
-      <div className="app-loading">
-        <div className="spinner" />
-        <p>Loading NanoVM...</p>
-      </div>
+      <Provider locale="en-US">
+        <div className={centerStyles}>
+          <ProgressCircle aria-label="Loading nano..." isIndeterminate size="L" />
+          <Text>Loading nano...</Text>
+        </div>
+      </Provider>
     );
   }
 
   return (
-    <div className="app">
-      <TopBar
-        runtimeMode={runtimeMode}
-        onRuntimeChange={setRuntimeMode}
-        command={command}
-        onCommandChange={setCommand}
-        onRun={handleRun}
-        onStop={handleStop}
-        onReset={handleReset}
-        running={running}
-      />
-      <div className="app-body">
-        <div className="panel panel-left">
-          <FileTree key={treeKey} onFileOpen={handleFileOpen} activeFile={openFile} />
-        </div>
-        <div className="panel panel-center">
-          <Editor
-            path={openFile}
-            content={fileContent}
-            onSave={handleSave}
-          />
-        </div>
-        <div className="panel panel-right">
-          <Preview
-            output={output}
-            activeTab={rightTab}
-            onTabChange={setRightTab}
-            previewUrl={previewUrl}
-          />
+    <Provider locale="en-US">
+      <div className={appStyles}>
+        <Toolbar
+          runtimeMode={runtimeMode}
+          onRuntimeChange={setRuntimeMode}
+          command={command}
+          onCommandChange={setCommand}
+          onRun={handleRun}
+          onStop={handleStop}
+          onReset={handleReset}
+          running={running}
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={() => setSidebarOpen((o) => !o)}
+        />
+        <div className={bodyStyles}>
+          <Allotment proportionalLayout={false} separator>
+            {sidebarOpen && (
+              <Allotment.Pane minSize={200} preferredSize={264} snap>
+                <div style={panelBase}>
+                  <Sidebar key={treeKey} onFileOpen={handleFileOpen} activeFile={openFile} />
+                </div>
+              </Allotment.Pane>
+            )}
+            <Allotment.Pane minSize={400}>
+              <div className={mainColumnStyles}>
+                <Allotment vertical proportionalLayout={false} separator>
+                  <Allotment.Pane minSize={150}>
+                    <div style={panelBase}>
+                      <Editor
+                        path={openFile}
+                        content={fileContent}
+                        onSave={handleSave}
+                      />
+                    </div>
+                  </Allotment.Pane>
+                  <Allotment.Pane minSize={120} preferredSize={280} snap>
+                    <div style={panelBase}>
+                      <OutputPanel
+                        output={output}
+                        activeTab={rightTab}
+                        onTabChange={setRightTab}
+                        previewUrl={previewUrl}
+                        onClear={handleClearOutput}
+                      />
+                    </div>
+                  </Allotment.Pane>
+                </Allotment>
+              </div>
+            </Allotment.Pane>
+          </Allotment>
         </div>
       </div>
-    </div>
+    </Provider>
   );
 }

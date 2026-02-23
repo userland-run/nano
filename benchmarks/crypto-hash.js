@@ -1,6 +1,7 @@
-// SHA-256 hashing
+// SHA-256 hashing — crypto performance
+// Tests: crypto internals, buffer handling, hex encoding
 const crypto = require('crypto');
-const N = 2000;
+const N = 10000;
 const t0 = Date.now();
 
 let last = '';

@@ -1,5 +1,6 @@
 // Regular expression matching
-const N = 10000;
+// Tests: regex engine (backtracking, NFA), string scanning
+const N = 50000;
 const t0 = Date.now();
 
 const patterns = [

@@ -1,11 +1,25 @@
 import { useEffect, useRef } from "react";
+import { Text } from "@react-spectrum/s2";
+// @ts-ignore
+import { style } from "@react-spectrum/s2/style" with { type: "macro" };
 
 interface TerminalProps {
   output: string[];
-  onClear: () => void;
 }
 
-export default function Terminal({ output, onClear }: TerminalProps) {
+const scrollStyles = style({
+  height: "full",
+  paddingX: 8,
+  paddingY: 16,
+  overflow: "auto",
+  fontFamily: "code",
+  fontSize: "code-sm",
+  lineHeight: "body",
+  whiteSpace: "pre-wrap",
+  color: "body",
+}) as unknown as string;
+
+export default function Terminal({ output }: TerminalProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -15,19 +29,14 @@ export default function Terminal({ output, onClear }: TerminalProps) {
   }, [output]);
 
   return (
-    <div style={{ position: "relative", height: "100%" }}>
-      <button className="terminal-clear" onClick={onClear}>
-        Clear
-      </button>
-      <div className="terminal-wrapper" ref={scrollRef}>
-        {output.length === 0 ? (
-          <span style={{ color: "var(--text-muted)" }}>
-            Press Run to execute...
-          </span>
-        ) : (
-          output.join("")
-        )}
-      </div>
+    <div className={scrollStyles} ref={scrollRef}>
+      {output.length === 0 ? (
+        <Text styles={style({ color: "gray-500" })}>
+          Press Run to execute...
+        </Text>
+      ) : (
+        <Text>{output.join("")}</Text>
+      )}
     </div>
   );
 }

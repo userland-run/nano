@@ -540,6 +540,456 @@ window.addItem = () => {
 render();
 `,
   },
+
+  // ============================================================
+  // 04-devtools — Dev toolchain demos (TypeScript, ESLint, Prettier, npm)
+  // ============================================================
+  {
+    path: "/examples/04-devtools/demo.json",
+    content: JSON.stringify({
+      name: "Dev Tools",
+      description: "TypeScript, ESLint, Prettier & npm running in NanoVM",
+      command: "node /examples/04-devtools/typescript.js",
+    }, null, 2),
+  },
+
+  // --- TypeScript: parse and analyze AST ---
+  {
+    path: "/examples/04-devtools/typescript.js",
+    content: `// TypeScript compiler — parse TS source and analyze the AST
+const ts = require("/usr/local/lib/node_modules/typescript");
+
+console.log("TypeScript", ts.version);
+console.log("");
+
+// TypeScript source with interfaces, type annotations, and generics
+const sourceCode = [
+  'interface User {',
+  '  id: number;',
+  '  name: string;',
+  '  email: string;',
+  '}',
+  '',
+  'function greet(user: User): string {',
+  '  return "Hello, " + user.name + " (" + user.email + ")!";',
+  '}',
+  '',
+  'const users: User[] = [',
+  '  { id: 1, name: "Alice", email: "alice@nanovm.dev" },',
+  '  { id: 2, name: "Bob",   email: "bob@nanovm.dev" },',
+  '];',
+  '',
+  'for (const u of users) {',
+  '  console.log(greet(u));',
+  '}',
+  '',
+  'const map = new Map<string, number>();',
+  'map.set("a", 1);',
+  'map.set("b", 2);',
+  'console.log("Map size:", map.size);',
+].join("\\n");
+
+console.log("=== TypeScript source ===");
+console.log(sourceCode);
+console.log("");
+
+// Parse into AST (no type-checker, just the parser)
+const sourceFile = ts.createSourceFile(
+  "demo.ts", sourceCode, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS
+);
+
+// Walk the AST and report what we find
+console.log("=== AST analysis ===");
+console.log("Statements:", sourceFile.statements.length);
+console.log("");
+
+function analyze(node, depth) {
+  const indent = "  ".repeat(depth);
+  if (ts.isInterfaceDeclaration(node)) {
+    const members = node.members.map(function(m) {
+      return m.name ? m.name.getText(sourceFile) : "?";
+    });
+    console.log(indent + "interface " + node.name.getText(sourceFile) + " { " + members.join(", ") + " }");
+  } else if (ts.isFunctionDeclaration(node) && node.name) {
+    const params = node.parameters.map(function(p) {
+      var name = p.name.getText(sourceFile);
+      var type = p.type ? p.type.getText(sourceFile) : "any";
+      return name + ": " + type;
+    });
+    var ret = node.type ? node.type.getText(sourceFile) : "void";
+    console.log(indent + "function " + node.name.getText(sourceFile) + "(" + params.join(", ") + "): " + ret);
+  } else if (ts.isVariableStatement(node)) {
+    for (var d of node.declarationList.declarations) {
+      var type = d.type ? d.type.getText(sourceFile) : "(inferred)";
+      console.log(indent + "const " + d.name.getText(sourceFile) + ": " + type);
+    }
+  } else if (ts.isForOfStatement(node)) {
+    console.log(indent + "for...of loop");
+  } else if (ts.isExpressionStatement(node)) {
+    var text = node.getText(sourceFile).slice(0, 60);
+    console.log(indent + "expr: " + text + (text.length >= 60 ? "..." : ""));
+  }
+}
+
+for (var stmt of sourceFile.statements) {
+  analyze(stmt, 0);
+}
+
+// Count node types in the AST
+var nodeCount = 0;
+var kindCounts = {};
+function countNodes(node) {
+  nodeCount++;
+  var kind = ts.SyntaxKind[node.kind];
+  kindCounts[kind] = (kindCounts[kind] || 0) + 1;
+  ts.forEachChild(node, countNodes);
+}
+countNodes(sourceFile);
+
+console.log("");
+console.log("Total AST nodes:", nodeCount);
+console.log("Top node kinds:");
+var sorted = Object.entries(kindCounts).sort(function(a, b) { return b[1] - a[1]; });
+for (var i = 0; i < Math.min(8, sorted.length); i++) {
+  console.log("  " + sorted[i][0] + ": " + sorted[i][1]);
+}
+`,
+  },
+
+  // --- ESLint: lint JavaScript code ---
+  {
+    path: "/examples/04-devtools/eslint.js",
+    content: `// ESLint — lint JavaScript for common issues
+const { Linter } = require("/usr/local/lib/node_modules/eslint");
+const linter = new Linter();
+
+console.log("ESLint", Linter.version);
+console.log("");
+
+// Code with intentional issues
+const code = \`
+var x = 1;
+var y = 2;
+console.log(x);
+if (x == 1) {
+  console.log("yes")
+}
+function unused() {
+  return 42;
+}
+\`;
+
+console.log("=== Source code ===");
+console.log(code.trim());
+console.log("");
+
+// Lint with common rules
+const messages = linter.verify(code, {
+  languageOptions: { ecmaVersion: 2022, sourceType: "module" },
+  rules: {
+    "no-var": "warn",
+    "eqeqeq": "error",
+    "semi": ["warn", "always"],
+    "no-unused-vars": "warn",
+  },
+});
+
+console.log("=== Lint results ===");
+if (messages.length === 0) {
+  console.log("No issues found!");
+} else {
+  for (const msg of messages) {
+    const level = msg.severity === 2 ? "ERROR" : "WARN ";
+    console.log(\`  \${level} line \${msg.line}:\${msg.column} — \${msg.message} [\${msg.ruleId}]\`);
+  }
+  const errors = messages.filter(m => m.severity === 2).length;
+  const warnings = messages.filter(m => m.severity === 1).length;
+  console.log(\`\\n  \${errors} error(s), \${warnings} warning(s)\`);
+}
+`,
+  },
+
+  // --- Toolchain: show all installed dev tool versions ---
+  {
+    path: "/examples/04-devtools/toolchain.js",
+    content: `// Toolchain — display all dev tools installed in NanoVM
+const fs = require("fs");
+const path = require("path");
+
+console.log("=== NanoVM JavaScript Toolchain ===");
+console.log("Node.js", process.version, "(" + process.arch + ")");
+console.log("");
+
+// Read tool versions from package.json files
+const tools = [
+  { name: "npm",        path: "npm" },
+  { name: "TypeScript",  path: "typescript" },
+  { name: "ESLint",      path: "eslint" },
+  { name: "Prettier",    path: "prettier" },
+  { name: "pnpm",        path: "pnpm" },
+  { name: "tsx",          path: "tsx" },
+  { name: "Vitest",      path: "vitest" },
+];
+
+console.log("=== Installed tools ===");
+for (const tool of tools) {
+  try {
+    const pkgJson = fs.readFileSync(
+      "/usr/local/lib/node_modules/" + tool.path + "/package.json", "utf8"
+    );
+    const pkg = JSON.parse(pkgJson);
+    console.log("  " + tool.name.padEnd(14) + "v" + pkg.version);
+  } catch (e) {
+    console.log("  " + tool.name.padEnd(14) + "(not installed)");
+  }
+}
+
+// Check for scoped packages
+const scoped = [
+  { name: "@rsbuild/core", display: "Rsbuild" },
+];
+for (const tool of scoped) {
+  try {
+    const pkgJson = fs.readFileSync(
+      "/usr/local/lib/node_modules/" + tool.name + "/package.json", "utf8"
+    );
+    const pkg = JSON.parse(pkgJson);
+    console.log("  " + tool.display.padEnd(14) + "v" + pkg.version);
+  } catch {
+    console.log("  " + tool.display.padEnd(14) + "(not installed)");
+  }
+}
+
+console.log("");
+
+// Show disk usage of node_modules
+var totalSize = 0;
+var fileCount = 0;
+function walk(dir) {
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      const full = path.join(dir, name);
+      try {
+        const st = fs.statSync(full);
+        if (st.isDirectory()) walk(full);
+        else { totalSize += st.size; fileCount++; }
+      } catch {}
+    }
+  } catch {}
+}
+walk("/usr/local/lib/node_modules");
+
+console.log("=== Environment stats ===");
+console.log("  Files in node_modules: " + fileCount.toLocaleString());
+console.log("  Total size:            " + (totalSize / 1024 / 1024).toFixed(1) + " MB");
+console.log("  Platform:              " + process.platform + "/" + process.arch);
+console.log("  Node.js:               " + process.version);
+`,
+  },
+
+  // --- npm: explore installed packages ---
+  {
+    path: "/examples/04-devtools/npm-info.js",
+    content: `// npm — explore globally installed packages
+const fs = require("fs");
+const path = require("path");
+
+const npmPkg = JSON.parse(
+  fs.readFileSync("/usr/local/lib/node_modules/npm/package.json", "utf8")
+);
+console.log("npm", npmPkg.version);
+console.log("");
+
+// List all globally installed packages
+const modulesDir = "/usr/local/lib/node_modules";
+const entries = fs.readdirSync(modulesDir).sort();
+
+console.log("=== Globally installed packages ===");
+for (const name of entries) {
+  try {
+    const pkgPath = name.startsWith("@")
+      ? fs.readdirSync(path.join(modulesDir, name)).map(sub => path.join(name, sub))
+      : [name];
+    for (const p of pkgPath) {
+      const pkg = JSON.parse(
+        fs.readFileSync(path.join(modulesDir, p, "package.json"), "utf8")
+      );
+      const desc = (pkg.description || "").slice(0, 50);
+      console.log(\`  \${p.padEnd(24)} v\${(pkg.version || "?").padEnd(10)} \${desc}\`);
+    }
+  } catch {}
+}
+
+// Count total files
+let totalFiles = 0;
+function countFiles(dir) {
+  try {
+    for (const entry of fs.readdirSync(dir)) {
+      const full = path.join(dir, entry);
+      try {
+        const st = fs.statSync(full);
+        if (st.isDirectory()) countFiles(full);
+        else totalFiles++;
+      } catch {}
+    }
+  } catch {}
+}
+countFiles(modulesDir);
+console.log(\`\\nTotal files in node_modules: \${totalFiles.toLocaleString()}\`);
+`,
+  },
+
+  // --- TypeScript: AST parsing and analysis ---
+  {
+    path: "/examples/04-devtools/typecheck.js",
+    content: `// TypeScript — parse source code into an AST and analyze it
+const ts = require("/usr/local/lib/node_modules/typescript");
+
+console.log("TypeScript", ts.version, "— AST parser");
+console.log("");
+
+const code = [
+  'interface User {',
+  '  id: number;',
+  '  name: string;',
+  '  role: "admin" | "user";',
+  '}',
+  '',
+  'function createUser(name: string, role: "admin" | "user" = "user"): User {',
+  '  return { id: Math.random(), name, role };',
+  '}',
+  '',
+  'async function fetchUsers(): Promise<User[]> {',
+  '  return [createUser("Alice", "admin"), createUser("Bob")];',
+  '}',
+  '',
+  'const greet = (u: User): string => "Hello " + u.name;',
+].join("\\n");
+
+console.log("=== Source ===");
+console.log(code);
+console.log("");
+
+// Parse into AST
+const sourceFile = ts.createSourceFile("demo.ts", code, ts.ScriptTarget.ES2020, true);
+
+// Walk the AST and collect declarations
+const declarations = [];
+function visit(node) {
+  if (ts.isInterfaceDeclaration(node)) {
+    const members = node.members.map(m => m.name ? m.name.getText(sourceFile) : "?");
+    declarations.push({ kind: "interface", name: node.name.getText(sourceFile), members });
+  } else if (ts.isFunctionDeclaration(node) && node.name) {
+    const params = node.parameters.map(p => p.name.getText(sourceFile));
+    const isAsync = !!(node.modifiers && node.modifiers.some(m => m.kind === ts.SyntaxKind.AsyncKeyword));
+    declarations.push({ kind: "function", name: node.name.getText(sourceFile), params, async: isAsync });
+  } else if (ts.isVariableStatement(node)) {
+    for (const decl of node.declarationList.declarations) {
+      if (ts.isArrowFunction(decl.initializer)) {
+        const params = decl.initializer.parameters.map(p => p.name.getText(sourceFile));
+        declarations.push({ kind: "arrow fn", name: decl.name.getText(sourceFile), params });
+      }
+    }
+  }
+  ts.forEachChild(node, visit);
+}
+visit(sourceFile);
+
+console.log("=== AST analysis ===");
+for (const d of declarations) {
+  if (d.kind === "interface") {
+    console.log("  interface " + d.name + " { " + d.members.join(", ") + " }");
+  } else if (d.kind === "function") {
+    console.log("  " + (d.async ? "async " : "") + "function " + d.name + "(" + d.params.join(", ") + ")");
+  } else {
+    console.log("  const " + d.name + " = (" + d.params.join(", ") + ") => ...");
+  }
+}
+console.log("");
+console.log("Total statements:", sourceFile.statements.length);
+console.log("Declarations found:", declarations.length);
+
+// Emit JS from the AST (no type checker needed)
+const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
+const jsOutput = printer.printFile(sourceFile);
+console.log("");
+console.log("=== Emitted as JavaScript ===");
+console.log(jsOutput.trim());
+`,
+  },
+
+  // --- ESLint: auto-fix pipeline ---
+  {
+    path: "/examples/04-devtools/lint-and-format.js",
+    content: `// ESLint auto-fix — find issues and automatically repair them
+const { Linter } = require("/usr/local/lib/node_modules/eslint");
+
+const linter = new Linter();
+
+// Messy code with both style and logic issues
+const input = \`
+var items =   ["apple","banana",   "cherry"]
+var total=0
+for(var i=0;i<items.length;i++){
+  if(items[i]=="banana"){
+    total = total +1
+  }
+}
+function   getTotal(  ){return total}
+console.log( "total:" ,getTotal() )
+\`;
+
+console.log("=== Original code ===");
+console.log(input.trim());
+console.log("");
+
+// Step 1: Find all issues
+const rules = {
+  "no-var": "warn",
+  "eqeqeq": "error",
+  "semi": ["error", "always"],
+  "no-unused-vars": "warn",
+  "no-multi-spaces": "warn",
+  "space-infix-ops": "warn",
+};
+
+const messages = linter.verify(input, {
+  languageOptions: { ecmaVersion: 2022 },
+  rules,
+});
+
+console.log("=== Issues found (" + messages.length + ") ===");
+for (const msg of messages) {
+  const level = msg.severity === 2 ? "ERROR" : "WARN ";
+  const fixable = msg.fix ? " [fixable]" : "";
+  console.log(\`  \${level} line \${msg.line}:\${msg.column} \${msg.message}\${fixable}\`);
+}
+
+const errors = messages.filter(m => m.severity === 2).length;
+const warnings = messages.filter(m => m.severity === 1).length;
+const fixable = messages.filter(m => m.fix).length;
+console.log(\`\\n  \${errors} error(s), \${warnings} warning(s), \${fixable} auto-fixable\`);
+console.log("");
+
+// Step 2: Auto-fix everything ESLint can
+const result = linter.verifyAndFix(input, {
+  languageOptions: { ecmaVersion: 2022 },
+  rules,
+});
+
+console.log("=== After auto-fix (" + result.messages.length + " remaining) ===");
+console.log(result.output.trim());
+
+if (result.messages.length > 0) {
+  console.log("");
+  console.log("Remaining issues (not auto-fixable):");
+  for (const msg of result.messages) {
+    const level = msg.severity === 2 ? "ERROR" : "WARN ";
+    console.log(\`  \${level} line \${msg.line}:\${msg.column} \${msg.message}\`);
+  }
+}
+`,
+  },
 ];
 
 export function getExamples(): ExampleFile[] {

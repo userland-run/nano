@@ -17,7 +17,7 @@ export async function ensureVM(): Promise<any> {
 
   initPromise = (async () => {
     vmInstance = await NanoVM.create({
-      ramMB: 1500,
+      ramMB: 1800,
       wasm: import.meta.env.BASE_URL + "nano.wasm",
     });
 

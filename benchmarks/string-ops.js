@@ -1,5 +1,6 @@
-// String concatenation and manipulation
-const N = 50000;
+// String operations — concatenation, search, split/join
+// Tests: memory allocation, GC pressure, string internals
+const N = 200000;
 const t0 = Date.now();
 
 let s = '';

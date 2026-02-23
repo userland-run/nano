@@ -4,6 +4,7 @@ use core::sync::atomic::AtomicI32;
 pub const STATUS_OK: i32 = 0;
 pub const STATUS_FAULT: i32 = 3;
 pub const STATUS_FS_PENDING: i32 = 6;
+pub const STATUS_EPOLL_BLOCKED: i32 = 7;
 pub const STATUS_RUNNING: i32 = 18;
 
 // FD types

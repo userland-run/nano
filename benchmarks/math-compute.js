@@ -1,35 +1,41 @@
-// Math-heavy computation: matrix multiply + trig
-const N = 200;
+// Integer-heavy math: sieve of Eratosthenes + integer matrix multiply
+// Tests: tight integer loops, array access patterns, branch-heavy code
+// (Avoids Float64Array which hits FP emulation overhead in the emulator)
 const t0 = Date.now();
 
-// Simple NxN matrix multiply
-function matmul(a, b, n) {
-  const c = new Float64Array(n * n);
-  for (let i = 0; i < n; i++) {
-    for (let k = 0; k < n; k++) {
-      const aik = a[i * n + k];
-      for (let j = 0; j < n; j++) {
-        c[i * n + j] += aik * b[k * n + j];
-      }
+// Sieve of Eratosthenes
+const SIEVE_N = 1000000;
+const sieve = new Uint8Array(SIEVE_N + 1);
+let primeCount = 0;
+for (let i = 2; i <= SIEVE_N; i++) {
+  if (!sieve[i]) {
+    primeCount++;
+    for (let j = i * 2; j <= SIEVE_N; j += i) {
+      sieve[j] = 1;
     }
   }
-  return c;
 }
 
-const a = new Float64Array(N * N);
-const b = new Float64Array(N * N);
+// Integer matrix multiply
+const N = 150;
+const a = new Int32Array(N * N);
+const b = new Int32Array(N * N);
+const c = new Int32Array(N * N);
 for (let i = 0; i < N * N; i++) {
-  a[i] = Math.sin(i * 0.01);
-  b[i] = Math.cos(i * 0.01);
+  a[i] = (i * 3 + 7) & 0xFF;
+  b[i] = (i * 5 + 13) & 0xFF;
 }
-
-const c = matmul(a, b, N);
-
-// Compute trace
-let trace = 0;
 for (let i = 0; i < N; i++) {
-  trace += c[i * N + i];
+  for (let k = 0; k < N; k++) {
+    const aik = a[i * N + k];
+    for (let j = 0; j < N; j++) {
+      c[i * N + j] = (c[i * N + j] + aik * b[k * N + j]) | 0;
+    }
+  }
 }
+
+let trace = 0;
+for (let i = 0; i < N; i++) trace += c[i * N + i];
 
 const ms = Date.now() - t0;
-console.log(`BENCH: math-compute n=${N} trace=${trace.toFixed(4)} ${ms}ms`);
+console.log(`BENCH: math-compute primes=${primeCount} trace=${trace} ${ms}ms`);

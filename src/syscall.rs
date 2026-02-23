@@ -98,6 +98,7 @@ const SYS_ACCEPT4: u64 = 242;
 // Error codes
 const ENOSYS: i64 = -38;
 const ENOMEM: i64 = -12;
+const EINTR: i64 = -4;
 const EBADF: i64 = -9;
 const EINVAL: i64 = -22;
 const ENOENT: i64 = -2;
@@ -202,6 +203,19 @@ static mut TIMERFD_ALLOC: usize = 0;
 const TIOCGWINSZ: u64 = 0x5413;
 const TCGETS: u64 = 0x5401;
 const FIONREAD: u64 = 0x541B;
+
+/// Reset all static mut globals to their initial state.
+/// Must be called before each new program execution to avoid stale state.
+pub unsafe fn reset_statics() {
+    SOCKETS = [EMPTY_SOCKET; MAX_SOCKETS];
+    EPOLL_ENTRIES = [EMPTY_EPOLL; MAX_EPOLL_ENTRIES];
+    EPOLL_COUNT = 0;
+    EVENTFD_COUNTERS = [0; MAX_EVENTFDS];
+    EVENTFD_ALLOC = 0;
+    TIMERFD_EXPIRY_MS = [0.0; MAX_TIMERFDS];
+    TIMERFD_INTERVAL_MS = [0.0; MAX_TIMERFDS];
+    TIMERFD_ALLOC = 0;
+}
 
 /// Handle a syscall. Called from cpu.rs when ECALL is executed.
 /// Reads syscall number from x[17] (a7), args from x[10..16] (a0..a6).
@@ -1122,6 +1136,19 @@ unsafe fn find_runnable(vm: &Vm, exclude: usize) -> i32 {
         }
         i += 1;
     }
+    // Third pass: pick any EPOLL_WAIT thread if there's a listening socket.
+    // The thread will be woken with -EINTR so it can yield to the host for
+    // connection injection. Without this, all threads deadlock: workers return
+    // ETIMEDOUT from futex_wait and the event loop thread never resumes.
+    if has_listening_socket() {
+        i = 0;
+        while i < n && i < MAX_THREADS {
+            if i != exclude && get_tstate(vm, i) == TSTATE_EPOLL_WAIT {
+                return i as i32;
+            }
+            i += 1;
+        }
+    }
     -1
 }
 
@@ -1704,9 +1731,16 @@ unsafe fn sys_epoll_pwait(
             vm._tid_extra = target as i32;
             return vm.x[10] as i64;
         }
-        // No other thread — return 0 to let event loop advance.
-        // In release builds (NDEBUG), libuv's assert(timeout != -1) is disabled,
-        // and the timeout-update logic handles this gracefully.
+        // No other thread to switch to.
+        if has_listening_socket() {
+            // There's a listening server socket — yield to the JS host so it
+            // can inject service worker connections. On real Linux, epoll_wait
+            // would block here. We yield with STATUS_EPOLL_BLOCKED; the host
+            // resumes us after checking for incoming connections.
+            vm.status = STATUS_EPOLL_BLOCKED;
+            return 0; // host will set a0 to -EINTR before resuming
+        }
+        // No listening socket: return 0 (timeout expired).
     }
     0 // Return 0 events
 }
@@ -1891,6 +1925,18 @@ unsafe fn get_socket_slot(vm: &Vm, fd: i32) -> i32 {
         return -1;
     }
     slot
+}
+
+/// Check if any socket is in LISTENING state.
+unsafe fn has_listening_socket() -> bool {
+    let mut i = 0;
+    while i < MAX_SOCKETS {
+        if SOCKETS[i].state == SOCK_LISTENING {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 unsafe fn find_listener(port: u16) -> i32 {
@@ -2295,6 +2341,9 @@ pub unsafe fn inject_connection(vm: &mut Vm, port: u16, req_ptr: u32, req_len: u
         return -2; // out of socket slots
     }
     let si = server_idx as usize;
+
+    // Mark as non-FREE so the next find_free_socket() won't return the same slot
+    SOCKETS[si].state = SOCK_CONNECTED;
 
     // Allocate client-side socket (our virtual client, for collecting the response)
     let client_idx = find_free_socket();

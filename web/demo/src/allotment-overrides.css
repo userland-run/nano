@@ -1,0 +1,6 @@
+/* Allotment overrides — invisible sash, panels create their own gutter via inset */
+
+:root {
+  --sash-size: 1px;
+  --separator-border: transparent;
+}
