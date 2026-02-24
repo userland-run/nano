@@ -391,6 +391,63 @@ class MemFS {
     return e.node.size;
   }
 
+  // --- Snapshot serialization ---
+
+  serialize() {
+    const nodes = [];
+    const walk = (node) => {
+      const entry = {
+        id: node.ino,
+        parentId: node.parent ? node.parent.ino : 0,
+        name: node.name,
+        mode: node.mode,
+        nlink: node.nlink,
+        size: node.size,
+      };
+      if (node.data) entry.data = node.data.slice();
+      if (node.target !== null) entry.target = node.target;
+      nodes.push(entry);
+      if (node.children) {
+        for (const child of node.children.values()) walk(child);
+      }
+    };
+    walk(this.root);
+    return nodes;
+  }
+
+  static deserialize(data) {
+    const fs = new MemFS();
+    // Pass 1: create all nodes by ino
+    const byId = new Map();
+    let maxIno = 0;
+    for (const entry of data) {
+      const node = new FSNode(entry.name, null, entry.mode);
+      node.ino = entry.id;
+      node.nlink = entry.nlink;
+      node.size = entry.size;
+      if (entry.data) node.data = new Uint8Array(entry.data);
+      if (entry.target !== undefined) node.target = entry.target;
+      if (node.isDir) node.children = new Map();
+      byId.set(entry.id, node);
+      if (entry.id > maxIno) maxIno = entry.id;
+    }
+    // Pass 2: wire parent/child relationships
+    for (const entry of data) {
+      const node = byId.get(entry.id);
+      const parent = entry.parentId ? byId.get(entry.parentId) : node;
+      node.parent = parent;
+      if (parent && parent !== node && parent.children) {
+        parent.children.set(node.name, node);
+      }
+    }
+    // Set root (first entry is always root)
+    fs.root = byId.get(data[0].id);
+    fs.root.parent = fs.root;
+    // Advance ino counter past all serialized nodes
+    _nextIno = maxIno + 1;
+    return fs;
+  }
+
   // --- Tar.gz extraction ---
 
   async loadTarGz(compressedBuffer) {

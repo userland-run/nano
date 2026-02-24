@@ -78,6 +78,7 @@ class NanoVM {
     this._onStdout = null;
     this._virtualServer = null;
     this._scratchPtr = 0; // WASM linear memory scratch buffer for virtual server
+    this._snapshotRequested = false; // set by sentinel detection in _processFsRequest
   }
 
   /**
@@ -98,11 +99,16 @@ class NanoVM {
     const { ramMB = 512, wasm, busyboxUrl, nodeUrl } = opts;
     this._ramMB = ramMB;
 
-    // Fetch WASM binary
-    const wasmUrl = typeof wasm === "string" ? wasm : "/nano.wasm";
-    const wasmResponse = await fetch(wasmUrl);
-    if (!wasmResponse.ok) throw new Error(`Failed to fetch WASM: ${wasmResponse.status}`);
-    const wasmBytes = await wasmResponse.arrayBuffer();
+    // Load WASM binary (accepts URL string, ArrayBuffer, or Uint8Array)
+    let wasmBytes;
+    if (wasm instanceof ArrayBuffer || wasm instanceof Uint8Array) {
+      wasmBytes = wasm;
+    } else {
+      const wasmUrl = typeof wasm === "string" ? wasm : "/nano.wasm";
+      const wasmResponse = await fetch(wasmUrl);
+      if (!wasmResponse.ok) throw new Error(`Failed to fetch WASM: ${wasmResponse.status}`);
+      wasmBytes = await wasmResponse.arrayBuffer();
+    }
 
     // Create shared memory
     const ramPages = Math.floor((ramMB * 1024 * 1024) / 65536);
@@ -367,6 +373,151 @@ class NanoVM {
     this._virtualServer = null;
   }
 
+  // ============================================================
+  // Public API — Snapshotting
+  // ============================================================
+
+  /**
+   * Capture a snapshot of the current VM state.
+   * Call this when the VM is paused at a clean boundary (e.g. after snapshotReady).
+   * @returns {{ vmStruct: Uint8Array, guestRAM: Uint8Array, usedRAMSize: number, memfs: Array }}
+   */
+  snapshot() {
+    const dv = new DataView(this._memory.buffer);
+    const v = this._vmPtr;
+
+    // Low region: heap + mmap area (grows upward from 0)
+    const brkCurrent = Number(dv.getBigUint64(v + 568, true));
+    const mmapNext = Number(dv.getBigUint64(v + 3312, true));
+    const lowEnd = Math.min(Math.max(brkCurrent, mmapNext), this._ramSize);
+
+    // High region: stack (grows downward from ram_size)
+    const sp = Number(dv.getBigUint64(v + 16, true)); // x[2] = sp
+    // 64KB margin below sp for safety, page-aligned
+    const stackStart = Math.max(lowEnd, (sp - 65536) & ~0xFFF);
+
+    // Copy VM struct
+    const vmStruct = new Uint8Array(this._memory.buffer, v, VM_STRUCT_SIZE).slice();
+
+    // Copy low region (heap + mmap)
+    const lowRAM = new Uint8Array(this._memory.buffer, this._ramPtr, lowEnd).slice();
+
+    // Copy stack region
+    const stackSize = this._ramSize - stackStart;
+    const stackRAM = stackSize > 0
+      ? new Uint8Array(this._memory.buffer, this._ramPtr + stackStart, stackSize).slice()
+      : new Uint8Array(0);
+
+    // Serialize MemFS
+    const memfs = this._memfs.serialize();
+
+    return { vmStruct, lowRAM, lowEnd, stackRAM, stackStart, memfs };
+  }
+
+  /**
+   * Restore a snapshot and run injected code.
+   * @param {Object} snap - Snapshot from snapshot()
+   * @param {string} script - JavaScript source to inject as /dev/__run__
+   * @param {Object} [opts]
+   * @param {function} [opts.onStdout] - callback for stdout chunks
+   * @param {number} [opts.maxSteps] - max instructions (default 2M)
+   * @returns {Promise<{exitCode: number, stdout: string}>}
+   */
+  async restoreAndRun(snap, script, opts = {}) {
+    const { onStdout, maxSteps = 2_000_000 } = opts;
+
+    this._stdout = "";
+    this._onStdout = onStdout || null;
+
+    const X = this._exports;
+    const v = this._vmPtr;
+    const mem = new Uint8Array(this._memory.buffer);
+
+    // 1. Reset block cache + syscall statics
+    if (X.vm_snapshot_restore_reset) {
+      X.vm_snapshot_restore_reset();
+    } else {
+      // Fallback: reset separately
+      if (X.vm_reset_blocks) X.vm_reset_blocks();
+      if (X.vm_reset_statics) X.vm_reset_statics();
+    }
+
+    // 2. Restore VM struct
+    mem.set(snap.vmStruct, v);
+
+    // 3. Restore guest RAM (dual-region: low heap/mmap + high stack)
+    mem.set(snap.lowRAM, this._ramPtr);
+
+    // 4. Zero gap between low region and stack
+    if (snap.stackStart > snap.lowEnd) {
+      mem.fill(0, this._ramPtr + snap.lowEnd, this._ramPtr + snap.stackStart);
+    }
+
+    // 5. Restore stack region
+    if (snap.stackRAM.length > 0) {
+      mem.set(snap.stackRAM, this._ramPtr + snap.stackStart);
+    }
+
+    // 6. Rebuild MemFS from snapshot
+    this._memfs = MemFS.deserialize(snap.memfs);
+
+    // 7. Inject user script into MemFS at /dev/__run__
+    this._memfs.createFile("/dev/__run__", script);
+
+    // 8. Complete the pending writeFileSync: a0 = 0 (success), status = OK
+    const dv = new DataView(this._memory.buffer);
+    dv.setBigInt64(v + 80, 0n, true);          // a0 = 0
+    dv.setInt32(v + 528, STATUS_OK, true);      // status = STATUS_OK
+
+    // 9. Resume execution
+    return this._runLoop(maxSteps);
+  }
+
+  /**
+   * Convenience: snapshot Node.js after V8 init using the launcher script pattern.
+   * @param {Object} [opts]
+   * @param {number} [opts.maxSteps] - max steps for warmup phase (default 50M)
+   * @returns {Promise<Object>} snapshot object for use with restoreAndRun()
+   */
+  async nodeSnapshot(opts = {}) {
+    if (!this._nodeElf) throw new Error("No node ELF loaded");
+    const { maxSteps = 2_000_000_000 } = opts;
+
+    // Seed the launcher script into MemFS
+    const launcher = [
+      "const fs = require('fs');",
+      "fs.writeFileSync('/dev/__snapshot__', 'snap');",
+      "const __s = fs.readFileSync('/dev/__run__', 'utf8');",
+      "(new Function(__s))();",
+    ].join("\n");
+    this._memfs.createFile("/launcher.js", launcher);
+
+    this._stdout = "";
+    this._onStdout = null;
+
+    // Reset and load Node ELF
+    this._resetVM();
+    const mem = new Uint8Array(this._memory.buffer);
+    mem.set(this._nodeElf, this._ramPtr);
+
+    const X = this._exports;
+    const loadRc = X.vm_load_elf(this._vmPtr, 0, this._nodeElf.length);
+    if (loadRc !== 0) throw new Error(`vm_load_elf failed: ${loadRc}`);
+
+    // Set up argv: node /launcher.js
+    const argv = ["node", "/launcher.js"];
+    const envVars = ["UV_THREADPOOL_SIZE=0"];
+    this._setupArgv(argv, envVars);
+
+    // Run until snapshot sentinel
+    const result = await this._runLoop(maxSteps);
+    if (!result.snapshotReady) {
+      throw new Error("Node.js did not reach snapshot sentinel within budget");
+    }
+
+    return this.snapshot();
+  }
+
   // Getters for runtime.ts compatibility
   get exports() { return this._exports; }
   get memory() { return this._memory; }
@@ -397,13 +548,22 @@ class NanoVM {
     // Set up argv/envp on the stack
     this._setupArgv(argv, extraEnv);
 
-    // Execution loop with periodic yielding
+    return this._runLoop(maxSteps);
+  }
+
+  /**
+   * Core execution loop. Runs the VM until exit, fault, snapshot sentinel, or budget exhaustion.
+   * @param {number} maxSteps - Max instructions to execute
+   * @returns {Promise<{exitCode: number, stdout: string, snapshotReady?: boolean}>}
+   */
+  async _runLoop(maxSteps) {
+    const X = this._exports;
     const BUDGET = 100_000;
     const maxIter = Math.ceil(maxSteps / BUDGET);
     let yieldCounter = 0;
     let stepCounter = 0;
-    // Detect server mode: once stdout contains "listening", keep loop alive
     let serverMode = false;
+    this._snapshotRequested = false;
 
     for (let iter = 0; iter < maxIter; iter++) {
       try {
@@ -422,8 +582,11 @@ class NanoVM {
 
       if (status === STATUS_FS_PENDING) {
         this._processFsRequest();
+        // Snapshot sentinel was hit — return control to caller
+        if (this._snapshotRequested) {
+          return { exitCode: 0, stdout: this._stdout, snapshotReady: true };
+        }
         iter--; // FS operations don't consume execution budget
-        // Yield periodically during heavy FS activity to keep UI responsive
         if (++yieldCounter % 200 === 0) {
           await new Promise(r => setTimeout(r, 0));
         }
@@ -432,15 +595,12 @@ class NanoVM {
 
       if (status === STATUS_EPOLL_BLOCKED) {
         serverMode = true;
-        // VM is blocked in epoll_wait with a listening socket.
-        // Yield to the event loop so service worker requests can arrive,
-        // then set a0 = -EINTR so libuv retries epoll_wait.
         await new Promise(r => setTimeout(r, 0));
         this._pollConnections();
         const dv = new DataView(this._memory.buffer);
         dv.setBigInt64(this._vmPtr + 80, BigInt(-4), true); // a0 = -EINTR
-        dv.setInt32(this._vmPtr + 528, STATUS_OK, true); // reset status
-        iter--; // don't consume execution budget while blocked
+        dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+        iter--;
         continue;
       }
 
@@ -448,18 +608,13 @@ class NanoVM {
         return { exitCode: -1, stdout: this._stdout };
       }
 
-      // Auto-detect server mode: if stdout contains "listening", keep alive
       if (!serverMode && /listening/i.test(this._stdout)) {
         serverMode = true;
       }
-
-      // In server mode, don't consume iteration budget
       if (serverMode) iter--;
 
-      // Poll pending virtual connections for response data
       this._pollConnections();
 
-      // Yield to event loop every 5 steps (~500K instructions) to keep UI responsive
       if (stepCounter % 5 === 0) {
         await new Promise(r => setTimeout(r, 0));
       }
@@ -729,6 +884,53 @@ class NanoVM {
 
     const path = this._resolvePath(rawPath);
     const path2 = rawPath2 ? this._resolvePath(rawPath2) : "";
+
+    // Snapshot sentinel: detect openat for /dev/__snapshot__
+    // writeFileSync will open, write, then close. We intercept the open
+    // to assign a sentinel host_fd (-99), and intercept the write to that
+    // fd to trigger the snapshot.
+    if (syscallNr === SYS_OPENAT && path === "/dev/__snapshot__") {
+      const newGfd = this._fdAlloc(dv);
+      if (newGfd >= 0) {
+        this._fdWrite(dv, newGfd, FD_TYPE_FILE, -99, 0, 0);
+      }
+      this._setA0(dv, newGfd >= 0 ? newGfd : -28);
+      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+      return;
+    }
+    // Handle sentinel fd operations (host_fd === -99)
+    if (gfd >= 0 && gfd < MAX_FDS) {
+      const fe = this._fdRead(dv, gfd);
+      if (fe.host_fd === -99) {
+        if (syscallNr === SYS_WRITE) {
+          // Pretend write succeeded
+          const count = bufLen || arg1;
+          this._setA0(dv, count);
+          dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+          return;
+        }
+        if (syscallNr === SYS_FSTAT) {
+          // Return fake regular file stat
+          const statBufPhys = ramPtr + (arg1 >>> 0);
+          new Uint8Array(this._memory.buffer, statBufPhys, 128).fill(0);
+          const sdv = new DataView(this._memory.buffer, statBufPhys, 128);
+          sdv.setUint32(16, 0o100644, true); // st_mode = regular file
+          sdv.setUint32(20, 1, true);        // st_nlink
+          sdv.setInt32(56, 4096, true);      // st_blksize
+          this._setA0(dv, 0);
+          dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+          return;
+        }
+        if (syscallNr === SYS_CLOSE) {
+          // Close triggers the snapshot — writeFileSync is complete
+          this._fdClear(dv, gfd);
+          this._snapshotRequested = true;
+          this._setA0(dv, 0);
+          dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+          return;
+        }
+      }
+    }
 
     let result = 0;
 

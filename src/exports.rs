@@ -394,6 +394,13 @@ pub extern "C" fn vm_reset_blocks() {
     cpu::reset_blocks();
 }
 
+/// Reset all cached state for snapshot restore (block cache + syscall statics)
+#[no_mangle]
+pub unsafe extern "C" fn vm_snapshot_restore_reset() {
+    cpu::reset_blocks();
+    crate::syscall::reset_statics();
+}
+
 /// No-op: matches reference where console_queue_char aliases free()
 #[no_mangle]
 pub extern "C" fn console_queue_char(_ch: i32) {
