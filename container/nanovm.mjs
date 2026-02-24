@@ -79,6 +79,7 @@ class NanoVM {
     this._virtualServer = null;
     this._scratchPtr = 0; // WASM linear memory scratch buffer for virtual server
     this._snapshotRequested = false; // set by sentinel detection in _processFsRequest
+    this._runId = 0; // incremented on each run; checked in _runLoop for cancellation
   }
 
   /**
@@ -363,6 +364,11 @@ class NanoVM {
     return this._execute(this._nodeElf, args, envVars, opts);
   }
 
+  /** Cancel the currently running execution loop. */
+  cancelRun() {
+    this._runId++;
+  }
+
   destroy() {
     this._memfs = null;
     this._exports = null;
@@ -460,6 +466,13 @@ class NanoVM {
 
     // 6. Rebuild MemFS from snapshot
     this._memfs = MemFS.deserialize(snap.memfs);
+
+    // 6b. Inject extra user files (e.g. from OPFS)
+    if (opts.extraFiles) {
+      for (const { path, content } of opts.extraFiles) {
+        this._memfs.createFile(path, content);
+      }
+    }
 
     // 7. Inject user script into MemFS at /dev/__run__
     this._memfs.createFile("/dev/__run__", script);
@@ -564,8 +577,12 @@ class NanoVM {
     let stepCounter = 0;
     let serverMode = false;
     this._snapshotRequested = false;
+    const myRunId = ++this._runId;
 
     for (let iter = 0; iter < maxIter; iter++) {
+      if (this._runId !== myRunId) {
+        return { exitCode: -1, stdout: this._stdout, cancelled: true };
+      }
       try {
         X.vm_step(this._vmPtr, BUDGET);
       } catch (e) {

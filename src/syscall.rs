@@ -199,6 +199,12 @@ static mut TIMERFD_EXPIRY_MS: [f64; MAX_TIMERFDS] = [0.0; MAX_TIMERFDS];
 static mut TIMERFD_INTERVAL_MS: [f64; MAX_TIMERFDS] = [0.0; MAX_TIMERFDS];
 static mut TIMERFD_ALLOC: usize = 0;
 
+/// Hint for find_runnable: set when any thread enters EPOLL_WAIT with a
+/// finite positive timeout (e.g. libuv timer). Tells find_runnable to wake
+/// epoll_wait threads so the event loop can yield to the host for real time
+/// to advance.
+static mut EPOLL_FINITE_TIMEOUT_ACTIVE: bool = false;
+
 // ioctl constants
 const TIOCGWINSZ: u64 = 0x5413;
 const TCGETS: u64 = 0x5401;
@@ -215,6 +221,7 @@ pub unsafe fn reset_statics() {
     TIMERFD_EXPIRY_MS = [0.0; MAX_TIMERFDS];
     TIMERFD_INTERVAL_MS = [0.0; MAX_TIMERFDS];
     TIMERFD_ALLOC = 0;
+    EPOLL_FINITE_TIMEOUT_ACTIVE = false;
 }
 
 /// Handle a syscall. Called from cpu.rs when ECALL is executed.
@@ -1136,11 +1143,11 @@ unsafe fn find_runnable(vm: &Vm, exclude: usize) -> i32 {
         }
         i += 1;
     }
-    // Third pass: pick any EPOLL_WAIT thread if there's a listening socket.
-    // The thread will be woken with -EINTR so it can yield to the host for
-    // connection injection. Without this, all threads deadlock: workers return
-    // ETIMEDOUT from futex_wait and the event loop thread never resumes.
-    if has_listening_socket() {
+    // Third pass: pick any EPOLL_WAIT thread if there's a listening socket
+    // or an active timer wait. This wakes the event loop thread so it can
+    // yield to the host for real time to advance (timers) or to accept
+    // incoming connections (servers).
+    if has_listening_socket() || EPOLL_FINITE_TIMEOUT_ACTIVE {
         i = 0;
         while i < n && i < MAX_THREADS {
             if i != exclude && get_tstate(vm, i) == TSTATE_EPOLL_WAIT {
@@ -1722,6 +1729,9 @@ unsafe fn sys_epoll_pwait(
                 core::ptr::write_unaligned(p.add(TCTX_X + 80) as *mut u64, 0u64);
             }
             set_tstate(vm, current_slot, TSTATE_EPOLL_WAIT);
+            if timeout > 0 {
+                EPOLL_FINITE_TIMEOUT_ACTIVE = true;
+            }
 
             load_thread(vm, target);
             if get_tstate(vm, target) == TSTATE_FUTEX_WAIT {
@@ -1731,16 +1741,17 @@ unsafe fn sys_epoll_pwait(
             vm._tid_extra = target as i32;
             return vm.x[10] as i64;
         }
-        // No other thread to switch to.
-        if has_listening_socket() {
-            // There's a listening server socket — yield to the JS host so it
-            // can inject service worker connections. On real Linux, epoll_wait
-            // would block here. We yield with STATUS_EPOLL_BLOCKED; the host
-            // resumes us after checking for incoming connections.
+        // No other thread to switch to — all threads are deadlocked.
+        // Yield to the host when:
+        // - there's a listening socket (server waiting for connections), OR
+        // - timeout > 0 (finite wait, e.g. libuv timer — real time must advance)
+        // We do NOT yield for timeout == -1 without a listening socket, as that
+        // would slow down V8 init where worker threads block with infinite waits.
+        if has_listening_socket() || timeout > 0 {
             vm.status = STATUS_EPOLL_BLOCKED;
             return 0; // host will set a0 to -EINTR before resuming
         }
-        // No listening socket: return 0 (timeout expired).
+        // No listening socket and infinite timeout: return 0 (timeout expired).
     }
     0 // Return 0 events
 }
@@ -1938,6 +1949,8 @@ unsafe fn has_listening_socket() -> bool {
     }
     false
 }
+
+
 
 unsafe fn find_listener(port: u16) -> i32 {
     let mut i = 0;

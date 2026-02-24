@@ -3,10 +3,13 @@
 
 // @ts-ignore — nanovm.mjs is a JS module, no types
 import { NanoVM } from "@container/nanovm.mjs";
+import * as opfs from "./opfs";
 
 let vmInstance: any = null;
 let vmReady = false;
 let initPromise: Promise<void> | null = null;
+let nodeSnapshot: any = null;
+let snapshotPromise: Promise<any> | null = null;
 
 export async function ensureVM(): Promise<any> {
   if (vmInstance && vmReady) return vmInstance;
@@ -61,36 +64,125 @@ export async function runBusybox(
   });
 }
 
+/** Parse node args into either inline code or a file path. */
+function parseNodeArgs(args: string[]): { kind: "code"; code: string } | { kind: "file"; path: string } | null {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "-e" && i + 1 < args.length) {
+      return { kind: "code", code: args[i + 1] };
+    }
+    if (args[i] === "-p" && i + 1 < args.length) {
+      return { kind: "code", code: `process.stdout.write(String(${args[i + 1]}))` };
+    }
+    // First non-flag arg is a file path
+    if (!args[i].startsWith("-")) {
+      return { kind: "file", path: args[i] };
+    }
+  }
+  return null;
+}
+
+async function ensureNodeSnapshot(): Promise<any> {
+  const vm = await ensureVM();
+  if (nodeSnapshot) return nodeSnapshot;
+  if (snapshotPromise) return snapshotPromise;
+
+  snapshotPromise = (async () => {
+    const t0 = performance.now();
+    console.log("[NanoVM] Creating Node.js snapshot (cold start)...");
+    nodeSnapshot = await vm.nodeSnapshot();
+    console.log(`[NanoVM] Snapshot created in ${(performance.now() - t0).toFixed(0)}ms`);
+    return nodeSnapshot;
+  })();
+
+  return snapshotPromise;
+}
+
 export async function runNode(
   args: string[],
   opts: { onStdout?: (chunk: string) => void; stdin?: string; maxSteps?: number } = {}
 ): Promise<{ exitCode: number; stdout: string }> {
   const vm = await ensureVM();
-  return vm.node(...args, {
+  const maxSteps = opts.maxSteps || 2_000_000_000;
+
+  const parsed = parseNodeArgs(args);
+
+  // If we can't map args to a snapshot script, fall back to cold start
+  if (parsed === null) {
+    return vm.node(...args, {
+      onStdout: opts.onStdout,
+      stdin: opts.stdin,
+      maxSteps,
+    });
+  }
+
+  let script: string;
+  if (parsed.kind === "file") {
+    // Use require() so the file gets proper module context
+    // (require, __filename, __dirname, module, exports)
+    script = `process.mainModule.require('${parsed.path}')`;
+  } else {
+    script = parsed.code;
+  }
+
+  // Sync OPFS user files into MemFS via extraFiles
+  const extraFiles = await opfs.walkFiles("/examples");
+
+  const snap = await ensureNodeSnapshot();
+  const t0 = performance.now();
+  const result = await vm.restoreAndRun(snap, script, {
     onStdout: opts.onStdout,
-    stdin: opts.stdin,
-    maxSteps: opts.maxSteps || 2_000_000_000,
+    maxSteps,
+    extraFiles,
   });
+  console.log(`[NanoVM] Node.js warm start completed in ${(performance.now() - t0).toFixed(0)}ms`);
+  return result;
 }
 
 export async function addFile(path: string, content: string | Uint8Array) {
+  if (path.startsWith("/examples/")) {
+    const text = content instanceof Uint8Array
+      ? new TextDecoder().decode(content)
+      : content;
+    await opfs.writeFile(path, text);
+    return;
+  }
   const vm = await ensureVM();
   vm.addFile(path, content);
 }
 
 export async function readFile(path: string): Promise<string | null> {
+  if (path.startsWith("/examples/")) {
+    return opfs.readFile(path);
+  }
   const vm = await ensureVM();
   return vm.readFileString(path);
 }
 
 export async function listDir(path: string) {
+  if (path === "/examples" || path.startsWith("/examples/")) {
+    const entries = await opfs.listDir(path);
+    if (entries) {
+      return entries.map((e) => ({ name: e.name, type: e.type, size: 0 }));
+    }
+    return null;
+  }
   const vm = await ensureVM();
   return vm.listDir(path);
 }
 
+/** Cancel any in-progress run loop without destroying the VM or snapshot. */
+export function cancelRun() {
+  if (vmInstance) {
+    vmInstance.cancelRun();
+  }
+}
+
 export async function resetVFS() {
   // Destroy and re-create to get a fresh FS
+  nodeSnapshot = null;
+  snapshotPromise = null;
   if (vmInstance) {
+    vmInstance.cancelRun();
     vmInstance.destroy();
     vmInstance = null;
     vmReady = false;

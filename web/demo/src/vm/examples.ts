@@ -1,5 +1,7 @@
 // VFS seed data — all example files for the NanoVM demo.
 
+import * as opfs from "./opfs";
+
 interface ExampleFile {
   path: string;
   content: string;
@@ -1000,4 +1002,13 @@ export async function loadExamples(vm: any): Promise<void> {
   for (const example of EXAMPLES) {
     vm.addFile(example.path, example.content);
   }
+}
+
+/** Seed example files into OPFS if not already done. */
+export async function seedOpfsExamples(): Promise<void> {
+  if (await opfs.isSeeded()) return;
+  for (const example of EXAMPLES) {
+    await opfs.writeFile(example.path, example.content);
+  }
+  await opfs.markSeeded();
 }

@@ -10,9 +10,10 @@ import Sidebar from "./components/Sidebar";
 import Editor from "./components/Editor";
 import OutputPanel from "./components/OutputPanel";
 import { ensureVM } from "./vm/runtime";
-import { loadExamples } from "./vm/examples";
+import { seedOpfsExamples } from "./vm/examples";
 import { registerServiceWorker } from "./vm/sw-bridge";
 import * as runtime from "./vm/runtime";
+import * as opfs from "./vm/opfs";
 import type { RuntimeMode, RightPanelTab, DemoManifest } from "./types";
 
 // Layer 1: app shell background — visible as gutters between panels
@@ -90,8 +91,8 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const vm = await ensureVM();
-        await loadExamples(vm);
+        await ensureVM();
+        await seedOpfsExamples();
         await registerServiceWorker();
         setReady(true);
         handleFileOpen("/examples/01-basic/hello.js");
@@ -176,17 +177,13 @@ export default function App() {
     })();
   }, [command, running]);
 
-  const handleStop = useCallback(async () => {
+  const handleStop = useCallback(() => {
     if (runAbortRef.current) runAbortRef.current();
+    runtime.cancelRun();
 
     setRunning(false);
     setPreviewUrl(null);
     setOutput((prev) => [...prev, "\n[stopped]\n"]);
-
-    await runtime.resetVFS();
-    const vm = await ensureVM();
-    await loadExamples(vm);
-    setTreeKey((k) => k + 1);
   }, []);
 
   const handleReset = useCallback(async () => {
@@ -195,8 +192,8 @@ export default function App() {
     setPreviewUrl(null);
 
     await runtime.resetVFS();
-    const vm = await ensureVM();
-    await loadExamples(vm);
+    await opfs.clearAll();
+    await seedOpfsExamples();
     setTreeKey((k) => k + 1);
     setOutput([]);
     setOpenFile(null);
