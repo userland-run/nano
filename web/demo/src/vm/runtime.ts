@@ -19,9 +19,26 @@ export async function ensureVM(): Promise<any> {
   }
 
   initPromise = (async () => {
+    // Fetch WASM chunks and concatenate (split to stay under GitHub's 100MB limit)
+    const base = import.meta.env.BASE_URL;
+    const chunks = await Promise.all(
+      ["nano.wasm.aa", "nano.wasm.ab"].map(async (name) => {
+        const res = await fetch(base + name);
+        if (!res.ok) throw new Error(`Failed to fetch ${name}: ${res.status}`);
+        return new Uint8Array(await res.arrayBuffer());
+      })
+    );
+    const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);
+    const wasmBytes = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const chunk of chunks) {
+      wasmBytes.set(chunk, offset);
+      offset += chunk.length;
+    }
+
     vmInstance = await NanoVM.create({
       ramMB: 1800,
-      wasm: import.meta.env.BASE_URL + "nano.wasm",
+      wasm: wasmBytes.buffer,
     });
 
     // Load bundled devenv tarball if available
