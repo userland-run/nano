@@ -525,19 +525,39 @@ class NanoVM {
   }
 
   /**
-   * Snapshot the current grid for rendering. Returns dimensions, cursor, and a
-   * copy of the cell bytes (row-major, 8 bytes/cell: u32 ch, u8 fg, u8 bg,
-   * u8 flags, u8 pad), or null if the build lacks terminal exports.
-   * @returns {{cols:number, rows:number, cursorRow:number, cursorCol:number, cells:Uint8Array}|null}
+   * Snapshot the grid for rendering. Returns dimensions, cursor, a copy of the
+   * cell bytes (row-major, 8 bytes/cell: u32 ch, u8 fg, u8 bg, u8 flags, u8 pad),
+   * and the scroll position, or null if the build lacks terminal exports.
+   *
+   * `scrollOffset` is the number of scrollback lines scrolled up from the live
+   * bottom (0 = live). It is clamped to `scrollMax`; the cursor is hidden
+   * (-1/-1) whenever the viewport is scrolled off the live region.
+   * @param {number} [scrollOffset=0]
+   * @returns {{cols:number, rows:number, cursorRow:number, cursorCol:number,
+   *   cells:Uint8Array, scrollOffset:number, scrollMax:number}|null}
    */
-  termSnapshot() {
+  termSnapshot(scrollOffset = 0) {
     const X = this._exports;
     if (!this._termEnabled || !X.term_cells_ptr) return null;
     const cols = X.term_cols();
     const rows = X.term_rows();
-    const ptr = X.term_cells_ptr();
+    let ptr, scrollMax = 0, off = 0;
+    if (X.term_compose && X.term_view_ptr && X.term_scroll_max) {
+      scrollMax = X.term_scroll_max();
+      off = Math.max(0, Math.min(scrollOffset | 0, scrollMax));
+      X.term_compose(off);
+      ptr = X.term_view_ptr();
+    } else {
+      ptr = X.term_cells_ptr(); // pre-scrollback build: live screen only
+    }
     const cells = new Uint8Array(this._memory.buffer, ptr, cols * rows * 8).slice();
-    return { cols, rows, cursorRow: X.term_cursor_row(), cursorCol: X.term_cursor_col(), cells };
+    const live = off === 0;
+    return {
+      cols, rows,
+      cursorRow: live ? X.term_cursor_row() : -1,
+      cursorCol: live ? X.term_cursor_col() : -1,
+      cells, scrollOffset: off, scrollMax,
+    };
   }
 
   /**
@@ -629,6 +649,7 @@ class NanoVM {
       vmStruct: new Uint8Array(this._memory.buffer, v, VM_STRUCT_SIZE).slice(),
       lowRAM: new Uint8Array(this._memory.buffer, this._ramPtr, lowEnd).slice(),
       stackRAM: new Uint8Array(this._memory.buffer, this._ramPtr + stackStart, this._ramSize - stackStart).slice(),
+      lowEnd,
       stackStart,
     };
   }
@@ -638,6 +659,15 @@ class NanoVM {
     const mem = new Uint8Array(this._memory.buffer);
     mem.set(snap.vmStruct, this._vmPtr);
     mem.set(snap.lowRAM, this._ramPtr);
+    // Zero the gap between the parent's heap/mmap top and its stack. The child
+    // ran in-place — execve loaded a fresh image that grew its own heap/stack
+    // through this region — so it holds the child's garbage. The parent treats
+    // this as free memory and expects zeroed pages when it later grows brk/stack
+    // into it; leaving child bytes here corrupts the parent nondeterministically.
+    // Mirrors the gap-zero in restoreAndRun()'s persistence restore.
+    if (snap.stackStart > snap.lowEnd) {
+      mem.fill(0, this._ramPtr + snap.lowEnd, this._ramPtr + snap.stackStart);
+    }
     if (snap.stackRAM.length) mem.set(snap.stackRAM, this._ramPtr + snap.stackStart);
   }
 

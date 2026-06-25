@@ -55,6 +55,10 @@ const MAX_COLS: usize = 200;
 const MAX_ROWS: usize = 64;
 const MAX_CELLS: usize = MAX_COLS * MAX_ROWS;
 
+/// Scrollback ring depth (lines retained above the live viewport). Fixed-capacity
+/// to honour nano's no-heap design: 1000 × MAX_COLS × 8 ≈ 1.6 MB of static.
+const SCROLL_LINES: usize = 1000;
+
 /// The terminal grid + parser state. A single static instance (`TERM`).
 #[repr(C)]
 struct Term {
@@ -93,7 +97,8 @@ impl Term {
         self.pen_flags = FLAG_FG_DEFAULT | FLAG_BG_DEFAULT;
     }
 
-    /// Reset dimensions and clear the screen.
+    /// Reset dimensions and clear the screen. Scrollback is dropped on resize —
+    /// stored lines were wrapped at the old width, and reflow is a later phase.
     fn resize(&mut self, cols: u32, rows: u32) {
         self.cols = cols.clamp(1, MAX_COLS as u32);
         self.rows = rows.clamp(1, MAX_ROWS as u32);
@@ -101,6 +106,7 @@ impl Term {
         self.cur_col = 0;
         self.reset_pen();
         self.clear_all();
+        unsafe { (*addr_of_mut!(SB)).clear(); }
     }
 
     fn clear_all(&mut self) {
@@ -110,10 +116,14 @@ impl Term {
         }
     }
 
-    /// Scroll the viewport up by one line, clearing the new bottom row.
+    /// Scroll the viewport up by one line, clearing the new bottom row. The
+    /// evicted top row is pushed into the scrollback ring so it can be scrolled
+    /// back to.
     fn scroll_up(&mut self) {
         let cols = self.cols as usize;
         let rows = self.rows as usize;
+        // Capture the top row into scrollback before it is overwritten.
+        unsafe { (*addr_of_mut!(SB)).push(&self.cells[0..cols]); }
         for r in 0..rows - 1 {
             let (dst0, src0) = (r * cols, (r + 1) * cols);
             self.cells.copy_within(src0..src0 + cols, dst0);
@@ -331,6 +341,80 @@ impl Perform for Term {
 static mut TERM: Term = Term::NEW;
 static mut PARSER: Option<Parser> = None;
 
+/// Fixed-capacity scrollback ring of evicted top rows (each padded to MAX_COLS).
+struct Scrollback {
+    lines: [[Cell; MAX_COLS]; SCROLL_LINES],
+    head: usize,  // ring index of the oldest retained line
+    count: usize, // number of valid lines (<= SCROLL_LINES)
+}
+
+impl Scrollback {
+    const NEW: Scrollback = Scrollback {
+        lines: [[Cell::BLANK; MAX_COLS]; SCROLL_LINES],
+        head: 0,
+        count: 0,
+    };
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.count = 0;
+    }
+
+    /// Append one line (the evicted screen top row), overwriting the oldest when full.
+    fn push(&mut self, row: &[Cell]) {
+        let slot = if self.count == SCROLL_LINES {
+            let s = self.head;
+            self.head = (self.head + 1) % SCROLL_LINES;
+            s
+        } else {
+            let s = (self.head + self.count) % SCROLL_LINES;
+            self.count += 1;
+            s
+        };
+        let line = &mut self.lines[slot];
+        *line = [Cell::BLANK; MAX_COLS];
+        for (i, &cell) in row.iter().enumerate().take(MAX_COLS) {
+            line[i] = cell;
+        }
+    }
+
+    /// The j-th retained line (0 = oldest).
+    #[inline]
+    fn line(&self, j: usize) -> &[Cell; MAX_COLS] {
+        &self.lines[(self.head + j) % SCROLL_LINES]
+    }
+}
+
+static mut SB: Scrollback = Scrollback::NEW;
+
+/// Composed viewport buffer, filled by `term_compose` for the renderer to read.
+/// Separate from the live `TERM.cells` so scrolling back never disturbs the grid.
+static mut VIEW: [Cell; MAX_CELLS] = [Cell::BLANK; MAX_CELLS];
+
+/// Fill `VIEW` with the `rows` visible lines at scroll `offset` (lines scrolled up
+/// from the live bottom, clamped to the scrollback depth). `offset == 0` reproduces
+/// the live screen exactly.
+unsafe fn compose(offset: u32) {
+    let term = &*addr_of!(TERM);
+    let sb = &*addr_of!(SB);
+    let view = &mut *addr_of_mut!(VIEW);
+    let cols = term.cols as usize;
+    let rows = term.rows as usize;
+    let off = (offset as usize).min(sb.count);
+    let top = sb.count - off; // first visible absolute line index (into sb ++ screen)
+    for vy in 0..rows {
+        let line_idx = top + vy;
+        for c in 0..cols {
+            let cell = if line_idx < sb.count {
+                sb.line(line_idx)[c]
+            } else {
+                term.cells[(line_idx - sb.count) * cols + c]
+            };
+            view[vy * cols + c] = cell;
+        }
+    }
+}
+
 #[inline]
 unsafe fn parser_mut() -> &'static mut Parser {
     let p = &mut *addr_of_mut!(PARSER);
@@ -385,4 +469,24 @@ pub extern "C" fn term_cursor_row() -> u32 {
 #[no_mangle]
 pub extern "C" fn term_cursor_col() -> u32 {
     unsafe { addr_of!(TERM.cur_col).read() }
+}
+
+/// Maximum scroll offset (number of scrollback lines available above the live top).
+#[no_mangle]
+pub extern "C" fn term_scroll_max() -> u32 {
+    unsafe { (*addr_of!(SB)).count as u32 }
+}
+
+/// Compose the viewport for scroll `offset` into the `VIEW` buffer. Call before
+/// reading `term_view_ptr()`; `offset` is clamped to `term_scroll_max()`.
+#[no_mangle]
+pub extern "C" fn term_compose(offset: u32) {
+    unsafe { compose(offset) }
+}
+
+/// Pointer to the composed viewport (row-major, stride = `term_cols()`, 8 bytes/
+/// cell). Valid for `term_cols() * term_rows()` cells after `term_compose`.
+#[no_mangle]
+pub extern "C" fn term_view_ptr() -> u32 {
+    unsafe { addr_of!(VIEW) as u32 }
 }
