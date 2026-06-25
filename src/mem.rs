@@ -1,3 +1,43 @@
+// =====================================================================
+// A2: self-modifying-code detection
+//
+// The guest (V8) emits no `fence.i`, so we watch guest stores instead. Pages the
+// interpreter has built a block from are marked in CODE_PAGES; a store into a
+// marked page sets CODE_DIRTY, and the exec loop invalidates stale blocks before
+// running the next one. Sized to cover the 2GB max guest address space.
+// =====================================================================
+const NUM_CODE_PAGES: usize = 1 << 19; // 524288 * 4KB = 2GB
+static mut CODE_PAGES: [u8; NUM_CODE_PAGES] = [0; NUM_CODE_PAGES];
+static mut CODE_DIRTY: bool = false;
+
+/// Mark the 4KB page containing `guest_addr` as holding cached code.
+#[inline(always)]
+pub unsafe fn mark_code_page(guest_addr: u64) {
+    CODE_PAGES[(guest_addr >> 12) as usize & (NUM_CODE_PAGES - 1)] = 1;
+}
+
+/// Note a guest store: flag dirty if it lands in a page that holds cached code.
+#[inline(always)]
+unsafe fn note_store(guest_addr: u64) {
+    if CODE_PAGES[(guest_addr >> 12) as usize & (NUM_CODE_PAGES - 1)] != 0 {
+        CODE_DIRTY = true;
+    }
+}
+
+/// Take-and-clear the code-dirty flag (polled at the exec loop top).
+#[inline(always)]
+pub unsafe fn take_code_dirty() -> bool {
+    let d = CODE_DIRTY;
+    CODE_DIRTY = false;
+    d
+}
+
+/// Clear all code-page marks (on program load / snapshot restore).
+pub unsafe fn clear_code_pages() {
+    core::ptr::write_bytes(CODE_PAGES.as_mut_ptr(), 0, NUM_CODE_PAGES);
+    CODE_DIRTY = false;
+}
+
 /// Read u8 from guest address
 #[inline(always)]
 pub unsafe fn read_u8(base: u32, addr: u64) -> u8 {
@@ -49,24 +89,28 @@ pub unsafe fn read_i64(base: u32, addr: u64) -> i64 {
 /// Write u8 to guest address
 #[inline(always)]
 pub unsafe fn write_u8(base: u32, addr: u64, val: u8) {
+    note_store(addr);
     *((base + addr as u32) as *mut u8) = val;
 }
 
 /// Write u16 LE to guest address (single WASM i32.store16)
 #[inline(always)]
 pub unsafe fn write_u16(base: u32, addr: u64, val: u16) {
+    note_store(addr);
     ((base + addr as u32) as *mut u16).write_unaligned(val);
 }
 
 /// Write u32 LE to guest address (single WASM i32.store)
 #[inline(always)]
 pub unsafe fn write_u32(base: u32, addr: u64, val: u32) {
+    note_store(addr);
     ((base + addr as u32) as *mut u32).write_unaligned(val);
 }
 
 /// Write u64 LE to guest address (single WASM i64.store)
 #[inline(always)]
 pub unsafe fn write_u64(base: u32, addr: u64, val: u64) {
+    note_store(addr);
     ((base + addr as u32) as *mut u64).write_unaligned(val);
 }
 

@@ -1,6 +1,54 @@
 # NanoVM Performance Analysis
 
-## Current Benchmark Results
+## Implemented: block-engine rework (measurement-driven)
+
+The interpreter originally had a basic-block cache that was **only entered on backward
+branches**. Instrumentation (a `debug_block_*` hit-rate counter, surfaced in `test/run.mjs`'s
+`[progress]`/`[blockstats]` lines) showed this gave **0.2% block coverage even on `loop-compute`** —
+i.e. ~99.8% of the hottest loop ran in the slow per-instruction baseline. The fix landed in stages,
+each gated by the counter and the correctness suite:
+
+| change | what it does |
+|---|---|
+| **C1** | block-cache / dispatch instrumentation (`BLOCK_*`, `JALR/forward` counters → `debug_*` exports) |
+| **A0** | execute FP/AMO instructions *inside* blocks (`build_block` no longer breaks on them) |
+| **B3** | superblocks — blocks span *forward* conditional branches as internal multi-exit points |
+| **A1** | **block dispatch moved to the top of `exec()`** — every control transfer (incl. `JALR`/forward `JAL`/forward branch) now enters a cached block; consecutive blocks chain through the loop top |
+| **A2** | self-modifying-code safety: guest stores into a page that holds cached code invalidate stale blocks (no `fence.i` exists in the guest, so we watch stores — see `src/mem.rs` `note_store`) |
+| **C2** | block cache 4096 → 16384 entries (−62% rebuilds; negligible wall-clock, helps larger workloads) |
+
+### Measured result (Apple Silicon, minimal WASM + RISC-V Node v25)
+
+| benchmark | before | after | wall-clock | block coverage |
+|---|---|---|---|---|
+| loop-compute | 67.3 s | **58.2 s** | **−13%** | 0.2% → **100%** |
+| math-compute | 17.8 s | **15.4 s** | **−13%** | 0.8% → **100%** |
+
+Correctness held throughout: 24/24 ELF+BusyBox+MemFS tests, 9 diverse Node programs
+(json/classes/regex/crypto/proxy-reflect/typed-arrays/…), and result canaries (`74735`, `78498`).
+
+### What the data taught us (three hypotheses the counter killed)
+
+1. *"FP ops break blocks"* (A0) — implemented, coverage stayed 0.2%. Not the limiter.
+2. *"Blocks die at the first conditional branch"* (B3) — implemented, coverage stayed ~0.4%. Not it.
+3. The control-flow counter then showed the truth: for `loop-compute`'s 23.2 B baseline insns, the
+   transfers were **827 M `JALR` + 714 M forward-branch + 196 M forward-`JAL`**, none entering a block
+   because the cache only fired on backward branches. Moving dispatch to the loop top (A1) fixed it.
+
+### Honest caveats
+
+- **Wall-clock (`BENCH … ms`) is the ground truth.** Reported MIPS (~520) and "100% coverage" are
+  *inflated*: `exec_block` charges the full block budget even on early exits, so `block_insns`
+  over-counts by ~25%.
+- **The current bottleneck is per-block dispatch + per-op decode overhead**, *not* coverage and *not*
+  cache thrash (C2 cut rebuilds 62% with ~0% wall-clock change). Remaining compute levers are
+  incremental: A1b (true successor-pointer chaining ~4–10%), B2 (pin `sp`/`ra` as WASM locals), or a
+  wider pre-decoded op format. The 200–777× *library* benchmarks (`buffer-ops`/`string-ops`/`crypto`)
+  are untouched — those need **P1** (paravirtual `memcpy`/`memset` hypercalls in a custom guest build).
+
+---
+
+## Baseline Benchmark Results (before the block-engine rework)
 
 ```
   Benchmark                Native     NanoVM   Slowdown
@@ -81,6 +129,11 @@ The interpreter is a monolithic `exec()` function with:
 ---
 
 ## Optimization Opportunities
+
+> **Note:** several items below were superseded by the block-engine rework at the top of this doc.
+> The "decode cache" and "basic block chaining" ideas are now realized as the loop-top block dispatch
+> (A1) + superblocks (B3); register pinning (B2), superinstructions, and `memcpy` interception (now
+> reframed as P1 paravirtual hypercalls) remain open. Treat the analysis below as background.
 
 ### 1. Decode Cache (HIGH IMPACT, estimated 1.5-2x speedup)
 

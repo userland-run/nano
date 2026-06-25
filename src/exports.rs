@@ -351,6 +351,44 @@ pub unsafe extern "C" fn debug_fault_addr(vm_ptr: u32) -> u64 {
     vm.fault_addr
 }
 
+// ---------- C1: block-cache instrumentation ----------
+// Counters are global (not per-VM) and reset on block-cache reset.
+
+#[no_mangle]
+pub extern "C" fn debug_block_hits() -> u64 {
+    cpu::stat_block_hits()
+}
+
+#[no_mangle]
+pub extern "C" fn debug_block_builds() -> u64 {
+    cpu::stat_block_builds()
+}
+
+#[no_mangle]
+pub extern "C" fn debug_block_insns() -> u64 {
+    cpu::stat_block_insns()
+}
+
+#[no_mangle]
+pub extern "C" fn debug_baseline_insns() -> u64 {
+    cpu::stat_baseline_insns()
+}
+
+#[no_mangle]
+pub extern "C" fn debug_jalr_execs() -> u64 {
+    cpu::stat_jalr_execs()
+}
+
+#[no_mangle]
+pub extern "C" fn debug_jalfwd_execs() -> u64 {
+    cpu::stat_jalfwd_execs()
+}
+
+#[no_mangle]
+pub extern "C" fn debug_brfwd_execs() -> u64 {
+    cpu::stat_brfwd_execs()
+}
+
 // ---------- Virtual Server ----------
 // JS host injects HTTP connections into the VM's socket layer.
 

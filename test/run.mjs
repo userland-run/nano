@@ -678,7 +678,11 @@ for (let iter = 0; iter < MAX_ITER; iter++) {
     const scTotal = Object.values(syscallCounts).reduce((a,b) => a+b, 0);
     const names = {29:'ioctl',56:'openat',63:'read',64:'write',80:'fstat',93:'exit',94:'exit_group',98:'futex',113:'clock_gettime',124:'sched_yield',134:'rt_sigaction',135:'rt_sigprocmask',172:'getpid',178:'gettid',214:'brk',215:'munmap',216:'mremap',222:'mmap',226:'mprotect',233:'madvise',261:'prlimit64',278:'getrandom'};
     const top3 = Object.entries(syscallCounts).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([k,v])=>`${names[k]||k}:${v}`).join(' ');
-    console.error(`  [progress] ~${(totalInsns/1e6).toFixed(1)}M insns  ${mips.toFixed(0)} MIPS  syscalls=${scTotal}  top=[${top3}]`);
+    // C1: cumulative block-cache coverage (block insns / all insns)
+    const bIns = X.debug_block_insns ? Number(X.debug_block_insns()) : 0;
+    const baseIns = X.debug_baseline_insns ? Number(X.debug_baseline_insns()) : 0;
+    const cov = (bIns + baseIns) > 0 ? (100 * bIns / (bIns + baseIns)) : 0;
+    console.error(`  [progress] ~${(totalInsns/1e6).toFixed(1)}M insns  ${mips.toFixed(0)} MIPS  blockcov=${cov.toFixed(1)}%  syscalls=${scTotal}  top=[${top3}]`);
     lastReport = now;
     totalInsns = 0;
   }
@@ -693,6 +697,20 @@ for (let iter = 0; iter < MAX_ITER; iter++) {
     }
     console.error("--- execution end ---");
     console.error(`Exit code ${code}  (~${totalInsns} insns)`);
+    if (X.debug_block_insns) {
+      // C1: final block-cache coverage / hit-rate summary
+      const bIns = Number(X.debug_block_insns());
+      const baseIns = Number(X.debug_baseline_insns());
+      const tot = bIns + baseIns;
+      const covPct = tot > 0 ? (100 * bIns / tot).toFixed(1) : "0.0";
+      console.error(`  [blockstats] coverage=${covPct}%  block_insns=${bIns}  baseline_insns=${baseIns}  hits=${Number(X.debug_block_hits())}  builds=${Number(X.debug_block_builds())}`);
+      if (X.debug_jalr_execs) {
+        const jalr = Number(X.debug_jalr_execs());
+        const jalf = Number(X.debug_jalfwd_execs());
+        const brf = Number(X.debug_brfwd_execs());
+        console.error(`  [cflow] baseline jalr=${jalr}  jal_fwd=${jalf}  branch_fwd=${brf}  (these never enter a block today)`);
+      }
+    }
     if (trace) {
       const names = {17:'getcwd',29:'ioctl',25:'fcntl',48:'faccessat',56:'openat',57:'close',61:'getdents64',62:'lseek',63:'read',64:'write',65:'readv',66:'writev',78:'readlinkat',79:'fstatat',80:'fstat',93:'exit',94:'exit_group',96:'set_tid_addr',98:'futex',99:'set_robust_list',101:'nanosleep',113:'clock_gettime',114:'clock_getres',123:'sched_getaff',124:'sched_yield',129:'kill',130:'tkill',131:'tgkill',132:'sigaltstack',134:'rt_sigaction',135:'rt_sigprocmask',153:'times',160:'uname',166:'umask',167:'prctl',172:'getpid',174:'getuid',175:'geteuid',176:'getgid',177:'getegid',178:'gettid',179:'sysinfo',214:'brk',215:'munmap',220:'clone',222:'mmap',226:'mprotect',233:'madvise',261:'prlimit64',278:'getrandom',291:'statx',293:'rseq'};
       const total = Object.values(syscallCounts).reduce((a,b) => a+b, 0);

@@ -13,8 +13,8 @@ extern "C" {
 // Basic Block Cache — pre-decoded instruction sequences for hot loops
 // =====================================================================
 
-const MAX_BLOCK_OPS: usize = 32;
-const BLOCK_CACHE_SIZE: usize = 4096; // direct-mapped, power-of-2
+const MAX_BLOCK_OPS: usize = 64;
+const BLOCK_CACHE_SIZE: usize = 16384; // direct-mapped, power-of-2 (C2: 4x to cut aliasing)
 
 // Op IDs — dense u8 identifiers for pre-decoded instructions
 const OP_LD: u8 = 0;
@@ -86,13 +86,63 @@ const EMPTY_BLOCK: BlockEntry = BlockEntry {
 };
 
 static mut BLOCKS: [BlockEntry; BLOCK_CACHE_SIZE] = [EMPTY_BLOCK; BLOCK_CACHE_SIZE];
-/// Clear the block cache (call on program load or self-modifying code)
+
+// === C1 instrumentation: block-cache hit-rate / dispatch coverage ===
+// Cheap u64 counters (no atomics — single cooperative thread runs exec at a time).
+// Read out via debug_block_* exports; reset on block-cache reset.
+static mut BLOCK_HITS: u64 = 0;       // exec_block invocations (block dispatches)
+static mut BLOCK_BUILDS: u64 = 0;     // blocks built (cache misses)
+static mut BLOCK_INSNS: u64 = 0;      // instructions executed inside blocks
+static mut BASELINE_INSNS: u64 = 0;   // instructions executed in the baseline loop
+// Diagnostic: which control-flow ops the baseline takes that DON'T enter a block
+// (the cache only triggers on backward branch/JAL). Confirms where the hot path goes.
+static mut JALR_EXECS: u64 = 0;       // baseline indirect jumps (JALR) — calls/returns/dispatch
+static mut JALFWD_EXECS: u64 = 0;     // baseline forward JAL (direct calls)
+static mut BRFWD_EXECS: u64 = 0;      // baseline forward taken branches
+
+#[inline(always)]
+pub fn stat_block_hits() -> u64 { unsafe { BLOCK_HITS } }
+#[inline(always)]
+pub fn stat_block_builds() -> u64 { unsafe { BLOCK_BUILDS } }
+#[inline(always)]
+pub fn stat_block_insns() -> u64 { unsafe { BLOCK_INSNS } }
+#[inline(always)]
+pub fn stat_baseline_insns() -> u64 { unsafe { BASELINE_INSNS } }
+#[inline(always)]
+pub fn stat_jalr_execs() -> u64 { unsafe { JALR_EXECS } }
+#[inline(always)]
+pub fn stat_jalfwd_execs() -> u64 { unsafe { JALFWD_EXECS } }
+#[inline(always)]
+pub fn stat_brfwd_execs() -> u64 { unsafe { BRFWD_EXECS } }
+
+/// Reset instrumentation counters.
+pub fn reset_stats() {
+    unsafe {
+        BLOCK_HITS = 0;
+        BLOCK_BUILDS = 0;
+        BLOCK_INSNS = 0;
+        BASELINE_INSNS = 0;
+        JALR_EXECS = 0;
+        JALFWD_EXECS = 0;
+        BRFWD_EXECS = 0;
+    }
+}
+
+/// Zero all block tags — cheap invalidation that leaves stats and code-page marks alone.
+#[inline(always)]
+unsafe fn clear_block_tags() {
+    for i in 0..BLOCK_CACHE_SIZE {
+        BLOCKS[i].start_pc = 0;
+    }
+}
+
+/// Clear the block cache (call on program load or snapshot restore)
 pub fn reset_blocks() {
     unsafe {
-        for i in 0..BLOCK_CACHE_SIZE {
-            BLOCKS[i].start_pc = 0;
-        }
+        clear_block_tags();
+        mem::clear_code_pages();
     }
+    reset_stats();
 }
 
 /// Classify a 32-bit instruction into (op_id, immediate)
@@ -114,8 +164,8 @@ fn classify_insn(insn: u32) -> (u8, i32) {
                 _ => (OP_LOAD_OTHER, imm),
             }
         }
-        // LOAD-FP
-        0x01 => (OP_FP_LOAD, imm_i(insn)),
+        // LOAD-FP — store raw insn so exec_block can re-decode (A0)
+        0x01 => (OP_FP_LOAD, insn as i32),
         // FENCE
         0x03 => (OP_FENCE, 0),
         // OP-IMM
@@ -154,8 +204,8 @@ fn classify_insn(insn: u32) -> (u8, i32) {
                 _ => (OP_STORE_OTHER, imm),
             }
         }
-        // STORE-FP
-        0x09 => (OP_FP_STORE, imm_s(insn)),
+        // STORE-FP — store raw insn so exec_block can re-decode (A0)
+        0x09 => (OP_FP_STORE, insn as i32),
         // AMO
         0x0B => (OP_AMO, insn as i32),
         // OP
@@ -221,6 +271,7 @@ fn classify_insn(insn: u32) -> (u8, i32) {
 
 #[inline(never)] // cold path, don't bloat exec()
 unsafe fn build_block(blk: &mut BlockEntry, start_pc: u64, base: u32) {
+    BLOCK_BUILDS += 1; // C1: count cache misses (blocks built)
     blk.start_pc = start_pc;
     let mut pc = start_pc;
     let mut count = 0u16;
@@ -239,9 +290,10 @@ unsafe fn build_block(blk: &mut BlockEntry, start_pc: u64, base: u32) {
         let (op_id, imm) = classify_insn(insn);
         if op_id == OP_UNKNOWN { break; }
 
-        // Non-integer ops: end block BEFORE adding (baseline interpreter handles them)
+        // A0: FP/AMO are now executed inside blocks (see exec_block arms).
+        // Only CSR still falls back to the baseline interpreter.
         match op_id {
-            OP_FP_LOAD | OP_FP_STORE | OP_FP_OP | OP_AMO | OP_CSR => break,
+            OP_CSR => break,
             _ => {}
         }
 
@@ -266,15 +318,30 @@ unsafe fn build_block(blk: &mut BlockEntry, start_pc: u64, base: u32) {
         total += step as u16;
         pc = pc.wrapping_add(step as u64);
 
-        // Stop at terminators (included in block — exec_block has handlers)
+        // Stop at terminators (included in block — exec_block has handlers).
+        // B3 superblocks: forward conditional branches stay IN the block as internal
+        // multi-exit points — exec_block returns the target when the branch is taken
+        // and falls through to the next op when not. Only backward/self conditional
+        // branches (loop back-edges) end the block, so loop_back detection and the
+        // per-block budget stay correct. Unconditional control flow still terminates.
         match op_id {
-            OP_JAL | OP_JALR | OP_BEQ | OP_BNE | OP_BRANCH_OTHER | OP_ECALL => break,
+            OP_JAL | OP_JALR | OP_ECALL => break,
+            OP_BEQ | OP_BNE | OP_BRANCH_OTHER => {
+                if imm <= 0 { break; } // backward / self → loop back-edge, end block
+            }
             _ => {}
         }
     }
 
     blk.len = count;
     blk.total_budget = count; // match main loop: 1 budget per instruction
+    // A2: mark the page(s) this block was decoded from for self-modifying-code detection
+    if count > 0 {
+        mem::mark_code_page(start_pc);
+        if total > 1 {
+            mem::mark_code_page(start_pc + (total as u64) - 1);
+        }
+    }
 }
 
 // =====================================================================
@@ -286,19 +353,23 @@ unsafe fn exec_block(
     blk: &BlockEntry,
     base: u32,
     x: &mut [u64; 32],
-    _f: &mut [u64; 32],
-    _fcsr: &mut u32,
+    f: &mut [u64; 32],
+    fcsr: &mut u32,
     vm: &mut Vm,
     remaining: &mut i32,
 ) -> u64 {
+    BLOCK_HITS += 1; // C1: count block dispatches
     let mut pc = blk.start_pc;
 
     loop {
-        // Budget check once per block iteration
-        if *remaining < blk.total_budget as i32 {
+        // Budget check once per block iteration. Run if ANY budget remains (may dip
+        // slightly negative); the outer loop breaks on remaining <= 0. This guarantees
+        // forward progress when dispatched from the loop top with low remaining budget.
+        if *remaining <= 0 {
             break;
         }
         *remaining -= blk.total_budget as i32;
+        BLOCK_INSNS += blk.total_budget as u64; // C1: instructions executed in blocks
 
         pc = blk.start_pc;
         let mut i = 0usize;
@@ -570,11 +641,41 @@ unsafe fn exec_block(
                 }
                 OP_ECALL => {
                     vm.x = *x; vm.pc = pc.wrapping_add(step);
-                    vm.f = *_f; vm.fcsr = *_fcsr;
+                    vm.f = *f; vm.fcsr = *fcsr;
                     syscall::handle(vm);
-                    *x = vm.x; pc = vm.pc; *_f = vm.f; *_fcsr = vm.fcsr;
+                    *x = vm.x; pc = vm.pc; *f = vm.f; *fcsr = vm.fcsr;
                     x[0] = 0;
                     return pc;
+                }
+                // A0: FP / AMO executed inline (raw insn carried in the imm slot).
+                // rd/f3/rs1/rs2 come from the packed word (same decode as the raw insn);
+                // funct7/rs3/fmt are recovered from the raw insn by the helpers.
+                OP_FP_LOAD => {
+                    let insn = imm as u32;
+                    exec_load_fp(base, f, x, &mut pc, step, insn, rd, f3, rs1);
+                }
+                OP_FP_STORE => {
+                    let insn = imm as u32;
+                    exec_store_fp(base, f, x, &mut pc, step, insn, f3, rs1, rs2);
+                }
+                OP_FP_OP => {
+                    let insn = imm as u32;
+                    match (insn >> 2) & 0x1f {
+                        0x10 => exec_fma(insn, f, fcsr, false, false),
+                        0x11 => exec_fma(insn, f, fcsr, true, false),
+                        0x12 => exec_fma(insn, f, fcsr, false, true),
+                        0x13 => exec_fma(insn, f, fcsr, true, true),
+                        _ => {
+                            let funct7 = (insn >> 25) & 0x7f;
+                            exec_op_fp(insn, x, f, fcsr, rd, f3, rs1, rs2, funct7);
+                        }
+                    }
+                    pc = pc.wrapping_add(step);
+                }
+                OP_AMO => {
+                    let insn = imm as u32;
+                    let funct7 = (insn >> 25) & 0x7f;
+                    exec_amo(base, x, &mut pc, step, insn, rd, f3, rs1, rs2, funct7);
                 }
                 _ => {
                     pc = pc.wrapping_add(step);
@@ -1062,7 +1163,33 @@ pub unsafe fn exec(vm: &mut Vm, budget: i32) -> i32 {
         if remaining <= 0 {
             break;
         }
+
+        // === A2: invalidate stale blocks if guest code was written since last check ===
+        if mem::take_code_dirty() {
+            clear_block_tags();
+        }
+
+        // === A1: block dispatch at the top of the loop ===
+        // Every control transfer (branch/jal/jalr) lands here; run a cached block at
+        // `pc` if present, building one lazily (evicting on collision) otherwise.
+        // exec_block returns the next pc, so consecutive blocks chain back-to-back
+        // through this point with only a cache lookup between them.
+        let bidx = (pc >> 1) as usize & (BLOCK_CACHE_SIZE - 1);
+        if BLOCKS[bidx].start_pc != pc {
+            build_block(&mut BLOCKS[bidx], pc, base);
+        }
+        if BLOCKS[bidx].len > 0 {
+            pc = exec_block(&mut BLOCKS[bidx], base, &mut x, &mut f, &mut fcsr, vm, &mut remaining);
+            if vm.status != STATUS_OK && vm.status != STATUS_RUNNING {
+                remaining = 0;
+                break;
+            }
+            continue;
+        }
+
+        // === baseline single-step (block head not cacheable here, e.g. CSR/illegal) ===
         remaining -= 1;
+        BASELINE_INSNS += 1; // C1: instructions executed in the baseline loop
 
         // Single 32-bit fetch (1 WASM i32.load instruction)
         let raw = ((base + pc as u32) as *const u32).read_unaligned();
@@ -1184,27 +1311,10 @@ pub unsafe fn exec(vm: &mut Vm, budget: i32) -> i32 {
                 exec_op_fp(insn, &mut x, &mut f, &mut fcsr, rd, funct3, rs1, rs2, funct7);
                 pc = pc.wrapping_add(step);
             }
-            // BRANCH
+            // BRANCH — block dispatch at the loop top runs the block at the target
             0x18 => {
-                let taken = exec_branch(&x, funct3, rs1, rs2);
-                if taken {
-                    let imm = imm_b(insn);
-                    let target = pc.wrapping_add(imm as i64 as u64);
-                    if imm < 0 {
-                        // Backward branch — check block cache
-                        let idx = (target >> 1) as usize & (BLOCK_CACHE_SIZE - 1);
-                        let blk = &mut BLOCKS[idx];
-                        if blk.start_pc == target || blk.start_pc == 0 {
-                            if blk.start_pc == 0 { build_block(blk, target, base); }
-                            pc = exec_block(blk, base, &mut x, &mut f, &mut fcsr, vm, &mut remaining);
-                            if vm.status != STATUS_OK && vm.status != STATUS_RUNNING {
-                                remaining = 0;
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-                    pc = target;
+                if exec_branch(&x, funct3, rs1, rs2) {
+                    pc = pc.wrapping_add(imm_b(insn) as i64 as u64);
                 } else {
                     pc = pc.wrapping_add(step);
                 }
@@ -1220,25 +1330,10 @@ pub unsafe fn exec(vm: &mut Vm, budget: i32) -> i32 {
             }
             // JAL
             0x1B => {
-                let imm = imm_j(insn);
                 if rd != 0 {
                     x[rd] = pc.wrapping_add(step);
                 }
-                let target = pc.wrapping_add(imm as i64 as u64);
-                if imm < 0 {
-                    let idx = (target >> 1) as usize & (BLOCK_CACHE_SIZE - 1);
-                    let blk = &mut BLOCKS[idx];
-                    if blk.start_pc == target || blk.start_pc == 0 {
-                        if blk.start_pc == 0 { build_block(blk, target, base); }
-                        pc = exec_block(blk, base, &mut x, &mut f, &mut fcsr, vm, &mut remaining);
-                        if vm.status != STATUS_OK && vm.status != STATUS_RUNNING {
-                            remaining = 0;
-                            break;
-                        }
-                        continue;
-                    }
-                }
-                pc = target;
+                pc = pc.wrapping_add(imm_j(insn) as i64 as u64);
             }
             // SYSTEM
             0x1C => {
