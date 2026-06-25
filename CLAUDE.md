@@ -47,10 +47,10 @@ node test/run.mjs images/busybox --trace --cmd ls /tmp
 
 - **Target**: `wasm32-unknown-unknown` (Rust stable toolchain)
 - **Crate type**: `cdylib` (produces `.wasm`)
-- **Only dependency**: `libm` (math functions for no_std)
-- **Release profile**: `opt-level = "z"`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`
+- **Dependencies**: none — `[dependencies]` is empty (`sqrt`/`sqrtf` lower directly to WASM `f64.sqrt`/`f32.sqrt` opcodes; no `libm`)
+- **Release profile**: `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true` (speed-first, per the Bellard interpreter design)
 - **Dev profile**: `opt-level = 1`, `codegen-units = 256` (fast incremental builds)
-- **WASM memory**: 1MB stack, 4MB initial, 512MB max (set in `.cargo/config.toml`)
+- **WASM memory**: 1MB stack, 192MB initial, 2GB max, shared + imported (set in `.cargo/config.toml`)
 - **Features**: `demo` (default) — embeds busybox + node + devenv into the WASM data section
 
 ## Architecture

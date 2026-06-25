@@ -41,9 +41,10 @@ Syscalls are handled in two ways:
 
 | Nr | Name | Notes |
 |----|------|-------|
-| 214 | brk | Bump allocator with shared atomic state |
+| 214 | brk | Page-aligned bump within guest RAM (zeroes growth) |
 | 222 | mmap | Anonymous + fixed mappings in guest VA space |
-| 215 | munmap | Stub (no-op) |
+| 216 | mremap | Grows in place at the bump frontier, or moves with MREMAP_MAYMOVE (used by V8 heap growth) |
+| 215 | munmap | Stub (no-op; bump allocator never frees) |
 | 226 | mprotect | Stub (returns 0) |
 | 233 | madvise | Stub (returns 0) |
 
@@ -55,7 +56,7 @@ Syscalls are handled in two ways:
 | 93 | exit | Thread exit |
 | 94 | exit_group | Process exit |
 | 172 | getpid | Returns 1 |
-| 173 | getppid | Returns 0 |
+| 173 | getppid | Returns 1 |
 | 178 | gettid | Returns thread ID |
 | 96 | set_tid_address | Sets clear_child_tid pointer |
 | 98 | futex | FUTEX_WAIT, FUTEX_WAKE — cooperative thread switching |
@@ -66,8 +67,8 @@ Syscalls are handled in two ways:
 
 | Nr | Name | Notes |
 |----|------|-------|
-| 134 | rt_sigaction | Records handler (not delivered) |
-| 135 | rt_sigprocmask | Updates signal mask |
+| 134 | rt_sigaction | Stub (returns 0; handlers are never recorded or delivered) |
+| 135 | rt_sigprocmask | Stub (returns 0; mask is not tracked) |
 | 132 | sigaltstack | Records alternate stack |
 | 129 | kill | No-op |
 | 130 | tkill | No-op |
@@ -105,8 +106,8 @@ Timerfds integrate with epoll — `epoll_pwait` checks `Date.now()` against the 
 
 | Nr | Name | Notes |
 |----|------|-------|
-| 198 | socket | AF_INET, AF_INET6, AF_UNIX (SOCK_STREAM, SOCK_DGRAM) |
-| 199 | socketpair | AF_UNIX connected pair |
+| 198 | socket | AF_INET / AF_INET6 only, SOCK_STREAM / SOCK_DGRAM (AF_UNIX → EAFNOSUPPORT) |
+| 199 | socketpair | Not supported (ENOSYS) |
 | 200 | bind | Associates socket with port |
 | 201 | listen | Marks socket as listening |
 | 202 | accept | Legacy accept (calls accept4) |
@@ -126,7 +127,7 @@ Sockets use 16KB ring buffers per slot. Connected sockets have peer indices — 
 
 | Nr | Name | Notes |
 |----|------|-------|
-| 29 | ioctl | TIOCGWINSZ (80x25), TCGETS, FIONREAD |
+| 29 | ioctl | TIOCGWINSZ / TCGETS → ENOTTY (so `isatty()` is false — required for V8 init); FIONREAD → 0 |
 | 25 | fcntl | F_GETFL, F_SETFL (O_NONBLOCK), F_GETFD, F_SETFD, F_DUPFD |
 | 23 | dup | Duplicate fd |
 | 24 | dup3 | Duplicate fd to specific number |

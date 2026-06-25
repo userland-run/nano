@@ -17,7 +17,9 @@ The architecture follows Fabrice Bellard's approach to high-performance interpre
 ```
 WASM Linear Memory
 ├── VM struct (12,680 bytes)         ← vm_create() allocates this
-├── Guest RAM (configurable, ~512MB) ← vm_create() allocates this
+├── Guest RAM (configurable; demo    ← vm_create() allocates this
+│   uses ~1.8GB, 2GB WASM max)
+
 ├── Scratch buffer (32KB)            ← malloc() for virtual server I/O
 └── WASM data section                ← bundled ELFs (busybox, node, devenv)
 ```

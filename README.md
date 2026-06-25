@@ -45,7 +45,7 @@ The demo includes examples that run inside the emulator: basic Node.js (hello wo
 NanoVM follows Fabrice Bellard's approach to high-performance WASM interpreters:
 
 - **Monolithic `exec()` function** — Dense dispatch compiles to WASM `br_table` (O(1) jump tables). Source code is split across files with `#[inline(always)]`; fat LTO fuses everything into a single function.
-- **`#![no_std]` Rust** — No standard library, no heap allocation in the hot path. Zero dependencies (except `libm` for math).
+- **`#![no_std]` Rust** — No standard library, no heap allocation in the hot path. Zero crate dependencies (math like `sqrt` lowers straight to WASM opcodes).
 - **Minimal host boundary** — 5 WASM imports, ~30 exports. Filesystem I/O goes through a shared-memory protocol, not per-instruction callbacks.
 - **Cooperative threading** — clone/futex-based multithreading with context switching at syscall boundaries.
 

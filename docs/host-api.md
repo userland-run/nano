@@ -122,4 +122,7 @@ When the VM needs filesystem I/O it cannot handle internally:
 | 0 | STATUS_OK | Ready to execute |
 | 3 | STATUS_FAULT | Process exited or trapped |
 | 6 | STATUS_FS_PENDING | Waiting for JS to handle filesystem request |
+| 7 | STATUS_EPOLL_BLOCKED | Event loop has no runnable thread; host sets `a0 = -EINTR` (and lets real time / virtual-server connections advance) before resuming |
 | 18 | STATUS_RUNNING | Currently executing |
+
+When `vm_step` returns with `status == 7` (STATUS_EPOLL_BLOCKED), the host writes `-EINTR` (`-4`) to `a0` (`vm_ptr + 80`), resets status to `0`, and calls `vm_step` again — this is how `epoll_pwait` yields to the host so timers fire and injected HTTP connections get accepted.
