@@ -52,6 +52,7 @@ const SYS_TGKILL: u64 = 131;
 const SYS_SIGALTSTACK: u64 = 132;
 const SYS_RT_SIGACTION: u64 = 134;
 const SYS_RT_SIGPROCMASK: u64 = 135;
+const SYS_RT_SIGRETURN: u64 = 139;
 const SYS_TIMES: u64 = 153;
 const SYS_UNAME: u64 = 160;
 const SYS_UMASK: u64 = 166;
@@ -249,6 +250,144 @@ pub unsafe fn tty_init_termios(vm: &mut Vm) {
     vm.c_cc[15] = 0x16; // VLNEXT   = ^V
 }
 
+// ============================================================
+// Signals
+// ============================================================
+//
+// A pragmatic delivery model: rt_sigaction records handlers; pending signals
+// (set by ^C/kill/the host) are delivered at the next syscall boundary or when
+// a parked stdin op is interrupted. Custom handlers are invoked with a
+// simplified frame — the pre-signal context is saved to a static (single level,
+// no nesting), a0=signum, and ra points at an injected `li a7,139; ecall`
+// trampoline so the handler returns through rt_sigreturn, which restores the
+// context. We don't synthesise a full ucontext (handlers that inspect it are
+// rare for SIGINT/SIGWINCH).
+
+const NSIG: usize = 64;
+const SIGINT: u32 = 2;
+const SIG_TRAMPOLINE: u64 = 0x800; // guest addr of the injected rt_sigreturn stub
+
+static mut SIG_HANDLERS: [u64; NSIG] = [0; NSIG]; // 0 = SIG_DFL, 1 = SIG_IGN, else addr
+static mut SIG_FLAGS: [u64; NSIG] = [0; NSIG];
+static mut SIG_SAVED_X: [u64; 32] = [0; 32];
+static mut SIG_SAVED_PC: u64 = 0;
+static mut SIG_ACTIVE: bool = false; // currently inside a handler
+static mut TRAMPOLINE_READY: bool = false;
+
+pub unsafe fn signals_reset() {
+    SIG_HANDLERS = [0; NSIG];
+    SIG_FLAGS = [0; NSIG];
+    SIG_ACTIVE = false;
+    TRAMPOLINE_READY = false;
+}
+
+/// Mark a signal pending on this VM (from ^C, kill, or the host).
+pub unsafe fn raise_signal(vm: &mut Vm, signum: u32) {
+    if signum >= 1 && (signum as usize) <= NSIG {
+        vm.sig_pending |= 1u64 << (signum - 1);
+    }
+}
+
+/// Signals whose default disposition is "ignore" (vs terminate).
+fn default_ignore(sig: u32) -> bool {
+    matches!(sig, 17 | 18 | 23 | 28 | 29) // SIGCHLD SIGCONT SIGURG SIGWINCH SIGIO
+}
+
+unsafe fn ensure_trampoline(vm: &Vm) {
+    if !TRAMPOLINE_READY {
+        // li a7, 139 (rt_sigreturn); ecall
+        mem::write_u32(vm.ram_base, SIG_TRAMPOLINE, 0x08B0_0893);
+        mem::write_u32(vm.ram_base, SIG_TRAMPOLINE + 4, 0x0000_0073);
+        TRAMPOLINE_READY = true;
+    }
+}
+
+/// Deliver one pending, unblocked signal if any. May redirect vm.pc to a handler
+/// (saving the interrupted context) or terminate the VM on a default-fatal
+/// signal. No-op while already inside a handler.
+pub unsafe fn deliver_signals(vm: &mut Vm) {
+    if SIG_ACTIVE {
+        return;
+    }
+    let deliverable = vm.sig_pending & !vm.sig_mask;
+    if deliverable == 0 {
+        return;
+    }
+    let bit = deliverable.trailing_zeros();
+    let signum = bit + 1;
+    vm.sig_pending &= !(1u64 << bit);
+
+    let h = SIG_HANDLERS[signum as usize];
+    if h == 1 {
+        return; // SIG_IGN
+    }
+    if h == 0 {
+        // SIG_DFL
+        if default_ignore(signum) {
+            return;
+        }
+        vm.exit_code = 128 + signum as i32;
+        vm.status = STATUS_FAULT;
+        return;
+    }
+    // Custom handler: invoke with the simplified frame.
+    ensure_trampoline(vm);
+    SIG_SAVED_X = vm.x;
+    SIG_SAVED_PC = vm.pc;
+    SIG_ACTIVE = true;
+    vm.x[10] = signum as u64; // a0 = signum
+    vm.x[1] = SIG_TRAMPOLINE; // ra = restorer trampoline
+    vm.pc = h;
+}
+
+unsafe fn sys_rt_sigaction(vm: &mut Vm, signum: u32, act: u64, oldact: u64) -> i64 {
+    if signum < 1 || signum as usize >= NSIG {
+        return EINVAL;
+    }
+    let idx = signum as usize;
+    if oldact != 0 {
+        mem::write_u64(vm.ram_base, oldact, SIG_HANDLERS[idx]);
+        mem::write_u64(vm.ram_base, oldact + 8, SIG_FLAGS[idx]);
+        mem::write_u64(vm.ram_base, oldact + 16, 0);
+    }
+    if act != 0 {
+        // SIGKILL (9) / SIGSTOP (19) cannot be caught.
+        if signum != 9 && signum != 19 {
+            SIG_HANDLERS[idx] = mem::read_u64(vm.ram_base, act);
+            SIG_FLAGS[idx] = mem::read_u64(vm.ram_base, act + 8);
+        }
+    }
+    0
+}
+
+unsafe fn sys_rt_sigprocmask(vm: &mut Vm, how: i32, set: u64, oldset: u64) -> i64 {
+    if oldset != 0 {
+        mem::write_u64(vm.ram_base, oldset, vm.sig_mask);
+    }
+    if set != 0 {
+        let s = mem::read_u64(vm.ram_base, set);
+        match how {
+            0 => vm.sig_mask |= s,  // SIG_BLOCK
+            1 => vm.sig_mask &= !s, // SIG_UNBLOCK
+            2 => vm.sig_mask = s,   // SIG_SETMASK
+            _ => return EINVAL,
+        }
+    }
+    0
+}
+
+/// rt_sigreturn: restore the context saved at signal delivery.
+unsafe fn sys_rt_sigreturn(vm: &mut Vm) -> i64 {
+    if SIG_ACTIVE {
+        vm.x = SIG_SAVED_X;
+        vm.pc = SIG_SAVED_PC;
+        SIG_ACTIVE = false;
+    }
+    // handle() will write our return value into a0; return the restored a0 so it
+    // is preserved.
+    vm.x[10] as i64
+}
+
 /// Reset all static mut globals to their initial state.
 /// Must be called before each new program execution to avoid stale state.
 pub unsafe fn reset_statics() {
@@ -262,6 +401,7 @@ pub unsafe fn reset_statics() {
     TIMERFD_ALLOC = 0;
     EPOLL_FINITE_TIMEOUT_ACTIVE = false;
     crate::tty::reset();
+    signals_reset();
 }
 
 /// Handle a syscall. Called from cpu.rs when ECALL is executed.
@@ -428,10 +568,24 @@ pub unsafe fn handle(vm: &mut Vm) {
 
         SYS_GETRANDOM => sys_getrandom(vm, a0, a1 as u32),
 
-        SYS_RT_SIGACTION => 0,   // stub
-        SYS_RT_SIGPROCMASK => 0, // stub
+        SYS_RT_SIGACTION => sys_rt_sigaction(vm, a0 as u32, a1, a2),
+        SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(vm, a0 as i32, a1, a2),
+        SYS_RT_SIGRETURN => sys_rt_sigreturn(vm),
         SYS_SIGALTSTACK => sys_sigaltstack(vm, a0, a1),
-        SYS_KILL | SYS_TKILL | SYS_TGKILL => 0, // stub: signals ignored
+        SYS_KILL | SYS_TKILL => {
+            // kill(pid, sig) / tkill(tid, sig): deliver to self (single process).
+            if a1 != 0 {
+                raise_signal(vm, a1 as u32);
+            }
+            0
+        }
+        SYS_TGKILL => {
+            // tgkill(tgid, tid, sig)
+            if a2 != 0 {
+                raise_signal(vm, a2 as u32);
+            }
+            0
+        }
 
         SYS_SET_TID_ADDRESS => {
             let slot = vm._tid_extra as usize;
@@ -1797,6 +1951,15 @@ unsafe fn sys_ppoll(vm: &mut Vm, fds: u64, nfds: u32, timeout: u64) -> i64 {
 /// op completed (a0 + status already set), 0 while it must keep waiting. Called
 /// by the host (`vm_io_retry`) each loop iteration while status is FS_PENDING.
 pub unsafe fn io_retry(vm: &mut Vm) -> i32 {
+    // A pending signal interrupts the blocked stdin op with EINTR, then the
+    // signal is delivered (its handler runs, or a default-fatal signal
+    // terminates the VM).
+    if (vm.sig_pending & !vm.sig_mask) != 0 {
+        vm.x[10] = (-4i64) as u64; // a0 = -EINTR
+        vm.status = STATUS_OK;
+        deliver_signals(vm);
+        return 1;
+    }
     match vm.fs_request.syscall_nr as u64 {
         SYS_READ => {
             let r = crate::tty::try_read(vm, vm.fs_request.buf_ptr as u64, vm.fs_request.buf_len);

@@ -227,10 +227,8 @@ class NanoVM {
       "sort head tail grep sed awk cut tr wc find xargs sleep env printf basename " +
       "dirname dd du df date id whoami hostname uname true false test expr seq yes " +
       "tee which tar gzip gunzip zcat md5sum sha256sum cmp stat readlink realpath " +
-      "mktemp sync kill ps nl od base64 wget clear ash").split(" ");
-    for (const a of applets) {
-      if (!m.resolve("/bin/" + a, false)) m.createSymlink("/bin/" + a, "busybox");
-    }
+      "mktemp sync kill ps nl od base64 wget clear sh ash").split(" ");
+    for (const a of applets) m.createSymlink("/bin/" + a, "busybox");
     m.createDir("/dev");
     m.createFile("/dev/null", "");
     m.createDir("/etc");
@@ -523,6 +521,7 @@ class NanoVM {
     this._termRows = rows;
     if (X.term_reset) X.term_reset(cols, rows);
     if (X.vm_tty_set_size) X.vm_tty_set_size(this._vmPtr, cols, rows);
+    if (X.vm_signal) X.vm_signal(this._vmPtr, 28); // SIGWINCH
   }
 
   /**
@@ -588,10 +587,6 @@ class NanoVM {
   /** Append guest bytes to a pipe buffer. */
   _pipeWrite(id, srcPhys, count) {
     if (count <= 0) return 0;
-    // Only the serialized fork pipeline (a | b) buffers pipe data. A live
-    // process's own pipe (e.g. node/libuv's self-pipe) keeps legacy discard
-    // semantics so its event loop is not perturbed.
-    if (!this._forkStack || this._forkStack.length === 0) return count;
     const p = this._pipeGet(id);
     p.chunks.push(new Uint8Array(this._memory.buffer, srcPhys, count).slice());
     p.total += count;
@@ -600,12 +595,9 @@ class NanoVM {
 
   /** Drain up to `count` bytes from a pipe buffer; 0 = EOF (writer finished). */
   _pipeRead(id, dstPhys, count) {
-    // Live (non-fork) process pipe, e.g. node/libuv self-pipe: legacy EOF
-    // semantics that node tolerates. Only serialized fork readers buffer.
-    if (!this._forkStack || this._forkStack.length === 0) return 0;
     const p = this._pipeGet(id);
     const avail = p.total - p.readPos;
-    if (avail <= 0 || count <= 0) return 0; // serialized reader: writer finished
+    if (avail <= 0 || count <= 0) return 0;
     const n = Math.min(count, avail);
     const dst = new Uint8Array(this._memory.buffer, dstPhys, n);
     let copied = 0, chunkStart = 0;

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 use crate::decode;
 use crate::mem;
 use crate::syscall;
@@ -643,6 +647,12 @@ unsafe fn exec_block(
                     vm.x = *x; vm.pc = pc.wrapping_add(step);
                     vm.f = *f; vm.fcsr = *fcsr;
                     syscall::handle(vm);
+                    // Deliver a pending signal at the syscall boundary (unless the
+                    // syscall parked or faulted — a parked stdin op is interrupted
+                    // via vm_io_retry instead).
+                    if vm.status == STATUS_RUNNING || vm.status == STATUS_OK {
+                        syscall::deliver_signals(vm);
+                    }
                     *x = vm.x; pc = vm.pc; *f = vm.f; *fcsr = vm.fcsr;
                     x[0] = 0;
                     return pc;

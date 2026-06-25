@@ -255,9 +255,15 @@ pub unsafe extern "C" fn vm_tty_set_size(vm_ptr: u32, cols: u32, rows: u32) {
 /// applying the line discipline (cooked echo/erase or raw passthrough).
 #[no_mangle]
 pub unsafe extern "C" fn vm_stdin_push(vm_ptr: u32, ptr: u32, len: u32) {
-    let vm = &*(vm_ptr as *const Vm);
+    let vm = &mut *(vm_ptr as *mut Vm);
     let bytes = core::slice::from_raw_parts(ptr as *const u8, len as usize);
     crate::tty::stdin_push(vm, bytes);
+}
+
+/// Raise a signal on the VM from the host (e.g. SIGWINCH on resize, SIGTERM).
+#[no_mangle]
+pub unsafe extern "C" fn vm_signal(vm_ptr: u32, signum: u32) {
+    crate::syscall::raise_signal(&mut *(vm_ptr as *mut Vm), signum);
 }
 
 /// Mark interactive stdin: when true, an empty read parks (blocks) instead of

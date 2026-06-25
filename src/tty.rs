@@ -23,6 +23,8 @@ const ICANON: u32 = 0x0002;
 const ECHO: u32 = 0x0008;
 const ISIG: u32 = 0x0001;
 
+const SIGINT: u32 = 2;
+
 /// "Would block" sentinel returned by try_read/try_poll when interactive stdin
 /// has no data yet — the caller parks (FS_PENDING) and retries via vm_io_retry.
 pub const WAIT: i64 = -0x7000_0000;
@@ -90,7 +92,7 @@ unsafe fn echo(bytes: &[u8]) {
 }
 
 /// Push raw host input through the line discipline.
-pub unsafe fn stdin_push(vm: &Vm, bytes: &[u8]) {
+pub unsafe fn stdin_push(vm: &mut Vm, bytes: &[u8]) {
     let tty = vm.tty_enabled != 0;
     let cooked = tty && (vm.c_lflag & ICANON) != 0;
     let do_echo = tty && (vm.c_lflag & ECHO) != 0;
@@ -100,21 +102,21 @@ pub unsafe fn stdin_push(vm: &Vm, bytes: &[u8]) {
     let veof = vm.c_cc[4];
 
     for &b in bytes {
+        if isig && b == vintr {
+            // ^C with ISIG: generate SIGINT; the byte is not passed to the program.
+            crate::syscall::raise_signal(vm, SIGINT);
+            LINE_LEN = 0;
+            if do_echo {
+                echo(b"^C\r\n");
+            }
+            continue;
+        }
         if !cooked {
             // Raw mode: deliver immediately, no echo, no editing.
             ring_push(b);
             continue;
         }
         // Cooked mode.
-        if isig && b == vintr {
-            LINE_LEN = 0;
-            if do_echo {
-                echo(b"^C\r\n");
-            }
-            // Real SIGINT delivery is the signal-delivery step; for now ^C just
-            // discards the current line.
-            continue;
-        }
         if b == veof {
             if LINE_LEN > 0 {
                 let n = LINE_LEN;
