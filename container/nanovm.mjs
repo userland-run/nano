@@ -1154,7 +1154,11 @@ class NanoVM {
     const view = new Uint8Array(this._memory.buffer, this._ramPtr + (gptr >>> 0));
     let e = 0;
     while (e < view.length && e < 8192 && view[e] !== 0) e++;
-    return new TextDecoder().decode(view.subarray(0, e));
+    // `.slice()` (not `.subarray()`) — copies into a non-shared ArrayBuffer.
+    // The browser's TextDecoder rejects views backed by the SharedArrayBuffer
+    // that `_memory.buffer` is (WASM memory is shared:true). Node's is lenient,
+    // so this only bites in the browser (e.g. reading execve argv).
+    return new TextDecoder().decode(view.slice(0, e));
   }
 
   /** Read a NULL-terminated array of guest string pointers (argv/envp). */
