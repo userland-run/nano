@@ -40,9 +40,13 @@ RED='\033[0;31m'
 YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
-ok()   { echo -e "  ${GREEN}PASS${NC}: $1"; PASS=$((PASS + 1)); }
-fail() { echo -e "  ${RED}FAIL${NC}: $1"; FAIL=$((FAIL + 1)); }
-skip() { echo -e "  ${YELLOW}SKIP${NC}: $1 ($2)"; SKIP=$((SKIP + 1)); }
+# When RESULTS_NDJSON is set, append one JSON line per assertion so
+# tools/harness-ledger-to-results.mjs can map it to a registry feature and
+# publish a `node-harness` suite to the userland.run status hub.
+record() { [ -n "${RESULTS_NDJSON:-}" ] && printf '{"name":"%s","status":"%s"}\n' "$1" "$2" >> "$RESULTS_NDJSON"; }
+ok()   { echo -e "  ${GREEN}PASS${NC}: $1"; PASS=$((PASS + 1)); record "$1" passed; }
+fail() { echo -e "  ${RED}FAIL${NC}: $1"; FAIL=$((FAIL + 1)); record "$1" failed; }
+skip() { echo -e "  ${YELLOW}SKIP${NC}: $1 ($2)"; SKIP=$((SKIP + 1)); record "$1" skipped; }
 
 # ============================================================
 # Phase 0: Prerequisites
