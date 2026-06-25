@@ -717,6 +717,7 @@ class NanoVM {
 
     this._stdout = "";
     this._onStdout = onStdout || null;
+    this._resetProcessState();
 
     const X = this._exports;
     const v = this._vmPtr;
@@ -790,6 +791,7 @@ class NanoVM {
 
     this._stdout = "";
     this._onStdout = null;
+    this._resetProcessState();
 
     // Reset and load Node ELF
     this._resetVM();
@@ -823,16 +825,25 @@ class NanoVM {
   // Internal — Execution loop
   // ============================================================
 
+  /**
+   * Reset the host-side serialized-fork bookkeeping (fork stack, zombie list,
+   * pid counter, pipe buffers). Every entry into the run loop — cold run,
+   * snapshot warmup, and warm restore — must start from clean state; a leftover
+   * pipe buffer or fork frame from a prior run corrupts the next guest image.
+   */
+  _resetProcessState() {
+    this._forkStack = [];
+    this._zombies = [];
+    this._nextPid = 1000;
+    this._pipes = new Map();
+  }
+
   async _execute(elfBytes, argv, extraEnv, opts = {}) {
     const { onStdout, maxSteps = 2_000_000 } = opts;
 
     this._stdout = "";
     this._onStdout = onStdout || null;
-    // Serialized-fork bookkeeping (reset per run).
-    this._forkStack = [];
-    this._zombies = [];
-    this._nextPid = 1000;
-    this._pipes = new Map();
+    this._resetProcessState();
 
     // Reset VM state for a clean run
     this._resetVM();
@@ -993,10 +1004,23 @@ class NanoVM {
   _resetVM() {
     const dv = new DataView(this._memory.buffer);
     const v = this._vmPtr;
+    const X = this._exports;
 
-    // Reset Rust static mut globals (sockets, epoll, eventfd, timerfd)
-    if (this._exports.vm_reset_statics) {
-      this._exports.vm_reset_statics();
+    // Reset the guest block cache AND the Rust static globals (sockets, epoll,
+    // eventfd, timerfd, signals, tty, pipe ids) before each program load.
+    // Resetting blocks is mandatory for correctness: translated blocks are keyed
+    // by guest address, so the next program (e.g. node after busybox `sh`) would
+    // otherwise execute stale blocks at the same addresses and fault. The build
+    // never exported a standalone `vm_reset_statics`; `vm_snapshot_restore_reset`
+    // resets both blocks and statics, so prefer it when a dedicated statics
+    // reset is absent.
+    if (X.vm_reset_statics) {
+      if (X.vm_reset_blocks) X.vm_reset_blocks();
+      X.vm_reset_statics();
+    } else if (X.vm_snapshot_restore_reset) {
+      X.vm_snapshot_restore_reset();
+    } else if (X.vm_reset_blocks) {
+      X.vm_reset_blocks();
     }
 
     // Zero entire VM struct
