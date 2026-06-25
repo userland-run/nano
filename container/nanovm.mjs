@@ -94,6 +94,8 @@ class NanoVM {
     this._scratchPtr = 0; // WASM linear memory scratch buffer for virtual server
     this._snapshotRequested = false; // set by sentinel detection in _processFsRequest
     this._runId = 0; // incremented on each run; checked in _runLoop for cancellation
+    this._boaWasm = null;             // boa.wasm source (URL/bytes) for the scripting layer
+    this._boa = null;                 // lazily-loaded BoaRuntime (see scripting())
   }
 
   /**
@@ -103,6 +105,7 @@ class NanoVM {
    * @param {string} opts.wasm - URL to the nano.wasm file
    * @param {string} [opts.busyboxUrl] - URL to busybox ELF (if not bundled)
    * @param {string} [opts.nodeUrl] - URL to node ELF (if not bundled)
+   * @param {string|ArrayBuffer|Uint8Array} [opts.boaWasm] - boa.wasm for the scripting layer (lazy)
    */
   static async create(opts = {}) {
     const vm = new NanoVM();
@@ -111,8 +114,9 @@ class NanoVM {
   }
 
   async _init(opts) {
-    const { ramMB = 512, wasm, busyboxUrl, nodeUrl } = opts;
+    const { ramMB = 512, wasm, busyboxUrl, nodeUrl, boaWasm } = opts;
     this._ramMB = ramMB;
+    this._boaWasm = boaWasm || null;
 
     // Load WASM binary (accepts URL string, ArrayBuffer, or Uint8Array)
     let wasmBytes;
@@ -353,6 +357,65 @@ class NanoVM {
 
   async loadTarGz(buffer) {
     await this._memfs.loadTarGz(buffer);
+  }
+
+  // ============================================================
+  // Public API — Scripting (host-side Boa engine)
+  // ============================================================
+
+  /**
+   * Create a sandboxed Boa scripting engine that can drive this VM. Loads
+   * boa.wasm lazily on first use (so consumers who never script pay nothing).
+   *
+   * @param {Object} [opts]
+   * @param {string|ArrayBuffer|Uint8Array} [opts.wasm] - boa.wasm source (defaults to NanoVM.create({boaWasm}))
+   * @param {Object} [opts.expose] - capabilities: { fs:"none"|"readonly"|"readwrite", run, node }
+   * @param {string} [opts.globalName] - bridge global name (default "nano")
+   * @param {Object} [opts.env] - read-only key/value bag injected as `<global>.env`
+   * @param {Object} [opts.limits] - { loopIterations, recursion }
+   * @param {number} [opts.timeoutMs] - host watchdog
+   * @returns {Promise<import("./boa.mjs").BoaEngine>}
+   */
+  async scripting(opts = {}) {
+    const wasm = opts.wasm || this._boaWasm;
+    if (!wasm) {
+      throw new Error("NanoVM.scripting: provide boa.wasm via opts.wasm or NanoVM.create({ boaWasm })");
+    }
+    if (!this._boa) {
+      const { BoaRuntime } = await import("./boa.mjs");
+      this._boa = await BoaRuntime.load(wasm);
+    }
+    return this._boa.createEngine({ host: this._scriptingHost(), ...opts });
+  }
+
+  /** One-shot: create an engine, evaluate `source`, dispose, return the value. */
+  async script(source, opts = {}) {
+    const engine = await this.scripting(opts);
+    try {
+      return await engine.eval(source);
+    } finally {
+      engine.dispose();
+    }
+  }
+
+  /** Host driver mapping the Boa bridge onto this VM's MemFS + run/node. */
+  _scriptingHost() {
+    const vm = this;
+    return {
+      fs: {
+        readText: (p) => vm.readFileString(p),
+        readFile: (p) => {
+          const node = vm._memfs.resolve(p);
+          return node && node.isFile ? node.data || new Uint8Array(0) : null;
+        },
+        list: (p) => vm.listDir(p),
+        exists: (p) => !!vm._memfs.resolve(p),
+        writeFile: (p, bytes) => vm.addFile(p, bytes),
+      },
+      run: (command) => vm.run(command),
+      node: (args) => vm.node(...(Array.isArray(args) ? args : [args])),
+      log: (...a) => console.log(...a),
+    };
   }
 
   // ============================================================

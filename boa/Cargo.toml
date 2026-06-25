@@ -1,0 +1,53 @@
+# nano-boa — embeds the Boa JavaScript engine as a standalone `boa.wasm`
+# scripting component for nano (see specs/nano/scripting-layer.md).
+#
+# Deliberately wasm-bindgen-free: Boa's `js` feature drags in web-time +
+# getrandom/wasm_js + time/wasm-bindgen and the whole js-sys glue. Instead we
+# supply time + entropy through our own clean host imports (src/host.rs), which
+# keeps boa.wasm a small module with a tiny C-style ABI — symmetric with how
+# nano.wasm talks to its JS host.
+#
+# Build with `make build-boa` from the nano root. That passes RUSTFLAGS via the
+# environment, which FULLY overrides config-file rustflags — important because
+# nano's root .cargo/config.toml sets --shared-memory/--import-memory for the
+# emulator, and cargo *joins* ancestor config rustflags into nested crates. A
+# child .cargo/config.toml cannot cancel that join, so the env var is the only
+# clean override. The raw command:
+#   RUSTFLAGS='--cfg getrandom_backend="custom"' \
+#     cargo build --release --target wasm32-unknown-unknown --manifest-path boa/Cargo.toml
+[package]
+name = "nano-boa"
+version = "0.1.0"
+edition = "2021"
+description = "Boa JavaScript engine packaged as nano's boa.wasm scripting component"
+license = "MIT OR Unlicense"
+
+# Keep this crate out of any ancestor workspace (nano's package manifest lives
+# one directory up). An empty [workspace] table makes it self-contained.
+[workspace]
+
+[lib]
+name = "boa"          # -> boa.wasm
+crate-type = ["cdylib"]
+
+[dependencies]
+# No `js` feature (see header). default-features=false drops float16/xsum too,
+# which we don't need and which only add size.
+boa_engine = { version = "0.21", default-features = false }
+# WebAPI shims (console, encoding, URL, timers). default-features=false drops
+# `fetch`/`url`-via-reqwest network deps; we re-enable just `url`.
+boa_runtime = { version = "0.21", default-features = false, features = ["url"] }
+# Direct dep so we can name getrandom::Error for the custom backend.
+getrandom = "0.3"
+# Boa's `Trace`/`Finalize` derive macros expand to `boa_gc::…` paths, so the
+# crate name must be in scope. Pinned to Boa's GC version.
+boa_gc = "0.21"
+# Marshalling across the host boundary. Unifies with boa_engine's own serde_json.
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -255,6 +255,27 @@ fi
 echo ""
 
 # ============================================================
+# Phase: Scripting layer (Boa / boa.wasm)
+# ============================================================
+echo "Phase: Scripting layer (Boa)"
+BOA_WASM="$PROJECT_ROOT/wasm/boa.wasm"
+if [ ! -f "$BOA_WASM" ]; then
+    skip "scripting tests" "wasm/boa.wasm not found (run 'make build-boa')"
+else
+    boa_output=$(node "$SCRIPT_DIR/test_boa.mjs" "$BOA_WASM" 2>&1)
+    boa_rc=$?
+    boa_summary=$(echo "$boa_output" | grep -E "passed, .* failed" | tail -1)
+    if [ "$boa_rc" -eq 0 ]; then
+        ok "scripting: ${boa_summary:-all assertions}"
+    else
+        fail "scripting: ${boa_summary:-failed}"
+        echo "$boa_output" | grep -E "FAIL:" | sed 's/^/    /'
+    fi
+fi
+
+echo ""
+
+# ============================================================
 # Summary
 # ============================================================
 
