@@ -12,9 +12,17 @@ The Rust toolchain is pinned in `rust-toolchain.toml`. The WASM target is added 
 
 ```bash
 make build            # Default: fully-bundled wasm/nano.wasm (~68MB)
-make build-minimal    # Bare emulator (~585KB) — no bundled binaries
+make build-minimal    # Bare emulator — no bundled binaries (dev; keeps syscall trace)
+make build-min        # Release artifact: wasm/nano.min.wasm  (no trace — plain conformance)
+make build-trace      # Release artifact: wasm/nano.trace.wasm (per-syscall trace coverage)
+make test-trace       # Verify the trace feature gate (min emits no syscalls, trace does)
 make clean            # Remove build artifacts
 ```
+
+`nano.min.wasm` and `nano.trace.wasm` are the two runtimes the app publish pipeline
+consumes (see `specs/nano/publish-pipeline.md`); `.github/workflows/release.yml`
+builds both — plus `nano-syscalls.json` from `tools/gen-syscalls-json.mjs` — and
+attaches them to the GitHub Release on each `v*` tag.
 
 ### What gets built
 
@@ -30,6 +38,7 @@ The default build embeds busybox, node, and devenv tools. Use `build-minimal` fo
 | `node` | `images/node` (static RISC-V ELF) | ~52MB |
 | `devenv` | `build/devenv.tar.gz` (npm, tsc, eslint, prettier) | ~15MB |
 | `demo` | All of the above (default) | ~68MB |
+| `trace` | nothing; emits `debug_log(0x0A \| nr)` per syscall (default-on; off in `build-min`) | none |
 
 Binaries are embedded via `include_bytes!` into the WASM data section. When a feature is disabled, the corresponding `vm_bundled_*_ptr()` returns 0 and `vm_bundled_*_size()` returns 0.
 

@@ -1,0 +1,56 @@
+name: release
+
+# Publish the runtime artifacts the app publish pipeline depends on. On every
+# semver tag we build the two conformance wasms and the syscall manifest, and
+# attach them to the GitHub Release for that tag. The catalog CI fetches these
+# by tag (NANO_VERSION) — see userland-run/catalog .github/workflows/publish.yml.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # create/upload to the release for this tag
+
+jobs:
+  artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # nano.min.wasm   — plain runtime: pass/fail + golden output + budgets.
+      # nano.trace.wasm — same emulator + per-syscall debug_log(0x0A) for coverage.
+      - name: Build conformance wasms
+        run: |
+          make build-min
+          make build-trace
+
+      # nano-syscalls.json — authoritative supported-syscall set for the gate.
+      - name: Generate syscall manifest
+        run: node tools/gen-syscalls-json.mjs > wasm/nano-syscalls.json
+
+      - name: Show artifacts
+        run: ls -lh wasm/nano.min.wasm wasm/nano.trace.wasm wasm/nano-syscalls.json
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "nano runtime ${GITHUB_REF_NAME}: conformance wasms + syscall manifest." \
+            --verify-tag 2>/dev/null \
+          || echo "release ${GITHUB_REF_NAME} already exists; uploading assets"
+          gh release upload "${GITHUB_REF_NAME}" \
+            wasm/nano.min.wasm \
+            wasm/nano.trace.wasm \
+            wasm/nano-syscalls.json \
+            --clobber

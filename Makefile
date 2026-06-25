@@ -24,9 +24,10 @@ build:
 	cargo build --target $(WASM_TARGET) --release
 	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.wasm
 
-# Minimal build: bare emulator, no bundled binaries (fast, for development/testing)
+# Minimal build: bare emulator, no bundled binaries (fast, for development/testing).
+# Keeps the `trace` feature so `node test/run.mjs --trace` still counts syscalls.
 build-minimal:
-	cargo build --target $(WASM_TARGET) --release --no-default-features
+	cargo build --target $(WASM_TARGET) --release --no-default-features --features trace
 	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.wasm
 
 # Release artifact: plain conformance runtime → wasm/nano.min.wasm (no bundled
@@ -91,6 +92,11 @@ test-boa: build-boa
 test-boa-vm: build-boa
 	@test -f $(OUT_DIR)/nano.wasm || (echo "ERROR: $(OUT_DIR)/nano.wasm not found. Run 'make build' first." && exit 1)
 	node test/test_boa_vm.mjs
+
+# Verify the trace feature gate: build both release wasms, assert nano.trace.wasm
+# emits per-syscall events and nano.min.wasm does not.
+test-trace: build-min build-trace
+	node test/test_trace.mjs
 
 # Run demo dev server (copies WASM to public dir, starts vite)
 demo: build build-boa
