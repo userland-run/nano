@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 /**
  * In-memory POSIX-like filesystem for NanoVM.
  * Provides FSNode (inode) and MemFS (filesystem operations) classes.
@@ -318,7 +322,9 @@ class MemFS {
   mkdir(path, mode) {
     const parts = path.split("/").filter(Boolean);
     const name = parts.pop();
-    if (!name) return EINVAL;
+    // No final component means the path is "/" (root), which already exists.
+    // Return EEXIST (not EINVAL) so `mkdir -p` treats it as a no-op, not fatal.
+    if (!name) return EEXIST;
     let dir = this.root;
     for (const p of parts) {
       if (!dir.children || !dir.children.has(p)) return ENOENT;

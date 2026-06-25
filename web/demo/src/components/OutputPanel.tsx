@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 import { Tabs, TabList, Tab, TabPanel, Text, ActionButton, Heading, Content, IllustratedMessage } from "@react-spectrum/s2";
 // @ts-ignore
 import { style } from "@react-spectrum/s2/style" with { type: "macro" };

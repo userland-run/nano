@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 /**
  * Node.js test suite for NanoVM
  * Runs each test file inside the guest VM and reports results.

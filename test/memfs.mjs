@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 /**
  * In-memory POSIX-like filesystem for NanoVM test runner.
  * Provides FSNode (inode) and MemFS (filesystem operations) classes.

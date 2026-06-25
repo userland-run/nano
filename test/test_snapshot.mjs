@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 /**
  * Snapshot round-trip tests for NanoVM.
  * Tests MemFS serialization and (when bundled WASM + node ELF available) full VM snapshotting.

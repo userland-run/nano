@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 // Service Worker bridge — registers SW and routes HTTP requests from the
 // iframe preview to NanoVM's VirtualServer.
 

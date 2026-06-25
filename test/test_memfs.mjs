@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 /**
  * Unit tests for MemFS (test/memfs.mjs)
  * Pure Node.js - no WASM needed. Tests the in-memory filesystem independently.

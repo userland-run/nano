@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 /// Expand a 16-bit RV64C compressed instruction into a 32-bit RV64I equivalent.
 /// Returns 0 for illegal/unknown compressed instructions.
 #[inline(always)]
