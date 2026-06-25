@@ -119,6 +119,22 @@ if (vmPtr === 0) { console.error("vm_create failed"); process.exit(1); }
 
 const ramPtr  = X.vm_ram_ptr(vmPtr);
 const ramSize = X.vm_ram_size(vmPtr);
+
+// --- Optional tty mode (--tty): make std fds report as a terminal (isatty) ---
+if (process.argv.includes("--tty") && X.vm_tty_enable) {
+  X.vm_tty_enable(vmPtr, 1, 80, 25);
+  console.error("tty mode enabled (80x25)");
+}
+
+// --- Push --stdin data into the in-VM tty ring (new wasm). Older wasm without
+//     vm_stdin_push falls back to the SYS_READ drain in processFsRequest. ---
+if (useStdin && X.vm_stdin_push && stdinData.length > 0) {
+  const p = X.malloc(stdinData.length);
+  new Uint8Array(memory.buffer).set(stdinData, p);
+  X.vm_stdin_push(vmPtr, p, stdinData.length);
+}
+if (useStdin && X.vm_stdin_eof) X.vm_stdin_eof(vmPtr);
+
 console.error(`VM created: ptr=${vmPtr}  RAM base=${ramPtr} size=${ramSize} (${(ramSize/1024/1024)|0} MB)`);
 console.error(`vm_struct_size = ${X.vm_struct_size()}`);
 

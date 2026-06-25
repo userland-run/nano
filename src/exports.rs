@@ -249,6 +249,37 @@ pub unsafe extern "C" fn vm_tty_set_size(vm_ptr: u32, cols: u32, rows: u32) {
     vm.ws_row = rows as u16;
 }
 
+// ---------- stdin (in-VM tty ring) ----------
+
+/// Push `len` host input bytes (at linear-memory `ptr`) into the stdin ring,
+/// applying the line discipline (cooked echo/erase or raw passthrough).
+#[no_mangle]
+pub unsafe extern "C" fn vm_stdin_push(vm_ptr: u32, ptr: u32, len: u32) {
+    let vm = &*(vm_ptr as *const Vm);
+    let bytes = core::slice::from_raw_parts(ptr as *const u8, len as usize);
+    crate::tty::stdin_push(vm, bytes);
+}
+
+/// Mark interactive stdin: when true, an empty read parks (blocks) instead of
+/// returning EOF. Batch runs leave this false to preserve EOF-on-empty.
+#[no_mangle]
+pub unsafe extern "C" fn vm_stdin_set_interactive(_vm_ptr: u32, on: i32) {
+    crate::tty::set_interactive(on != 0);
+}
+
+/// Signal end-of-input on stdin (e.g. host closed the input / Ctrl-D).
+#[no_mangle]
+pub unsafe extern "C" fn vm_stdin_eof(_vm_ptr: u32) {
+    crate::tty::set_eof();
+}
+
+/// Re-attempt a parked stdin read/ppoll. Returns 1 if completed (a0 + status
+/// set), 0 if it must keep waiting for input.
+#[no_mangle]
+pub unsafe extern "C" fn vm_io_retry(vm_ptr: u32) -> i32 {
+    crate::syscall::io_retry(&mut *(vm_ptr as *mut Vm))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn vm_struct_ptr(vm_ptr: u32) -> u32 {
     vm_ptr

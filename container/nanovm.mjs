@@ -57,6 +57,7 @@ const SYS_GETDENTS64 = 61;
 const SYS_LSEEK      = 62;
 const SYS_READ       = 63;
 const SYS_WRITE      = 64;
+const SYS_PPOLL      = 73;
 const SYS_PREAD64    = 67;
 const SYS_PREADV     = 69;
 const SYS_READLINKAT = 78;
@@ -226,8 +227,10 @@ class NanoVM {
       "sort head tail grep sed awk cut tr wc find xargs sleep env printf basename " +
       "dirname dd du df date id whoami hostname uname true false test expr seq yes " +
       "tee which tar gzip gunzip zcat md5sum sha256sum cmp stat readlink realpath " +
-      "mktemp sync kill ps nl od base64 wget clear sh ash").split(" ");
-    for (const a of applets) m.createSymlink("/bin/" + a, "busybox");
+      "mktemp sync kill ps nl od base64 wget clear ash").split(" ");
+    for (const a of applets) {
+      if (!m.resolve("/bin/" + a, false)) m.createSymlink("/bin/" + a, "busybox");
+    }
     m.createDir("/dev");
     m.createFile("/dev/null", "");
     m.createDir("/etc");
@@ -410,8 +413,19 @@ class NanoVM {
   writeStdin(bytes) {
     if (typeof bytes === "string") bytes = new TextEncoder().encode(bytes);
     if (!bytes || bytes.length === 0) return;
-    // Store a private copy so callers can reuse their buffer.
-    this._stdinQueue.push(bytes.slice());
+    const X = this._exports;
+    if (X && X.vm_stdin_push) {
+      // Push into the in-VM tty ring (applies line discipline / echo).
+      if (!this._stdinScratch || this._stdinScratchCap < bytes.length) {
+        this._stdinScratchCap = Math.max(bytes.length, 1024);
+        this._stdinScratch = X.malloc(this._stdinScratchCap);
+      }
+      new Uint8Array(this._memory.buffer).set(bytes, this._stdinScratch);
+      X.vm_stdin_push(this._vmPtr, this._stdinScratch, bytes.length);
+    } else {
+      // Legacy fallback: JS queue (older wasm without the in-VM tty ring).
+      this._stdinQueue.push(bytes.slice());
+    }
     this._stdinEof = false; // new input cancels a prior EOF
   }
 
@@ -424,11 +438,15 @@ class NanoVM {
    */
   setInteractiveStdin(on = true) {
     this._stdinInteractive = !!on;
+    const X = this._exports;
+    if (X && X.vm_stdin_set_interactive) X.vm_stdin_set_interactive(this._vmPtr, on ? 1 : 0);
   }
 
   /** Signal end-of-input on stdin (e.g. Ctrl-D). The next empty read returns EOF. */
   closeStdin() {
     this._stdinEof = true;
+    const X = this._exports;
+    if (X && X.vm_stdin_eof) X.vm_stdin_eof(this._vmPtr);
   }
 
   /** Total bytes currently queued on stdin. */
@@ -570,6 +588,10 @@ class NanoVM {
   /** Append guest bytes to a pipe buffer. */
   _pipeWrite(id, srcPhys, count) {
     if (count <= 0) return 0;
+    // Only the serialized fork pipeline (a | b) buffers pipe data. A live
+    // process's own pipe (e.g. node/libuv's self-pipe) keeps legacy discard
+    // semantics so its event loop is not perturbed.
+    if (!this._forkStack || this._forkStack.length === 0) return count;
     const p = this._pipeGet(id);
     p.chunks.push(new Uint8Array(this._memory.buffer, srcPhys, count).slice());
     p.total += count;
@@ -578,9 +600,12 @@ class NanoVM {
 
   /** Drain up to `count` bytes from a pipe buffer; 0 = EOF (writer finished). */
   _pipeRead(id, dstPhys, count) {
+    // Live (non-fork) process pipe, e.g. node/libuv self-pipe: legacy EOF
+    // semantics that node tolerates. Only serialized fork readers buffer.
+    if (!this._forkStack || this._forkStack.length === 0) return 0;
     const p = this._pipeGet(id);
     const avail = p.total - p.readPos;
-    if (avail <= 0 || count <= 0) return 0;
+    if (avail <= 0 || count <= 0) return 0; // serialized reader: writer finished
     const n = Math.min(count, avail);
     const dst = new Uint8Array(this._memory.buffer, dstPhys, n);
     let copied = 0, chunkStart = 0;
@@ -1215,6 +1240,18 @@ class NanoVM {
     const bufPtr    = dv.getUint32(reqPtr + 32, true);
     const bufLen    = dv.getUint32(reqPtr + 36, true);
 
+    // In-VM stdin park: a stdin read()/ppoll() blocked waiting for input.
+    // Re-attempt against the tty ring; if still waiting, leave FS_PENDING so the
+    // run loop re-polls (and yields to the event loop so keystrokes can arrive).
+    if (X.vm_io_retry && (syscallNr === SYS_READ || syscallNr === SYS_PPOLL)) {
+      const isStdin = syscallNr === SYS_PPOLL ||
+        (gfd >= 0 && gfd < MAX_FDS && this._fdRead(dv, gfd).fd_type === FD_TYPE_STDIN);
+      if (isStdin) {
+        X.vm_io_retry(this._vmPtr); // completes (sets a0 + status) or leaves pending
+        return;
+      }
+    }
+
     // Read null-terminated path (offset +40, max 256 bytes)
     const pathBytes = new Uint8Array(this._memory.buffer, reqPtr + 40, 256);
     let pe = 0; while (pe < 256 && pathBytes[pe] !== 0) pe++;
@@ -1418,7 +1455,7 @@ class NanoVM {
       case SYS_WRITE: {
         if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
         const fe = this._fdRead(dv, gfd);
-        if (fe.fd_type === FD_TYPE_PIPE) { result = bufLen || arg1; break; }
+        if (fe.fd_type === FD_TYPE_PIPE) { result = this._pipeWrite(fe.host_fd, ramPtr + bufPtr, bufLen || arg1); break; }
         if (fe.fd_type !== FD_TYPE_FILE) { result = -9; break; }
         const count = bufLen || arg1;
         const bufPhys = ramPtr + bufPtr;

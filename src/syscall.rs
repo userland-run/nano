@@ -261,6 +261,7 @@ pub unsafe fn reset_statics() {
     TIMERFD_INTERVAL_MS = [0.0; MAX_TIMERFDS];
     TIMERFD_ALLOC = 0;
     EPOLL_FINITE_TIMEOUT_ACTIVE = false;
+    crate::tty::reset();
 }
 
 /// Handle a syscall. Called from cpu.rs when ECALL is executed.
@@ -812,7 +813,24 @@ unsafe fn sys_read(vm: &mut Vm, fd: i32, buf: u64, count: u32) -> i64 {
     let fd_type = vm.fd_table[fd as usize].fd_type;
 
     match fd_type {
-        FD_TYPE_STDIN | FD_TYPE_FILE | FD_TYPE_PIPE => {
+        FD_TYPE_STDIN => {
+            // stdin is owned by the in-VM tty ring (line discipline). Try to
+            // satisfy the read now; if interactive and empty, park (FS_PENDING)
+            // and let the host retry via vm_io_retry when input arrives.
+            let r = crate::tty::try_read(vm, buf, count);
+            if r == crate::tty::WAIT {
+                vm.fs_request.syscall_nr = SYS_READ as i32;
+                vm.fs_request.fd = fd;
+                vm.fs_request.buf_ptr = buf as u32;
+                vm.fs_request.buf_len = count;
+                vm.fs_request.arg1 = count as i64;
+                vm.status = STATUS_FS_PENDING;
+                0
+            } else {
+                r
+            }
+        }
+        FD_TYPE_FILE | FD_TYPE_PIPE => {
             // Delegate to host via FS protocol
             vm.fs_request.syscall_nr = SYS_READ as i32;
             vm.fs_request.fd = fd;
@@ -1726,9 +1744,82 @@ unsafe fn sys_pipe2(vm: &mut Vm, pipefd: u64, _flags: i32) -> i64 {
     0
 }
 
-unsafe fn sys_ppoll(vm: &mut Vm, _fds: u64, _nfds: u32, _timeout: u64) -> i64 {
-    // Stub: return 0 (timeout)
+const POLLIN: u16 = 0x0001;
+
+unsafe fn sys_ppoll(vm: &mut Vm, fds: u64, nfds: u32, timeout: u64) -> i64 {
+    // Clear revents and find a stdin fd polled for POLLIN.
+    let mut stdin_idx: i64 = -1;
+    let mut i = 0u32;
+    while i < nfds {
+        let pfd = fds + (i as u64) * 8; // struct pollfd { int fd; short events; short revents; }
+        let gfd = mem::read_i32(vm.ram_base, pfd);
+        let events = mem::read_u16(vm.ram_base, pfd + 4);
+        mem::write_u16(vm.ram_base, pfd + 6, 0);
+        if gfd >= 0
+            && (gfd as usize) < MAX_FDS
+            && vm.fd_table[gfd as usize].fd_type == FD_TYPE_STDIN
+            && (events & POLLIN) != 0
+        {
+            stdin_idx = i as i64;
+        }
+        i += 1;
+    }
+
+    if stdin_idx < 0 {
+        return 0; // nothing we model is ready — behave as a timeout
+    }
+    if crate::tty::pollin() {
+        let pfd = fds + (stdin_idx as u64) * 8;
+        mem::write_u16(vm.ram_base, pfd + 6, POLLIN);
+        return 1;
+    }
+    // Not ready. A non-NULL timeout of {0,0} means "poll, don't block".
+    if timeout != 0 {
+        let sec = mem::read_i64(vm.ram_base, timeout);
+        let nsec = mem::read_i64(vm.ram_base, timeout + 8);
+        if sec == 0 && nsec == 0 {
+            return 0;
+        }
+    }
+    if !crate::tty::interactive() {
+        return 0;
+    }
+    // Park until input; host retries via vm_io_retry (fd field = the stdin index).
+    vm.fs_request.syscall_nr = SYS_PPOLL as i32;
+    vm.fs_request.fd = stdin_idx as i32;
+    vm.fs_request.buf_ptr = fds as u32;
+    vm.fs_request.arg1 = nfds as i64;
+    vm.status = STATUS_FS_PENDING;
     0
+}
+
+/// Re-attempt a parked stdin read/ppoll against the tty ring. Returns 1 when the
+/// op completed (a0 + status already set), 0 while it must keep waiting. Called
+/// by the host (`vm_io_retry`) each loop iteration while status is FS_PENDING.
+pub unsafe fn io_retry(vm: &mut Vm) -> i32 {
+    match vm.fs_request.syscall_nr as u64 {
+        SYS_READ => {
+            let r = crate::tty::try_read(vm, vm.fs_request.buf_ptr as u64, vm.fs_request.buf_len);
+            if r == crate::tty::WAIT {
+                return 0;
+            }
+            vm.x[10] = r as u64;
+            vm.status = STATUS_OK;
+            1
+        }
+        SYS_PPOLL => {
+            if crate::tty::pollin() {
+                let pfd = vm.fs_request.buf_ptr as u64 + (vm.fs_request.fd as u64) * 8;
+                mem::write_u16(vm.ram_base, pfd + 6, POLLIN);
+                vm.x[10] = 1;
+                vm.status = STATUS_OK;
+                1
+            } else {
+                0
+            }
+        }
+        _ => 1,
+    }
 }
 
 unsafe fn sys_epoll_create1(vm: &mut Vm, _flags: i32) -> i64 {

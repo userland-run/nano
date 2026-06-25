@@ -14,6 +14,7 @@ mod host;
 mod mem;
 mod syscall;
 mod term;
+mod tty;
 mod types;
 
 #[panic_handler]
