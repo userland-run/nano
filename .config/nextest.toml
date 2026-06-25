@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+# Copyright (C) 2026 And The Next GmbH - https://userland.run
+
+[profile.ci]
+# Retry once so a transient failure surfaces as flaky (not red) to the status hub.
+retries = 1
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"

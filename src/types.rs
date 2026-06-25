@@ -209,6 +209,45 @@ pub struct Vm {
 // Compile-time size verification
 const _: () = assert!(core::mem::size_of::<Vm>() == 12680);
 
+#[cfg(test)]
+mod tests {
+    // The Vm layout is a contract with the JS host (hardcoded offsets). These
+    // tests lock the offsets the host boundary depends on so a struct change can
+    // never silently drift. test/feature-map.json maps `types::tests::` to
+    // the registry feature emulator.types.layout.
+    use super::*;
+    use core::mem::{offset_of, size_of};
+
+    #[test]
+    fn vm_size_is_locked() {
+        assert_eq!(size_of::<Vm>(), 12680);
+    }
+
+    #[test]
+    fn host_shared_offsets_are_stable() {
+        assert_eq!(offset_of!(Vm, x), 0);
+        assert_eq!(offset_of!(Vm, pc), 256);
+        assert_eq!(offset_of!(Vm, status), 528);
+        assert_eq!(offset_of!(Vm, fs_request), 2216);
+        assert_eq!(offset_of!(Vm, cwd), 3680);
+        assert_eq!(offset_of!(Vm, ram_base), 3960);
+    }
+
+    #[test]
+    fn a0_and_sp_register_offsets() {
+        // a0 = x[10] @ +80, sp = x[2] @ +16 (used by the host to read/write regs)
+        assert_eq!(offset_of!(Vm, x) + 10 * 8, 80);
+        assert_eq!(offset_of!(Vm, x) + 2 * 8, 16);
+    }
+
+    #[test]
+    fn fsrequest_path_buffers_are_256() {
+        // FsRequest.path @ +40 (256), path2 @ +296 (256) — node_modules paths.
+        assert_eq!(offset_of!(FsRequest, path), 40);
+        assert_eq!(offset_of!(FsRequest, path2), 296);
+    }
+}
+
 impl Vm {
     /// Initialize a fresh VM
     pub unsafe fn init(&mut self) {

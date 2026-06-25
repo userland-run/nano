@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+# `rlib` is added only so `cargo test`/`cargo nextest` can build a host test
+# harness; the shipped wasm artifact is still the `cdylib`, byte-for-byte.
+crate-type = ["cdylib", "rlib"]
 
 [features]
 # `trace` is on by default so `node test/run.mjs --trace` keeps working on the

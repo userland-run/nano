@@ -1,0 +1,8 @@
+{
+  "comment": "Fallback test-name → registry feature id map for the cargo-unit suite. The primary mechanism is the __feat__<id> suffix on test names; this map covers tests without one (match by `module::test` prefix).",
+  "contract": 1,
+  "map": {
+    "decode::tests::": ["emulator.cpu.decode-rvc"],
+    "types::tests::": ["emulator.types.layout"]
+  }
+}

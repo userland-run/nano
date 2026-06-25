@@ -497,3 +497,47 @@ fn encode_j(opcode: u32, rd: u32, imm: i32) -> u32 {
     let b19_12 = (imm >> 12) & 0xff;
     opcode | (rd << 7) | (b19_12 << 12) | (b11 << 20) | (b10_1 << 21) | (b20 << 31)
 }
+
+#[cfg(test)]
+mod tests {
+    // Real unit tests for RV64C expansion. test/feature-map.json maps the
+    // `decode::tests::` prefix to the registry feature emulator.cpu.decode-rvc.
+    use super::*;
+
+    // C.NOP (0x0001) must expand to the canonical NOP `addi x0, x0, 0` = 0x13.
+    #[test]
+    fn c_nop_is_canonical_nop() {
+        assert_eq!(expand_compressed(0x0001), 0x0000_0013);
+    }
+
+    // C.ADDI4SPN with nzuimm == 0 is illegal → sentinel 0.
+    #[test]
+    fn illegal_compressed_returns_zero() {
+        assert_eq!(expand_compressed(0x0000), 0);
+    }
+
+    // A 32-bit instruction (bits[1:0] == 11) is not compressed → 0.
+    #[test]
+    fn non_compressed_returns_zero() {
+        assert_eq!(expand_compressed(0xFFFF), 0);
+    }
+
+    // C.LW (quadrant 0, funct3=010) expands to a LW — opcode 0b0000011.
+    #[test]
+    fn c_lw_expands_to_load_opcode() {
+        assert_eq!(expand_compressed(0x4000) & 0x7f, 0b0000011);
+    }
+
+    // C.SW (quadrant 0, funct3=110) expands to a SW — opcode 0b0100011.
+    #[test]
+    fn c_sw_expands_to_store_opcode() {
+        assert_eq!(expand_compressed(0xC000) & 0x7f, 0b0100011);
+    }
+
+    // C.ADDI (quadrant 1, funct3=000, rd!=0) expands to an OP-IMM addi — opcode 0b0010011.
+    #[test]
+    fn c_addi_expands_to_opimm() {
+        // rd=1, imm=1: bits 000_0_00001_00001_01
+        assert_eq!(expand_compressed(0x0085) & 0x7f, 0b0010011);
+    }
+}

@@ -1,0 +1,38 @@
+name: test
+
+# Run the host-side Rust unit tests (decode + Vm layout) on every default-branch
+# push and publish the results to the userland.run status hub.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run cargo unit tests (host)
+        run: cargo nextest run --profile ci
+      - name: Convert to results contract
+        run: node tools/junit-to-results.mjs target/nextest/ci/junit.xml --source nano --suite cargo-unit --map test/feature-map.json > userland-results.json
+      - name: Publish to status hub
+        if: github.ref == 'refs/heads/main'
+        uses: userland-run/status/.github/actions/publish-results@main
+        with:
+          source: nano
+          suite: cargo-unit
+          results-file: userland-results.json
+          token: ${{ secrets.STATUS_DISPATCH_TOKEN }}
