@@ -1,0 +1,31 @@
+# Third-Party Notices — NanoVM
+
+NanoVM itself is licensed as described in LICENSE.md (AGPL-3.0-only OR
+LicenseRef-UEL). This file lists third-party software that the project
+*redistributes*; each such component remains under its own license.
+
+## Bundled guest binaries (RISC-V / Linux)
+
+The default ("demo"/bundled) build embeds the following unmodified upstream
+binaries into the WASM data section (sources tracked under `images/` via Git
+LFS). They run as *guest* userland programs under emulation — aggregated and
+redistributed, not linked into NanoVM's Rust code — and each remains governed by
+its own license:
+
+| Component  | Upstream license            | Source                         |
+| ---------- | --------------------------- | ------------------------------ |
+| BusyBox    | GPL-2.0-only                | https://busybox.net            |
+| Node.js    | MIT-style "Node.js" license | https://nodejs.org             |
+| TypeScript | Apache-2.0                  | https://www.typescriptlang.org |
+| npm        | Artistic-2.0                | https://www.npmjs.com          |
+| ESLint     | MIT                         | https://eslint.org             |
+| Prettier   | MIT                         | https://prettier.io            |
+
+Node.js further bundles its own third-party dependencies (V8, OpenSSL, ICU,
+zlib, and others) under their respective licenses; see the Node.js distribution
+for the complete list.
+
+Because these binaries are mere-aggregation guests rather than parts of the
+NanoVM work, their licenses neither extend NanoVM's AGPL-3.0 obligations to them
+nor vice versa. Verify the exact versions and license texts of the binaries
+currently committed under `images/` before redistribution.

@@ -1,0 +1,45 @@
+name: CLA Assistant
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+# The CLA Assistant needs to comment on PRs, set commit statuses, and (via the
+# personal access token below) write the signature file to the separate
+# userland-run/cla-signatures repository.
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    steps:
+      - name: CLA Assistant
+        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          # Provided automatically by GitHub Actions; used to comment on the PR.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A PAT (classic, `repo` scope — or fine-grained with Contents: write)
+          # that has write access to userland-run/cla-signatures.
+          # Add it as a repository (or org) secret named CLA_SIGNATURES_TOKEN.
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
+        with:
+          # One shared signature file for ALL userland.run projects: the CLA is an
+          # umbrella agreement, so contributors sign once and are recognized
+          # across every repository.
+          path-to-signatures: 'signatures/cla.json'
+          path-to-document: '${{ github.server_url }}/${{ github.repository }}/blob/main/CLA.md'
+          branch: 'main'
+          allowlist: 'dependabot[bot],renovate[bot]'
+          # Store signatures in the dedicated repository.
+          remote-organization-name: 'userland-run'
+          remote-repository-name: 'cla-signatures'
+          custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
+          custom-notsigned-prcomment: 'Thank you for your contribution to a **userland.run** project. Before we can merge, please read our [Contributor License Agreement](${{ github.server_url }}/${{ github.repository }}/blob/main/CLA.md) and sign it by posting the comment below. You only need to sign once — your signature covers every userland.run project.'
+          custom-allsigned-prcomment: 'All contributors have signed the CLA. ✅'
