@@ -226,6 +226,10 @@ const TCSETSW: u64 = 0x5403;
 const TCSETSF: u64 = 0x5404;
 const FIONREAD: u64 = 0x541B;
 
+// termios c_oflag bits (output post-processing).
+const OPOST: u32 = 0x0001;
+const ONLCR: u32 = 0x0004;
+
 /// Install sane "cooked mode" termios defaults on a freshly-enabled tty so the
 /// guest reads back a believable terminal (ICANON+ECHO+ISIG, ^C/^D/erase, etc.).
 pub unsafe fn tty_init_termios(vm: &mut Vm) {
@@ -917,6 +921,49 @@ unsafe fn sys_preadv(vm: &mut Vm, fd: i32, iov: u64, iovcnt: u32, offset: u64) -
     }
 }
 
+/// Scratch buffer for OPOST output translation (NL -> CR NL). Reused per write;
+/// safe because `console_write` forwards synchronously to the term parser and
+/// execution is single-threaded (same contract as tty::ECHO_BUF).
+const OPOST_BUF_CAP: usize = 1024;
+static mut OPOST_BUF: [u8; OPOST_BUF_CAP] = [0; OPOST_BUF_CAP];
+
+/// Write guest bytes to the console with terminal output post-processing. With a
+/// tty in OPOST|ONLCR mode (the cooked default), each NL becomes CR-NL — exactly
+/// what the kernel's n_tty write path does. Without it a program's bare '\n'
+/// line-feeds with no carriage return, producing the classic "staircase" where
+/// every line starts under the end of the previous one. Raw mode (OPOST cleared)
+/// and non-tty consoles pass through untouched.
+unsafe fn console_write_tty(vm: &Vm, fd: i32, buf: u64, count: u32) {
+    let onlcr = vm.tty_enabled != 0 && (vm.c_oflag & OPOST) != 0 && (vm.c_oflag & ONLCR) != 0;
+    if !onlcr {
+        let ptr = (vm.ram_base + buf as u32) as i32;
+        host::console_write(fd, ptr, count as i32);
+        return;
+    }
+    let mut out: usize = 0;
+    let mut i: u32 = 0;
+    while i < count {
+        // Each iteration appends at most 2 bytes (CR NL); flush first if needed.
+        if out + 2 > OPOST_BUF_CAP {
+            host::console_write(fd, OPOST_BUF.as_ptr() as i32, out as i32);
+            out = 0;
+        }
+        let b = mem::read_u8(vm.ram_base, buf + i as u64);
+        if b == b'\n' {
+            OPOST_BUF[out] = b'\r';
+            OPOST_BUF[out + 1] = b'\n';
+            out += 2;
+        } else {
+            OPOST_BUF[out] = b;
+            out += 1;
+        }
+        i += 1;
+    }
+    if out > 0 {
+        host::console_write(fd, OPOST_BUF.as_ptr() as i32, out as i32);
+    }
+}
+
 unsafe fn sys_write(vm: &mut Vm, fd: i32, buf: u64, count: u32) -> i64 {
     if fd < 0 || fd >= MAX_FDS as i32 {
         return EBADF;
@@ -925,9 +972,8 @@ unsafe fn sys_write(vm: &mut Vm, fd: i32, buf: u64, count: u32) -> i64 {
 
     match fd_type {
         FD_TYPE_STDOUT | FD_TYPE_STDERR => {
-            // Write directly to console
-            let ptr = (vm.ram_base + buf as u32) as i32;
-            host::console_write(fd, ptr, count as i32);
+            // Console output, with tty OPOST/ONLCR post-processing.
+            console_write_tty(vm, fd, buf, count);
             count as i64
         }
         FD_TYPE_DEVNULL => count as i64,

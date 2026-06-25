@@ -1250,15 +1250,23 @@ class NanoVM {
       return;
     }
 
-    // Preserve inherited fds + cwd across the image replacement.
+    // Preserve inherited fds + cwd + tty/termios across the image replacement.
+    // Like a real execve, the controlling tty's state (isatty + winsize + the
+    // termios flags, incl. OPOST/ONLCR) belongs to the terminal, not the process
+    // image, so it must survive the reset — otherwise the new program writes with
+    // no output post-processing and every '\n' line-feeds without a carriage
+    // return (the classic "staircase"). Block [3632, 3680) = tty_enabled, ws_row,
+    // ws_col, c_iflag/oflag/cflag/lflag, c_cc[19], c_line (see src/types.rs).
     const v = this._vmPtr;
     const fdTable = new Uint8Array(this._memory.buffer, v + FD_TABLE_OFF, 64 * 24).slice();
     const cwd = new Uint8Array(this._memory.buffer, v + 3680, 256).slice();
+    const ttyState = new Uint8Array(this._memory.buffer, v + 3632, 48).slice();
 
     this._resetVM();
 
     new Uint8Array(this._memory.buffer).set(fdTable, v + FD_TABLE_OFF);
     new Uint8Array(this._memory.buffer).set(cwd, v + 3680);
+    new Uint8Array(this._memory.buffer).set(ttyState, v + 3632);
 
     // Load the new image and set up argv/envp.
     new Uint8Array(this._memory.buffer).set(this._busyboxElf, this._ramPtr);
