@@ -7,11 +7,15 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [features]
-default = ["demo"]
+# `trace` is on by default so `node test/run.mjs --trace` keeps working on the
+# dev builds (make build / build-minimal). Only the lean release artifact
+# `nano.min.wasm` (make build-min, --no-default-features) drops it.
+default = ["demo", "trace"]
 busybox = []  # Embed images/busybox RISC-V ELF into WASM data section (~1MB)
 node = []     # Embed images/node RISC-V ELF into WASM data section (~52MB)
 devenv = []   # Embed build/devenv.tar.gz into WASM data section
 demo = ["busybox", "node", "devenv"]  # All bundled: full demo
+trace = []    # Emit a debug_log(0x0A | nr) event on every syscall (conformance coverage)
 
 [dependencies]
 # Terminal model parser (Console). default-features=false → no_std, no heap

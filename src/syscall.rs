@@ -420,6 +420,10 @@ pub unsafe fn handle(vm: &mut Vm) {
     let a4 = vm.x[14];
     let a5 = vm.x[15];
 
+    // Per-syscall trace event (tag 0x0A, low 16 bits = syscall nr). Gated behind
+    // the `trace` feature so the plain (min) build skips the hot-path host call;
+    // the conformance pipeline runs a `trace`-built wasm to collect syscall coverage.
+    #[cfg(feature = "trace")]
     host::debug_log(0x0A000000 | (nr as i32 & 0xFFFF));
     let result: i64 = match nr {
         SYS_EXIT => {
