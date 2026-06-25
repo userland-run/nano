@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 /**
  * NanoVM Browser Module — high-level API for the NanoVM RISC-V emulator.
  *
@@ -41,6 +45,9 @@ const STATUS_RUNNING        = 18;
 
 // Syscall numbers (RISC-V Linux)
 const SYS_GETCWD     = 17;
+const SYS_CLONE      = 220;
+const SYS_EXECVE     = 221;
+const SYS_WAIT4      = 260;
 const SYS_MKDIRAT    = 34;
 const SYS_UNLINKAT   = 35;
 const SYS_FACCESSAT  = 48;
@@ -76,6 +83,12 @@ class NanoVM {
     this._nodeElf = null;
     this._stdout = "";
     this._onStdout = null;
+    this._onStdoutBytes = null;       // optional raw-byte stdout tap: (fd, Uint8Array) — for the terminal/vte
+    this._stdinQueue = [];            // queued Uint8Array chunks awaiting a guest read() on fd 0
+    this._stdinHead = 0;              // bytes already consumed from _stdinQueue[0]
+    this._stdinInteractive = false;   // when true, an empty blocking stdin read parks instead of returning EOF
+    this._stdinEof = false;           // when true, an empty stdin read returns EOF (0) even in interactive mode
+    this._termEnabled = false;        // when true, console_write also feeds the in-wasm terminal grid (term_feed)
     this._virtualServer = null;
     this._scratchPtr = 0; // WASM linear memory scratch buffer for virtual server
     this._snapshotRequested = false; // set by sentinel detection in _processFsRequest
@@ -130,7 +143,14 @@ class NanoVM {
         emscripten_random() { return Math.random(); },
         emscripten_date_now() { return Date.now(); },
         console_write(fd, ptr, len) {
+          // Feed the in-wasm terminal grid first, zero-copy: ptr/len already
+          // point at the guest's write buffer in linear memory, so the vte
+          // parser reads exactly these bytes (escape sequences intact).
+          if (self._termEnabled && self._exports.term_feed) self._exports.term_feed(ptr, len);
           const bytes = new Uint8Array(self._memory.buffer, ptr, len).slice();
+          // Raw-byte tap: lets a terminal/vte consumer receive undecoded bytes
+          // (escape sequences, partial UTF-8) before any lossy string decode.
+          if (self._onStdoutBytes) self._onStdoutBytes(fd, bytes);
           const text = new TextDecoder().decode(bytes);
           self._stdout += text;
           if (self._onStdout) self._onStdout(text);
@@ -200,6 +220,14 @@ class NanoVM {
     m.createDir("/bin");
     m.createExecutable("/bin/busybox", "");
     m.createSymlink("/bin/sh", "busybox");
+    // Applet symlink farm: so PATH lookups in sh (and execve) resolve common
+    // busybox commands to /bin/busybox, which execve then runs by argv[0].
+    const applets = ("ls cat echo mkdir rmdir rm mv cp ln touch chmod chown pwd " +
+      "sort head tail grep sed awk cut tr wc find xargs sleep env printf basename " +
+      "dirname dd du df date id whoami hostname uname true false test expr seq yes " +
+      "tee which tar gzip gunzip zcat md5sum sha256sum cmp stat readlink realpath " +
+      "mktemp sync kill ps nl od base64 wget clear sh ash").split(" ");
+    for (const a of applets) m.createSymlink("/bin/" + a, "busybox");
     m.createDir("/dev");
     m.createFile("/dev/null", "");
     m.createDir("/etc");
@@ -369,6 +397,151 @@ class NanoVM {
     this._runId++;
   }
 
+  // ============================================================
+  // Public API — stdin (interactive terminal feed)
+  // ============================================================
+
+  /**
+   * Feed bytes to the guest's stdin (fd 0). Bytes are queued and delivered to
+   * the next (or a currently parked) read() on stdin. Accepts a Uint8Array or
+   * a string (encoded as UTF-8).
+   * @param {Uint8Array|string} bytes
+   */
+  writeStdin(bytes) {
+    if (typeof bytes === "string") bytes = new TextEncoder().encode(bytes);
+    if (!bytes || bytes.length === 0) return;
+    // Store a private copy so callers can reuse their buffer.
+    this._stdinQueue.push(bytes.slice());
+    this._stdinEof = false; // new input cancels a prior EOF
+  }
+
+  /**
+   * Switch stdin between EOF-on-empty (default, preserves non-interactive
+   * semantics) and blocking-park-on-empty (for an interactive terminal driving
+   * a live shell). When interactive, an empty read parks the VM until
+   * writeStdin() supplies data (or closeStdin() signals EOF).
+   * @param {boolean} on
+   */
+  setInteractiveStdin(on = true) {
+    this._stdinInteractive = !!on;
+  }
+
+  /** Signal end-of-input on stdin (e.g. Ctrl-D). The next empty read returns EOF. */
+  closeStdin() {
+    this._stdinEof = true;
+  }
+
+  /** Total bytes currently queued on stdin. */
+  _stdinAvailable() {
+    let n = -this._stdinHead;
+    for (const chunk of this._stdinQueue) n += chunk.length;
+    return n;
+  }
+
+  /**
+   * Copy up to `max` queued stdin bytes into guest physical address `bufPhys`.
+   * Advances the queue. Returns the number of bytes written.
+   */
+  _stdinDrain(bufPhys, max) {
+    let written = 0;
+    const dst = new Uint8Array(this._memory.buffer);
+    while (written < max && this._stdinQueue.length > 0) {
+      const chunk = this._stdinQueue[0];
+      const take = Math.min(chunk.length - this._stdinHead, max - written);
+      dst.set(chunk.subarray(this._stdinHead, this._stdinHead + take), bufPhys + written);
+      written += take;
+      this._stdinHead += take;
+      if (this._stdinHead >= chunk.length) {
+        this._stdinQueue.shift();
+        this._stdinHead = 0;
+      }
+    }
+    return written;
+  }
+
+  // ============================================================
+  // Public API — terminal grid (Console)
+  // ============================================================
+
+  /**
+   * Initialise the in-wasm terminal grid and start feeding it guest stdout.
+   * Also switches stdin to interactive (blocking) mode, since a terminal drives
+   * a live shell. Call once after create() (and again to resize).
+   * @param {number} cols
+   * @param {number} rows
+   */
+  termInit(cols = 80, rows = 25) {
+    const X = this._exports;
+    if (!X || !X.term_reset) throw new Error("WASM build lacks terminal exports (rebuild nano.wasm)");
+    this._termCols = cols;
+    this._termRows = rows;
+    X.term_reset(cols, rows);
+    this._termEnabled = true;
+    this.setInteractiveStdin(true);
+    // NOTE: tty mode (isatty=true) is intentionally NOT enabled here yet. It
+    // makes busybox ash switch to its line editor, which needs the raw-mode
+    // read semantics + line discipline implemented later in Phase 1. Until then
+    // the terminal uses front-end cooked mode. Call setTty(true) once those land.
+  }
+
+  /**
+   * Enable/disable guest tty mode (isatty + winsize + termios on the std fds).
+   * Persists across runs. Only turn on once raw-mode reads + line discipline are
+   * implemented, or interactive shells will switch to a line editor that hangs.
+   * @param {boolean} on
+   */
+  setTty(on = true) {
+    this._ttyEnabled = !!on;
+    const X = this._exports;
+    if (X.vm_tty_enable) {
+      X.vm_tty_enable(this._vmPtr, on ? 1 : 0, this._termCols || 80, this._termRows || 25);
+    }
+  }
+
+  /** Resize the terminal (grid + guest winsize). SIGWINCH delivery is Phase 1's signal step. */
+  termResize(cols, rows) {
+    const X = this._exports;
+    this._termCols = cols;
+    this._termRows = rows;
+    if (X.term_reset) X.term_reset(cols, rows);
+    if (X.vm_tty_set_size) X.vm_tty_set_size(this._vmPtr, cols, rows);
+  }
+
+  /**
+   * Snapshot the current grid for rendering. Returns dimensions, cursor, and a
+   * copy of the cell bytes (row-major, 8 bytes/cell: u32 ch, u8 fg, u8 bg,
+   * u8 flags, u8 pad), or null if the build lacks terminal exports.
+   * @returns {{cols:number, rows:number, cursorRow:number, cursorCol:number, cells:Uint8Array}|null}
+   */
+  termSnapshot() {
+    const X = this._exports;
+    if (!this._termEnabled || !X.term_cells_ptr) return null;
+    const cols = X.term_cols();
+    const rows = X.term_rows();
+    const ptr = X.term_cells_ptr();
+    const cells = new Uint8Array(this._memory.buffer, ptr, cols * rows * 8).slice();
+    return { cols, rows, cursorRow: X.term_cursor_row(), cursorCol: X.term_cursor_col(), cells };
+  }
+
+  /**
+   * Echo bytes straight into the terminal grid WITHOUT sending them to the
+   * guest. Phase-0 front-end cooked-mode stopgap for local echo of typed input
+   * (the VM has no tty line discipline / echo yet — that arrives in Phase 1).
+   * @param {Uint8Array|string} data
+   */
+  termEcho(data) {
+    if (!this._termEnabled) return;
+    const X = this._exports;
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    if (bytes.length === 0) return;
+    if (!this._termScratch || this._termScratchCap < bytes.length) {
+      this._termScratchCap = Math.max(bytes.length, 256);
+      this._termScratch = X.malloc(this._termScratchCap);
+    }
+    new Uint8Array(this._memory.buffer).set(bytes, this._termScratch);
+    X.term_feed(this._termScratch, bytes.length);
+  }
+
   destroy() {
     this._memfs = null;
     this._exports = null;
@@ -388,6 +561,69 @@ class NanoVM {
    * Call this when the VM is paused at a clean boundary (e.g. after snapshotReady).
    * @returns {{ vmStruct: Uint8Array, guestRAM: Uint8Array, usedRAMSize: number, memfs: Array }}
    */
+  _pipeGet(id) {
+    let p = this._pipes.get(id);
+    if (!p) { p = { chunks: [], total: 0, readPos: 0 }; this._pipes.set(id, p); }
+    return p;
+  }
+
+  /** Append guest bytes to a pipe buffer. */
+  _pipeWrite(id, srcPhys, count) {
+    if (count <= 0) return 0;
+    const p = this._pipeGet(id);
+    p.chunks.push(new Uint8Array(this._memory.buffer, srcPhys, count).slice());
+    p.total += count;
+    return count;
+  }
+
+  /** Drain up to `count` bytes from a pipe buffer; 0 = EOF (writer finished). */
+  _pipeRead(id, dstPhys, count) {
+    const p = this._pipeGet(id);
+    const avail = p.total - p.readPos;
+    if (avail <= 0 || count <= 0) return 0;
+    const n = Math.min(count, avail);
+    const dst = new Uint8Array(this._memory.buffer, dstPhys, n);
+    let copied = 0, chunkStart = 0;
+    for (const ch of p.chunks) {
+      const chunkEnd = chunkStart + ch.length;
+      if (p.readPos + copied < chunkEnd && copied < n) {
+        const from = Math.max(0, p.readPos + copied - chunkStart);
+        const take = Math.min(ch.length - from, n - copied);
+        dst.set(ch.subarray(from, from + take), copied);
+        copied += take;
+      }
+      chunkStart = chunkEnd;
+      if (copied >= n) break;
+    }
+    p.readPos += copied;
+    return copied;
+  }
+
+  /** Capture parent process state for a serialized fork (struct + used RAM). */
+  _forkSnapshot() {
+    const dv = new DataView(this._memory.buffer);
+    const v = this._vmPtr;
+    const brkCurrent = Number(dv.getBigUint64(v + 568, true));
+    const mmapNext = Number(dv.getBigUint64(v + 3312, true));
+    const lowEnd = Math.min(Math.max(brkCurrent, mmapNext), this._ramSize);
+    const sp = Number(dv.getBigUint64(v + 16, true));
+    const stackStart = Math.max(lowEnd, (sp - 65536) & ~0xFFF);
+    return {
+      vmStruct: new Uint8Array(this._memory.buffer, v, VM_STRUCT_SIZE).slice(),
+      lowRAM: new Uint8Array(this._memory.buffer, this._ramPtr, lowEnd).slice(),
+      stackRAM: new Uint8Array(this._memory.buffer, this._ramPtr + stackStart, this._ramSize - stackStart).slice(),
+      stackStart,
+    };
+  }
+
+  /** Restore parent process state captured by _forkSnapshot. */
+  _forkRestore(snap) {
+    const mem = new Uint8Array(this._memory.buffer);
+    mem.set(snap.vmStruct, this._vmPtr);
+    mem.set(snap.lowRAM, this._ramPtr);
+    if (snap.stackRAM.length) mem.set(snap.stackRAM, this._ramPtr + snap.stackStart);
+  }
+
   snapshot() {
     const dv = new DataView(this._memory.buffer);
     const v = this._vmPtr;
@@ -545,6 +781,11 @@ class NanoVM {
 
     this._stdout = "";
     this._onStdout = onStdout || null;
+    // Serialized-fork bookkeeping (reset per run).
+    this._forkStack = [];
+    this._zombies = [];
+    this._nextPid = 1000;
+    this._pipes = new Map();
 
     // Reset VM state for a clean run
     this._resetVM();
@@ -560,6 +801,11 @@ class NanoVM {
 
     // Set up argv/envp on the stack
     this._setupArgv(argv, extraEnv);
+
+    // Re-apply tty mode — _resetVM() above cleared the Vm struct flag.
+    if (this._ttyEnabled && X.vm_tty_enable) {
+      X.vm_tty_enable(this._vmPtr, 1, this._termCols || 80, this._termRows || 25);
+    }
 
     return this._runLoop(maxSteps);
   }
@@ -594,6 +840,17 @@ class NanoVM {
       const status = X.debug_status(this._vmPtr);
 
       if (status === STATUS_FAULT) {
+        // A forked child exiting: record its status, restore the parent, and make
+        // the parent's clone() return the child pid. Otherwise it's the real exit.
+        if (this._forkStack && this._forkStack.length > 0) {
+          const frame = this._forkStack.pop();
+          this._zombies.push({ pid: frame.childPid, exitCode: X.vm_exit_code(this._vmPtr) });
+          this._forkRestore(frame.snap);
+          const fdv = new DataView(this._memory.buffer);
+          this._setA0(fdv, frame.childPid);
+          fdv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+          continue;
+        }
         return { exitCode: X.vm_exit_code(this._vmPtr), stdout: this._stdout };
       }
 
@@ -874,6 +1131,75 @@ class NanoVM {
     dv.setBigInt64(this._vmPtr + 80, BigInt(value), true);
   }
 
+  /** Read a NUL-terminated C string from guest address `gptr`. */
+  _readGuestCStr(gptr) {
+    if (!gptr) return "";
+    const view = new Uint8Array(this._memory.buffer, this._ramPtr + (gptr >>> 0));
+    let e = 0;
+    while (e < view.length && e < 8192 && view[e] !== 0) e++;
+    return new TextDecoder().decode(view.subarray(0, e));
+  }
+
+  /** Read a NULL-terminated array of guest string pointers (argv/envp). */
+  _readGuestStrArray(gptr) {
+    const out = [];
+    if (!gptr) return out;
+    const dv = new DataView(this._memory.buffer);
+    let p = this._ramPtr + (gptr >>> 0);
+    for (let i = 0; i < 4096; i++) {
+      const strPtr = Number(dv.getBigUint64(p, true));
+      if (strPtr === 0) break;
+      out.push(this._readGuestCStr(strPtr));
+      p += 8;
+    }
+    return out;
+  }
+
+  /**
+   * execve: replace the current process image with busybox (resolved from a /bin
+   * applet symlink), preserving inherited fds and cwd. argv/envp are read from the
+   * OLD image before the reset overwrites RAM. Resumes at the new ELF entry; on
+   * failure writes a negative errno to a0 (execve "returns" only on error).
+   */
+  _doExecve(dv, execPath, argvPtr, envpPtr) {
+    const X = this._exports;
+    const argv = this._readGuestStrArray(argvPtr);
+    const envp = this._readGuestStrArray(envpPtr);
+
+    // Only busybox-backed executables are supported (all /bin applet symlinks).
+    const target = this._memfs.resolve(execPath, true);
+    const busyboxNode = this._memfs.resolve("/bin/busybox", true);
+    if (!target || !busyboxNode || target !== busyboxNode || !this._busyboxElf) {
+      this._setA0(dv, -2); // ENOENT
+      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+      return;
+    }
+
+    // Preserve inherited fds + cwd across the image replacement.
+    const v = this._vmPtr;
+    const fdTable = new Uint8Array(this._memory.buffer, v + FD_TABLE_OFF, 64 * 24).slice();
+    const cwd = new Uint8Array(this._memory.buffer, v + 3680, 256).slice();
+
+    this._resetVM();
+
+    new Uint8Array(this._memory.buffer).set(fdTable, v + FD_TABLE_OFF);
+    new Uint8Array(this._memory.buffer).set(cwd, v + 3680);
+
+    // Load the new image and set up argv/envp.
+    new Uint8Array(this._memory.buffer).set(this._busyboxElf, this._ramPtr);
+    const loadRc = X.vm_load_elf(v, 0, this._busyboxElf.length);
+    const dv2 = new DataView(this._memory.buffer);
+    if (loadRc !== 0) {
+      this._setA0(dv2, -8); // ENOEXEC
+      dv2.setInt32(v + 528, STATUS_OK, true);
+      return;
+    }
+    this._setupArgv(argv.length ? argv : ["busybox"], envp);
+
+    // Resume at the new entry; vm_load_elf set pc/sp, _setupArgv set the argv stack.
+    dv2.setInt32(v + 528, STATUS_OK, true);
+  }
+
   _processFsRequest() {
     const X = this._exports;
     const reqPtr = X.vm_fs_request_ptr(this._vmPtr);
@@ -901,6 +1227,39 @@ class NanoVM {
 
     const path = this._resolvePath(rawPath);
     const path2 = rawPath2 ? this._resolvePath(rawPath2) : "";
+
+    if (syscallNr === SYS_EXECVE) {
+      this._doExecve(dv, path, arg1, arg2);
+      return;
+    }
+
+    if (syscallNr === SYS_CLONE) {
+      // Serialized fork: snapshot the parent and run the child first (clone
+      // returns 0 to the child). The parent is restored when the child exits.
+      this._forkStack.push({ snap: this._forkSnapshot(), childPid: this._nextPid++ });
+      this._setA0(dv, 0);
+      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+      return;
+    }
+
+    if (syscallNr === SYS_WAIT4) {
+      const wpid = arg1 | 0; // -1 / 0 = any child
+      const statusPtr = arg2 >>> 0;
+      let zi = -1;
+      for (let i = 0; i < this._zombies.length; i++) {
+        if (wpid <= 0 || this._zombies[i].pid === wpid) { zi = i; break; }
+      }
+      if (zi >= 0) {
+        const z = this._zombies.splice(zi, 1)[0];
+        // wait status: WEXITSTATUS = (status >> 8) & 0xff.
+        if (statusPtr) dv.setInt32(this._ramPtr + statusPtr, (z.exitCode & 0xff) << 8, true);
+        this._setA0(dv, z.pid);
+      } else {
+        this._setA0(dv, -10); // ECHILD
+      }
+      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+      return;
+    }
 
     // Snapshot sentinel: detect openat for /dev/__snapshot__
     // writeFileSync will open, write, then close. We intercept the open
@@ -1008,8 +1367,21 @@ class NanoVM {
       case SYS_READ: {
         if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
         const fe = this._fdRead(dv, gfd);
-        if (fe.fd_type === FD_TYPE_STDIN) { result = 0; break; }
-        if (fe.fd_type === FD_TYPE_PIPE) { result = 0; break; }
+        if (fe.fd_type === FD_TYPE_STDIN) {
+          const avail = this._stdinAvailable();
+          if (avail > 0) {
+            const count = bufLen || arg1;
+            result = this._stdinDrain(ramPtr + bufPtr, Math.min(count, avail));
+            break;
+          }
+          // No queued input. In interactive mode park the read (leave the VM
+          // FS_PENDING so _runLoop re-polls) until writeStdin() supplies data;
+          // otherwise preserve legacy EOF-on-empty semantics for batch runs.
+          if (this._stdinInteractive && !this._stdinEof) return;
+          result = 0;
+          break;
+        }
+        if (fe.fd_type === FD_TYPE_PIPE) { result = this._pipeRead(fe.host_fd, ramPtr + bufPtr, bufLen || arg1); break; }
         if (fe.fd_type !== FD_TYPE_FILE && fe.fd_type !== FD_TYPE_DIR) { result = -9; break; }
         const count = bufLen || arg1;
         const bufPhys = ramPtr + bufPtr;

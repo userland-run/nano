@@ -14,6 +14,9 @@ devenv = []   # Embed build/devenv.tar.gz into WASM data section
 demo = ["busybox", "node", "devenv"]  # All bundled: full demo
 
 [dependencies]
+# Terminal model parser (Console). default-features=false → no_std, no heap
+# (OSC params use a fixed-size ArrayVec, so no global allocator is required).
+vte = { version = "0.15", default-features = false }
 
 [profile.dev]
 opt-level = 1

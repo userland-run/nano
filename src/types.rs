@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 use core::sync::atomic::AtomicI32;
 
 // VM status codes
@@ -164,8 +168,21 @@ pub struct Vm {
     pub thread_tids: [i32; 16],   // 3440..3504 - TID per thread slot
     pub thread_ctids: [u64; 16],  // 3504..3632 - clear_child_tid per thread slot
 
-    // === Padding to CWD (offset 3632..3680 = 48 bytes) ===
-    pub _pre_cwd_pad: [u8; 48],  // 3632..3680
+    // === TTY / termios state (offset 3632..3680 = 48 bytes, carved from the
+    // pre-CWD pad; opt-in — tty_enabled stays 0 for batch/node runs so isatty
+    // remains false). Keeps CWD at 3680. ===
+    pub tty_enabled: u8,         // 3632: 0 = not a tty (ioctls return ENOTTY)
+    pub _tty_pad0: u8,           // 3633
+    pub ws_row: u16,             // 3634: window size — rows
+    pub ws_col: u16,             // 3636: window size — cols
+    pub _tty_pad1: u16,          // 3638 (align termios flags to 3640)
+    pub c_iflag: u32,            // 3640: termios input flags
+    pub c_oflag: u32,            // 3644: termios output flags
+    pub c_cflag: u32,            // 3648: termios control flags
+    pub c_lflag: u32,            // 3652: termios local flags (ICANON/ECHO/ISIG)
+    pub c_cc: [u8; 19],          // 3656..3675: control chars (VINTR, VMIN, …)
+    pub c_line: u8,              // 3675: line discipline
+    pub _pre_cwd_pad: [u8; 4],   // 3676..3680
 
     // === Current working directory (offset 3680, 256 bytes) ===
     pub cwd: [u8; 256],          // 3680..3936

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 use crate::host;
 use crate::mem;
 use crate::types::*;
@@ -63,6 +67,8 @@ const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
 const SYS_MREMAP: u64 = 216;
 const SYS_CLONE: u64 = 220;
+const SYS_EXECVE: u64 = 221;
+const SYS_WAIT4: u64 = 260;
 const SYS_MMAP: u64 = 222;
 const SYS_MPROTECT: u64 = 226;
 const SYS_PRLIMIT64: u64 = 261;
@@ -188,6 +194,11 @@ const MAX_EVENTFDS: usize = 16;
 static mut EVENTFD_COUNTERS: [u32; MAX_EVENTFDS] = [0; MAX_EVENTFDS];
 static mut EVENTFD_ALLOC: usize = 0;
 
+// Pipe identity counter — monotonic across the VM lifetime (deliberately NOT reset
+// by reset_statics, so pipe ids stay unique across execve/fork). The host keys its
+// per-pipe buffers by this id and clears them between top-level runs.
+static mut PIPE_NEXT_ID: i32 = 1;
+
 // ============================================================
 // Timerfd state — stores expiry time in ms (from emscripten_date_now)
 // ============================================================
@@ -207,8 +218,36 @@ static mut EPOLL_FINITE_TIMEOUT_ACTIVE: bool = false;
 
 // ioctl constants
 const TIOCGWINSZ: u64 = 0x5413;
+const TIOCSWINSZ: u64 = 0x5414;
 const TCGETS: u64 = 0x5401;
+const TCSETS: u64 = 0x5402;
+const TCSETSW: u64 = 0x5403;
+const TCSETSF: u64 = 0x5404;
 const FIONREAD: u64 = 0x541B;
+
+/// Install sane "cooked mode" termios defaults on a freshly-enabled tty so the
+/// guest reads back a believable terminal (ICANON+ECHO+ISIG, ^C/^D/erase, etc.).
+pub unsafe fn tty_init_termios(vm: &mut Vm) {
+    vm.c_iflag = 0x4500; // ICRNL | IXON | IUTF8
+    vm.c_oflag = 0x0005; // OPOST | ONLCR
+    vm.c_cflag = 0x00BF; // B38400 | CS8 | CREAD
+    vm.c_lflag = 0x8A3B; // ISIG ICANON ECHO ECHOE ECHOK ECHOCTL ECHOKE IEXTEN
+    vm.c_line = 0;
+    vm.c_cc = [0; 19];
+    vm.c_cc[0] = 0x03; // VINTR  = ^C
+    vm.c_cc[1] = 0x1C; // VQUIT  = ^\
+    vm.c_cc[2] = 0x7F; // VERASE = DEL
+    vm.c_cc[3] = 0x15; // VKILL  = ^U
+    vm.c_cc[4] = 0x04; // VEOF   = ^D
+    vm.c_cc[6] = 0x01; // VMIN   = 1
+    vm.c_cc[8] = 0x11; // VSTART = ^Q
+    vm.c_cc[9] = 0x13; // VSTOP  = ^S
+    vm.c_cc[10] = 0x1A; // VSUSP  = ^Z
+    vm.c_cc[12] = 0x12; // VREPRINT = ^R
+    vm.c_cc[13] = 0x0F; // VDISCARD = ^O
+    vm.c_cc[14] = 0x17; // VWERASE  = ^W
+    vm.c_cc[15] = 0x16; // VLNEXT   = ^V
+}
 
 /// Reset all static mut globals to their initial state.
 /// Must be called before each new program execution to avoid stale state.
@@ -401,6 +440,14 @@ pub unsafe fn handle(vm: &mut Vm) {
         SYS_SET_ROBUST_LIST => 0, // stub
         SYS_FUTEX => sys_futex(vm, a0, a1 as i32, a2 as u32, a3, a4),
         SYS_CLONE => sys_clone(vm, a0, a1, a2, a3, a4),
+        SYS_EXECVE => {
+            sys_execve(vm, a0, a1, a2);
+            return;
+        }
+        SYS_WAIT4 => {
+            sys_wait4(vm, a0, a1);
+            return;
+        }
 
         SYS_DUP => sys_dup(vm, a0 as i32),
         SYS_DUP3 => sys_dup3(vm, a0 as i32, a1 as i32),
@@ -831,8 +878,32 @@ unsafe fn sys_close(vm: &mut Vm, fd: i32) -> i64 {
         return EBADF;
     }
 
-    // For file-backed FDs, notify host
+    // For file-backed FDs, notify host — but reference-count the underlying host
+    // file. A dup'd guest fd (dup/dup3/F_DUPFD) shares the same host_fd, so only ask
+    // the host to actually close the file when this is the LAST guest fd referencing
+    // it. Otherwise closing one fd (e.g. busybox sh dup'ing the script fd then closing
+    // the original) would evict the shared host file and make the dup read EOF.
     if fd_type == FD_TYPE_FILE || fd_type == FD_TYPE_DIR {
+        let host_fd = vm.fd_table[fd as usize].host_fd;
+        let mut other_ref = false;
+        let mut i = 0;
+        while i < MAX_FDS {
+            if i != fd as usize
+                && (vm.fd_table[i].fd_type == FD_TYPE_FILE
+                    || vm.fd_table[i].fd_type == FD_TYPE_DIR)
+                && vm.fd_table[i].host_fd == host_fd
+            {
+                other_ref = true;
+                break;
+            }
+            i += 1;
+        }
+        if other_ref {
+            // Another fd still references the host file; just drop this guest fd.
+            vm.fd_table[fd as usize].fd_type = FD_TYPE_NONE;
+            vm.fd_table[fd as usize].host_fd = -1;
+            return 0;
+        }
         sys_fs_request(vm, SYS_CLOSE as i32, fd, 0, 0, 0);
         return 0; // status set by fs_request
     }
@@ -1335,6 +1406,44 @@ unsafe fn sys_futex(
     }
 }
 
+/// execve(path, argv, envp). Marshals the request to the host, which resolves the
+/// path (busybox/node, following symlinks), reads the argv/envp pointer arrays from
+/// guest memory, and reloads the process image in place (preserving fds and cwd).
+/// On success the host replaces the image and execution resumes at the new entry;
+/// on failure the host writes a negative errno to a0.
+unsafe fn sys_execve(vm: &mut Vm, path_addr: u64, argv: u64, envp: u64) {
+    let base = vm.ram_base;
+    // Copy the executable path into the FS request buffer (null-terminated).
+    let src = (base + path_addr as u32) as *const u8;
+    let dst = vm.fs_request.path.as_mut_ptr();
+    let max = vm.fs_request.path.len() - 1;
+    let mut i = 0;
+    while i < max {
+        let b = src.add(i).read();
+        if b == 0 {
+            break;
+        }
+        dst.add(i).write(b);
+        i += 1;
+    }
+    dst.add(i).write(0);
+
+    vm.fs_request.syscall_nr = SYS_EXECVE as i32;
+    vm.fs_request.fd = 0;
+    vm.fs_request.arg1 = argv as i64; // guest ptr to argv[] (NULL-terminated)
+    vm.fs_request.arg2 = envp as i64; // guest ptr to envp[] (NULL-terminated)
+    vm.status = STATUS_FS_PENDING;
+}
+
+/// wait4(pid, wstatus, options, rusage). Marshals to the host, which holds the
+/// serialized children's exit codes (zombies) and writes the wait status word.
+unsafe fn sys_wait4(vm: &mut Vm, pid: u64, wstatus: u64) {
+    vm.fs_request.syscall_nr = SYS_WAIT4 as i32;
+    vm.fs_request.arg1 = pid as i64;
+    vm.fs_request.arg2 = wstatus as i64;
+    vm.status = STATUS_FS_PENDING;
+}
+
 unsafe fn sys_clone(
     vm: &mut Vm,
     flags: u64,
@@ -1359,6 +1468,18 @@ unsafe fn sys_clone(
     // Write TID to child_tidptr if CLONE_CHILD_SETTID
     if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
         mem::write_u32(vm.ram_base, ctid, new_tid as u32);
+    }
+
+    // fork (no CLONE_VM): serialized fork orchestrated by the host. The host
+    // snapshots the parent, runs the child first (clone returns 0 to the child),
+    // and on the child's exit restores the parent (clone returns the child pid).
+    // The value returned here is a placeholder the host overwrites.
+    if flags & CLONE_VM == 0 {
+        vm.fs_request.syscall_nr = SYS_CLONE as i32;
+        vm.fs_request.arg1 = flags as i64;
+        vm.fs_request.arg2 = ctid as i64;
+        vm.status = STATUS_FS_PENDING;
+        return new_tid as i64;
     }
 
     if flags & CLONE_VM != 0 {
@@ -1446,7 +1567,22 @@ unsafe fn sys_fcntl(vm: &mut Vm, fd: i32, cmd: i32, arg: u64) -> i64 {
     }
 
     match cmd {
-        0 => sys_dup(vm, fd),          // F_DUPFD
+        0 => {
+            // F_DUPFD: duplicate to the lowest free fd >= arg (busybox sh relies on
+            // moving the script fd to a high number, e.g. fcntl(fd, F_DUPFD, 10)).
+            let min = arg as usize;
+            let mut result: i64 = -24; // EMFILE
+            let mut i = min;
+            while i < MAX_FDS {
+                if vm.fd_table[i].fd_type == FD_TYPE_NONE {
+                    vm.fd_table[i] = vm.fd_table[fd as usize];
+                    result = i as i64;
+                    break;
+                }
+                i += 1;
+            }
+            result
+        }
         1 => {
             // F_GETFD
             vm.fd_table[fd as usize].flags as i64 & 1
@@ -1475,12 +1611,74 @@ unsafe fn sys_ioctl(vm: &mut Vm, fd: i32, request: u64) -> i64 {
         return EBADF;
     }
 
+    // A fd is a terminal only when the host has opted this VM into tty mode and
+    // the fd is one of the std streams. Otherwise the tty ioctls return ENOTTY,
+    // exactly as before — so isatty() stays false for files and for node/batch
+    // runs that never enable tty mode (the V8 init-path workaround is preserved).
+    let is_tty_fd = vm.tty_enabled != 0
+        && matches!(
+            vm.fd_table[fd as usize].fd_type,
+            FD_TYPE_STDIN | FD_TYPE_STDOUT | FD_TYPE_STDERR
+        );
+
     match request {
-        TIOCGWINSZ | TCGETS => {
-            // Return ENOTTY - our virtual fds are not real terminals.
-            // This matches qemu-riscv64 behavior and is critical for V8:
-            // when isatty()=true, Node/V8 takes a different init path that crashes.
-            -25 // ENOTTY
+        TIOCGWINSZ => {
+            if !is_tty_fd {
+                return -25; // ENOTTY
+            }
+            // struct winsize { u16 ws_row, ws_col, ws_xpixel, ws_ypixel }
+            let a2 = vm.x[12];
+            mem::write_u16(vm.ram_base, a2, vm.ws_row);
+            mem::write_u16(vm.ram_base, a2 + 2, vm.ws_col);
+            mem::write_u16(vm.ram_base, a2 + 4, 0);
+            mem::write_u16(vm.ram_base, a2 + 6, 0);
+            0
+        }
+        TIOCSWINSZ => {
+            if !is_tty_fd {
+                return -25;
+            }
+            let a2 = vm.x[12];
+            vm.ws_row = mem::read_u16(vm.ram_base, a2);
+            vm.ws_col = mem::read_u16(vm.ram_base, a2 + 2);
+            // SIGWINCH delivery is wired in the signal-delivery step.
+            0
+        }
+        TCGETS => {
+            if !is_tty_fd {
+                return -25;
+            }
+            // struct termios { tcflag_t c_iflag,c_oflag,c_cflag,c_lflag;
+            //                  cc_t c_line; cc_t c_cc[19]; }
+            let a2 = vm.x[12];
+            mem::write_u32(vm.ram_base, a2, vm.c_iflag);
+            mem::write_u32(vm.ram_base, a2 + 4, vm.c_oflag);
+            mem::write_u32(vm.ram_base, a2 + 8, vm.c_cflag);
+            mem::write_u32(vm.ram_base, a2 + 12, vm.c_lflag);
+            mem::write_u8(vm.ram_base, a2 + 16, vm.c_line);
+            let mut i = 0;
+            while i < 19 {
+                mem::write_u8(vm.ram_base, a2 + 17 + i as u64, vm.c_cc[i]);
+                i += 1;
+            }
+            0
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            if !is_tty_fd {
+                return -25;
+            }
+            let a2 = vm.x[12];
+            vm.c_iflag = mem::read_u32(vm.ram_base, a2);
+            vm.c_oflag = mem::read_u32(vm.ram_base, a2 + 4);
+            vm.c_cflag = mem::read_u32(vm.ram_base, a2 + 8);
+            vm.c_lflag = mem::read_u32(vm.ram_base, a2 + 12);
+            vm.c_line = mem::read_u8(vm.ram_base, a2 + 16);
+            let mut i = 0;
+            while i < 19 {
+                vm.c_cc[i] = mem::read_u8(vm.ram_base, a2 + 17 + i as u64);
+                i += 1;
+            }
+            0
         }
         FIONREAD => {
             let a2 = vm.x[12];
@@ -1510,11 +1708,15 @@ unsafe fn sys_pipe2(vm: &mut Vm, pipefd: u64, _flags: i32) -> i64 {
 
     let fd0 = fds[0] as usize;
     let fd1 = fds[1] as usize;
+    // Both ends share a host-buffer id so writes to the write end are visible to
+    // reads on the read end (and survive dup/dup2 of either end).
+    let id = PIPE_NEXT_ID;
+    PIPE_NEXT_ID = PIPE_NEXT_ID.wrapping_add(1).max(1);
     // Safety: fd0/fd1 come from 0..MAX_FDS loop, guaranteed in bounds
     vm.fd_table.get_unchecked_mut(fd0).fd_type = FD_TYPE_PIPE;
-    vm.fd_table.get_unchecked_mut(fd0).host_fd = fds[1]; // read end points to write end
+    vm.fd_table.get_unchecked_mut(fd0).host_fd = id; // read end
     vm.fd_table.get_unchecked_mut(fd1).fd_type = FD_TYPE_PIPE;
-    vm.fd_table.get_unchecked_mut(fd1).host_fd = fds[0]; // write end points to read end
+    vm.fd_table.get_unchecked_mut(fd1).host_fd = id; // write end
 
     vm.pipe_read_fd = fds[0];
     vm.pipe_write_fd = fds[1];

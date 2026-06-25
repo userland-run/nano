@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 use crate::alloc;
 use crate::cpu;
 use crate::elf;
@@ -214,6 +218,35 @@ pub unsafe extern "C" fn vm_ram_ptr(vm_ptr: u32) -> u32 {
 pub unsafe extern "C" fn vm_ram_size(vm_ptr: u32) -> u32 {
     let vm = &*(vm_ptr as *const Vm);
     vm.ram_size
+}
+
+// ---------- TTY (Console) ----------
+
+/// Enable or disable tty mode for this VM and set the initial window size.
+/// When enabled, the std-stream fds report as a terminal (isatty() == true)
+/// with cooked-mode termios defaults; when disabled (the default), the tty
+/// ioctls return ENOTTY exactly as before. The host (terminal front-end) calls
+/// this; batch/node runs leave it off so the V8 init path is unaffected.
+#[no_mangle]
+pub unsafe extern "C" fn vm_tty_enable(vm_ptr: u32, on: i32, cols: u32, rows: u32) {
+    let vm = &mut *(vm_ptr as *mut Vm);
+    if on != 0 {
+        vm.tty_enabled = 1;
+        vm.ws_col = cols as u16;
+        vm.ws_row = rows as u16;
+        crate::syscall::tty_init_termios(vm);
+    } else {
+        vm.tty_enabled = 0;
+    }
+}
+
+/// Update the terminal window size (on resize / font zoom). SIGWINCH delivery
+/// is wired in the signal-delivery step.
+#[no_mangle]
+pub unsafe extern "C" fn vm_tty_set_size(vm_ptr: u32, cols: u32, rows: u32) {
+    let vm = &mut *(vm_ptr as *mut Vm);
+    vm.ws_col = cols as u16;
+    vm.ws_row = rows as u16;
 }
 
 #[no_mangle]

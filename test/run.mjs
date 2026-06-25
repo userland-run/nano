@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
 /**
  * NanoVM RISC-V interpreter test - runs a RISC-V ELF on the command line via Node.js + WASM.
  *
@@ -40,6 +44,18 @@ let stderr = "";
 const trace = process.argv.includes('--trace');
 const syscallTrace = [];
 const syscallCounts = {};
+
+// --- Optional stdin feed ---
+// `--stdin` reads all of fd 0 (a pipe or redirected file) up front, so guest
+// reads on stdin drain it and then see EOF — matching `cat < file` semantics.
+// Without the flag, stdin reads return EOF immediately (legacy behavior).
+const useStdin = process.argv.includes('--stdin');
+let stdinData = new Uint8Array(0);
+if (useStdin) {
+  try { stdinData = new Uint8Array(readFileSync(0)); }
+  catch (e) { console.error(`[run] --stdin: failed to read stdin: ${e.message}`); }
+}
+let stdinPos = 0;
 
 const imports = {
   env: {
@@ -477,8 +493,18 @@ function processFsRequest() {
     case SYS_READ: {
       if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
       const fe = fdRead(dv, gfd);
-      // stdin → EOF
-      if (fe.fd_type === FD_TYPE_STDIN) { result = 0; break; }
+      // stdin → drain the pre-seeded --stdin buffer, then EOF
+      if (fe.fd_type === FD_TYPE_STDIN) {
+        if (stdinPos < stdinData.length) {
+          const count = bufLen || arg1;
+          const n = Math.min(count, stdinData.length - stdinPos);
+          new Uint8Array(memory.buffer).set(stdinData.subarray(stdinPos, stdinPos + n), ramPtr + bufPtr);
+          stdinPos += n;
+          result = n;
+          break;
+        }
+        result = 0; break; // EOF
+      }
       // pipe → EOF (no pipe buffer implemented)
       if (fe.fd_type === FD_TYPE_PIPE) { result = 0; break; }
       if (fe.fd_type !== FD_TYPE_FILE && fe.fd_type !== FD_TYPE_DIR) { result = -9; break; }
