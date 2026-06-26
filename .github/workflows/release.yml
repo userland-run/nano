@@ -18,27 +18,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # nightly + rust-src: the shared-memory wasm needs build-std (see Makefile).
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-unknown-unknown
+          components: rust-src
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # nano.min.wasm   — plain runtime: pass/fail + golden output + budgets.
-      # nano.trace.wasm — same emulator + per-syscall debug_log(0x0A) for coverage.
-      - name: Build conformance wasms
+      # Git LFS pulls the real images/busybox the busybox runtime bundles.
+      - name: Pull LFS binaries
+        run: git lfs pull --include=images/busybox || true
+
+      # nano.min.wasm     — plain runtime: pass/fail + golden output + budgets.
+      # nano.trace.wasm   — same emulator + per-syscall debug_log(0x0A) for coverage.
+      # nano.busybox.wasm — bare emulator + BusyBox guest (SDK/terminal smoke runs).
+      # boa.wasm          — scripting engine (independent crate, own linear memory).
+      - name: Build runtime wasms
         run: |
           make build-min
           make build-trace
+          make build-busybox
+          make build-boa
 
       # nano-syscalls.json — authoritative supported-syscall set for the gate.
       - name: Generate syscall manifest
         run: node tools/gen-syscalls-json.mjs > wasm/nano-syscalls.json
 
       - name: Show artifacts
-        run: ls -lh wasm/nano.min.wasm wasm/nano.trace.wasm wasm/nano-syscalls.json
+        run: ls -lh wasm/nano.min.wasm wasm/nano.trace.wasm wasm/nano.busybox.wasm wasm/boa.wasm wasm/nano-syscalls.json
 
       - name: Upload to release
         env:
@@ -52,5 +62,7 @@ jobs:
           gh release upload "${GITHUB_REF_NAME}" \
             wasm/nano.min.wasm \
             wasm/nano.trace.wasm \
+            wasm/nano.busybox.wasm \
+            wasm/boa.wasm \
             wasm/nano-syscalls.json \
             --clobber

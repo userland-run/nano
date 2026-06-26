@@ -1,7 +1,13 @@
-.PHONY: build build-minimal build-min build-trace build-boa devenv clean serve test test-build test-devenv test-boa test-boa-vm test-trace demo
+.PHONY: build build-minimal build-min build-trace build-busybox build-boa devenv clean serve test test-build test-devenv test-boa test-boa-vm test-trace demo
 
 WASM_TARGET = wasm32-unknown-unknown
 OUT_DIR = wasm
+
+# The shared-memory wasm needs `core` recompiled with the +atomics/+bulk-memory
+# target-features (the .cargo/config rustflags). That requires build-std, which
+# needs a nightly toolchain + the rust-src component. Passed via the env var
+# (more reliable than the `-Z build-std` flag across cargo versions).
+BUILD_STD = CARGO_UNSTABLE_BUILD_STD=core,alloc,panic_abort
 
 # Scripting component (Boa). Built as an independent crate with its OWN linear
 # memory, so it must NOT inherit nano's .cargo/config.toml rustflags
@@ -33,14 +39,24 @@ build-minimal:
 # Release artifact: plain conformance runtime → wasm/nano.min.wasm (no bundled
 # binaries, no per-syscall trace). Used for the pass/fail + golden-output run.
 build-min:
-	cargo build --target $(WASM_TARGET) --release --no-default-features
+	$(BUILD_STD) cargo build --target $(WASM_TARGET) --release --no-default-features
 	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.min.wasm
 
 # Release artifact: trace conformance runtime → wasm/nano.trace.wasm. Same bare
 # emulator, but emits a debug_log(0x0A | nr) on every syscall for coverage.
 build-trace:
-	cargo build --target $(WASM_TARGET) --release --no-default-features --features trace
+	$(BUILD_STD) cargo build --target $(WASM_TARGET) --release --no-default-features --features trace
 	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.trace.wasm
+
+# Release artifact: busybox-bundled runtime → wasm/nano.busybox.wasm. Bare
+# emulator + the BusyBox guest only (no node/devenv), small enough to fetch in
+# CI. Used by the SDK and terminal smoke runs that must actually execute
+# `echo`/`sort`/etc.
+build-busybox:
+	@test -f images/busybox || (echo "ERROR: images/busybox not found." && exit 1)
+	gzip -9 -k -f images/busybox && mv images/busybox.gz build/busybox.gz
+	$(BUILD_STD) cargo build --target $(WASM_TARGET) --release --no-default-features --features busybox
+	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.busybox.wasm
 
 # Scripting engine: build boa.wasm (independent crate). Size-optimizes with
 # wasm-opt when available, but never fails the build if wasm-opt is missing or
