@@ -50,8 +50,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           lfs: true
-      - uses: dtolnay/rust-toolchain@nightly
+      # Pin the nightly: the shared-memory wasm + host-import linking is
+      # toolchain-sensitive; a later nightly's wasm-ld rejects the env imports
+      # that --allow-undefined accepts on this one.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-02-17
           targets: wasm32-unknown-unknown
           components: rust-src
       - uses: actions/setup-node@v4
