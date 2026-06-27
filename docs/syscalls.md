@@ -22,7 +22,9 @@ Syscalls are handled in two ways:
 | 65 | readv | Scatter read |
 | 66 | writev | Gather write |
 | 67 | pread64 | Positional read (does not change file offset) |
+| 68 | pwrite64 | Positional write (does not change file offset) |
 | 69 | preadv | Positional scatter read |
+| 70 | pwritev | Positional gather write |
 | 62 | lseek | SEEK_SET, SEEK_CUR, SEEK_END |
 | 61 | getdents64 | Directory listing |
 | 79 | newfstatat | File/directory stat |
@@ -147,6 +149,8 @@ Sockets use 16KB ring buffers per slot. Connected sockets have peer indices — 
 | 90 | capget | Reports all capabilities (root) |
 | 278 | getrandom | Uses host Math.random() via emscripten_random |
 | 167 | prctl | Stub (returns 0) |
+| 259 | riscv_flush_icache | No-op (the interpreter re-reads guest memory each step) |
+| 425 | io_uring_setup | Intentionally unavailable (ENOSYS) — callers fall back to thread-pool/epoll |
 
 ## Virtual Server Exports
 

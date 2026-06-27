@@ -33,6 +33,8 @@ const SYS_PREAD64: u64 = 67;
 const SYS_PWRITE64: u64 = 68;
 const SYS_PREADV: u64 = 69;
 const SYS_PWRITEV: u64 = 70;
+const SYS_RISCV_FLUSH_ICACHE: u64 = 259; // RISC-V: flush icache (no-op on the interpreter)
+const SYS_IO_URING_SETUP: u64 = 425;     // io_uring: intentionally unavailable (callers fall back)
 const SYS_READLINKAT: u64 = 78;
 const SYS_NEWFSTATAT: u64 = 79;
 const SYS_FSTAT: u64 = 80;
@@ -506,6 +508,8 @@ pub unsafe fn handle(vm: &mut Vm) {
         SYS_READV => sys_readv(vm, a0 as i32, a1, a2 as u32),
         SYS_PREAD64 => sys_pread64(vm, a0 as i32, a1, a2 as u32, a3),
         SYS_PREADV => sys_preadv(vm, a0 as i32, a1, a2 as u32, a3),
+        SYS_PWRITE64 => sys_pwrite64(vm, a0 as i32, a1, a2 as u32, a3),
+        SYS_PWRITEV => sys_pwritev(vm, a0 as i32, a1, a2 as u32, a3),
 
         SYS_OPENAT => {
             sys_fs_request(vm, SYS_OPENAT as i32, a0 as i32, a1, a2 as i64, a3 as i64);
@@ -650,6 +654,13 @@ pub unsafe fn handle(vm: &mut Vm) {
         SYS_SENDTO => sys_sendto(vm, a0 as i32, a1, a2 as u32, a3 as i32),
         SYS_RECVFROM => sys_recvfrom(vm, a0 as i32, a1, a2 as u32, a3 as i32),
         SYS_SOCKETPAIR => ENOSYS, // not supported
+
+        // RISC-V icache flush after JIT codegen — the interpreter re-reads guest
+        // memory every step, so there is no separate icache to flush. Succeed.
+        SYS_RISCV_FLUSH_ICACHE => 0,
+        // io_uring probe at startup (node, V8). Intentionally unavailable so the
+        // caller falls back to the thread-pool / epoll path. Acknowledged, ENOSYS.
+        SYS_IO_URING_SETUP => ENOSYS,
 
         _ => {
             // Unknown syscall - return ENOSYS
@@ -889,6 +900,64 @@ unsafe fn sys_pread64(vm: &mut Vm, fd: i32, buf: u64, count: u32, offset: u64) -
 /// preadv(fd, iov, iovcnt, offset) - read into scatter buffers at explicit offset.
 /// For file FDs, dispatches each iovec buffer as an FS read with the given offset.
 /// Does NOT update the file position (unlike readv).
+// Positional write — the mirror of sys_pread64. Writes at an explicit offset
+// without moving the FD cursor (node uses this heavily when emitting files).
+unsafe fn sys_pwrite64(vm: &mut Vm, fd: i32, buf: u64, count: u32, offset: u64) -> i64 {
+    if fd < 0 || fd >= MAX_FDS as i32 {
+        return EBADF;
+    }
+    let fd_type = vm.fd_table[fd as usize].fd_type;
+
+    match fd_type {
+        FD_TYPE_FILE => {
+            // Delegate to host via FS protocol with SYS_PWRITE64 marker.
+            // arg1 = count, arg2 = explicit offset (the FD cursor is left alone).
+            vm.fs_request.syscall_nr = SYS_PWRITE64 as i32;
+            vm.fs_request.fd = fd;
+            vm.fs_request.buf_ptr = buf as u32;
+            vm.fs_request.buf_len = count;
+            vm.fs_request.arg1 = count as i64;
+            vm.fs_request.arg2 = offset as i64;
+            vm.status = STATUS_FS_PENDING;
+            0
+        }
+        FD_TYPE_DEVNULL => count as i64, // /dev/null: pretend the whole buffer was written
+        _ => EBADF,
+    }
+}
+
+// Positional vectored write — the mirror of sys_preadv (first non-empty iovec).
+unsafe fn sys_pwritev(vm: &mut Vm, fd: i32, iov: u64, iovcnt: u32, offset: u64) -> i64 {
+    if fd < 0 || fd >= MAX_FDS as i32 {
+        return EBADF;
+    }
+    let fd_type = vm.fd_table[fd as usize].fd_type;
+
+    match fd_type {
+        FD_TYPE_FILE => {
+            let mut i: u32 = 0;
+            while i < iovcnt {
+                let iov_base = mem::read_u64(vm.ram_base, iov + (i as u64) * 16);
+                let iov_len = mem::read_u64(vm.ram_base, iov + (i as u64) * 16 + 8) as u32;
+                if iov_len > 0 {
+                    vm.fs_request.syscall_nr = SYS_PWRITEV as i32;
+                    vm.fs_request.fd = fd;
+                    vm.fs_request.buf_ptr = iov_base as u32;
+                    vm.fs_request.buf_len = iov_len;
+                    vm.fs_request.arg1 = iov_len as i64;
+                    vm.fs_request.arg2 = offset as i64;
+                    vm.status = STATUS_FS_PENDING;
+                    return 0; // host fills the result
+                }
+                i += 1;
+            }
+            0
+        }
+        FD_TYPE_DEVNULL => 0,
+        _ => EBADF,
+    }
+}
+
 unsafe fn sys_preadv(vm: &mut Vm, fd: i32, iov: u64, iovcnt: u32, offset: u64) -> i64 {
     if fd < 0 || fd >= MAX_FDS as i32 {
         return EBADF;
