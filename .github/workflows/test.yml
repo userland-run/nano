@@ -46,6 +46,10 @@ jobs:
   node-harness:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # Force cargo onto the pinned toolchain: rust-toolchain.toml says "nightly"
+    # (latest), which would override dtolnay's pinned install otherwise.
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-02-17
     steps:
       - uses: actions/checkout@v4
         with:

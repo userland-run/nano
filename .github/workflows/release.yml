@@ -15,6 +15,10 @@ permissions:
 jobs:
   artifacts:
     runs-on: ubuntu-latest
+    # Force cargo onto the pinned toolchain (rust-toolchain.toml's "nightly"
+    # would otherwise override dtolnay's pinned install).
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-02-17
     steps:
       - uses: actions/checkout@v4
 
