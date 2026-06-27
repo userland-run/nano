@@ -9,14 +9,15 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# `trace` is on by default so `node test/run.mjs --trace` keeps working on the
-# dev builds (make build / build-minimal). Only the lean release artifact
-# `nano.min.wasm` (make build-min, --no-default-features) drops it.
-default = ["demo", "trace"]
-busybox = []  # Embed images/busybox RISC-V ELF into WASM data section (~1MB)
-node = []     # Embed images/node RISC-V ELF into WASM data section (~52MB)
-devenv = []   # Embed build/devenv.tar.gz into WASM data section
-demo = ["busybox", "node", "devenv"]  # All bundled: full demo
+# Default is now the SLIM runtime — node + devenv are distributed through the
+# catalog (installed into the guest VFS on demand), so they are NOT embedded by
+# default. `trace` stays on for dev convenience (`node test/run.mjs --trace`).
+# The full all-in-one bundle is an explicit opt-in: `--features demo` (make build-full).
+default = ["trace"]
+busybox = []  # Embed images/busybox RISC-V ELF into WASM data section (~1MB) — terminal instant boot
+node = []     # Embed images/node RISC-V ELF (~52MB) — legacy; prefer the catalog `node` recipe
+devenv = []   # Embed build/devenv.tar.gz — legacy; prefer the catalog typescript/eslint recipes
+demo = ["busybox", "node", "devenv"]  # All bundled: the legacy offline all-in-one (make build-full)
 trace = []    # Emit a debug_log(0x0A | nr) event on every syscall (conformance coverage)
 
 [dependencies]

@@ -1,4 +1,4 @@
-.PHONY: build build-minimal build-min build-trace build-busybox build-boa devenv clean serve test test-build test-devenv test-boa test-boa-vm test-trace demo
+.PHONY: build build-full build-minimal build-min build-trace build-busybox build-boa devenv clean serve test test-build test-devenv test-boa test-boa-vm test-trace demo
 
 WASM_TARGET = wasm32-unknown-unknown
 OUT_DIR = wasm
@@ -20,14 +20,22 @@ WASM_OPT_FEATURES = --enable-bulk-memory --enable-sign-ext --enable-nontrapping-
                     --enable-mutable-globals --enable-multivalue --enable-reference-types \
                     --enable-extended-const
 
-# Default: fully-bundled build → wasm/nano.wasm (busybox + node + devenv)
+# Default: SLIM runtime → wasm/nano.wasm (bare emulator + trace). node and devenv
+# are NOT embedded — they install from the catalog into the guest VFS on demand.
+# No bundled-binary prerequisites; small and fast to build.
 build:
+	$(BUILD_STD) cargo build --target $(WASM_TARGET) --release
+	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.wasm
+
+# Legacy all-in-one: bundle busybox + node + devenv into wasm/nano.wasm for a
+# fully-offline build (no catalog/CDN at first use). Requires the prebuilt images.
+build-full:
 	@test -f images/busybox || (echo "ERROR: images/busybox not found." && exit 1)
 	@test -f images/node || (echo "ERROR: images/node not found." && exit 1)
 	@test -f build/devenv.tar.gz || (echo "ERROR: build/devenv.tar.gz not found. Run 'make devenv' first." && exit 1)
 	gzip -9 -k -f images/busybox && mv images/busybox.gz build/busybox.gz
 	gzip -9 -k -f images/node && mv images/node.gz build/node.gz
-	$(BUILD_STD) cargo build --target $(WASM_TARGET) --release
+	$(BUILD_STD) cargo build --target $(WASM_TARGET) --release --features demo
 	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.wasm
 
 # Minimal build: bare emulator, no bundled binaries (fast, for development/testing).
