@@ -27,13 +27,13 @@ build:
 	@test -f build/devenv.tar.gz || (echo "ERROR: build/devenv.tar.gz not found. Run 'make devenv' first." && exit 1)
 	gzip -9 -k -f images/busybox && mv images/busybox.gz build/busybox.gz
 	gzip -9 -k -f images/node && mv images/node.gz build/node.gz
-	cargo build --target $(WASM_TARGET) --release
+	$(BUILD_STD) cargo build --target $(WASM_TARGET) --release
 	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.wasm
 
 # Minimal build: bare emulator, no bundled binaries (fast, for development/testing).
 # Keeps the `trace` feature so `node test/run.mjs --trace` still counts syscalls.
 build-minimal:
-	cargo build --target $(WASM_TARGET) --release --no-default-features --features trace
+	$(BUILD_STD) cargo build --target $(WASM_TARGET) --release --no-default-features --features trace
 	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.wasm
 
 # Release artifact: plain conformance runtime → wasm/nano.min.wasm (no bundled

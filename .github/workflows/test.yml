@@ -39,9 +39,10 @@ jobs:
           results-file: userland-results.json
           token: ${{ secrets.STATUS_DISPATCH_TOKEN }}
 
-  # The behavioral half: ELF execution + 17 BusyBox applets + devenv tools, run
-  # through the Node harness against the bundled wasm. Heavy (Git LFS images +
-  # `make build`), so it runs nightly / on demand, not on every push.
+  # The behavioral half: MemFS + ELF execution + the 17 BusyBox applets, run
+  # through the Node harness. Builds just the busybox runtime (the full
+  # devenv bundle needs a slow Docker build, so devenv tool tests are skipped
+  # here). Heavy-ish (Git LFS + a wasm build), so nightly / on demand.
   node-harness:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -52,13 +53,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-unknown-unknown
+          components: rust-src
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Build bundled wasm (busybox + node + devenv)
-        run: make build
-      - name: Run node harness with results ledger
-        run: RESULTS_NDJSON=ledger.ndjson bash test/run_tests.sh --devenv || true
+      - name: Build busybox runtime
+        run: make build-busybox && cp wasm/nano.busybox.wasm wasm/nano.wasm
+      - name: Run node harness with results ledger (ELF + BusyBox; devenv skipped)
+        run: RESULTS_NDJSON=ledger.ndjson bash test/run_tests.sh || true
       - name: Convert ledger to results contract
         run: node tools/harness-ledger-to-results.mjs ledger.ndjson --source nano --suite node-harness --map test/harness-feature-map.json > userland-results.json
       - name: Publish to status hub
