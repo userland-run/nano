@@ -673,6 +673,21 @@ pub unsafe fn handle(vm: &mut Vm) {
 
 // --- Direct syscall implementations ---
 
+// Per-region high-water marks for the brk and mmap bump allocators.
+//
+// WASM linear memory is zero-initialized by the engine, and these bump
+// allocators never reuse address space within a run (munmap is a no-op), so
+// any region at/above its allocator's high-water mark is virgin memory that is
+// already zero — re-`memset`ing it is pure waste. Only space below the mark
+// (reused after a _resetVM that rewinds the allocators) can hold stale bytes
+// and must be zeroed. The marks persist across resets (the memory image does
+// too), so reused space is correctly re-zeroed.
+//
+// NOTE: module-global like the block-cache stats — assumes one VM executes at
+// a time (the cooperative model). Promote to Vm fields for multi-VM isolation.
+static mut BRK_HWM: u64 = 0;
+static mut MMAP_HWM: u64 = 0;
+
 unsafe fn sys_brk(vm: &mut Vm, addr: u64) -> i64 {
     // brk_start == u64::MAX means uninitialized
     if vm.brk_start == u64::MAX {
@@ -688,9 +703,16 @@ unsafe fn sys_brk(vm: &mut Vm, addr: u64) -> i64 {
     let new_brk = (addr + PAGE_SIZE - 1) & PAGE_MASK;
     let old_brk = vm.brk_current;
 
-    // Zero new memory if expanding
+    // Zero new memory if expanding — but only the part below the brk
+    // high-water mark; memory above it is virgin (engine-zero) already.
     if new_brk > old_brk {
-        mem::zero_mem(vm.ram_base, old_brk, (new_brk - old_brk) as usize);
+        if old_brk < BRK_HWM {
+            let zero_end = core::cmp::min(new_brk, BRK_HWM);
+            mem::zero_mem(vm.ram_base, old_brk, (zero_end - old_brk) as usize);
+        }
+        if new_brk > BRK_HWM {
+            BRK_HWM = new_brk;
+        }
     }
 
     vm.brk_current = new_brk;
@@ -739,9 +761,25 @@ unsafe fn sys_mmap(
         return ENOMEM;
     }
 
-    // Zero the region for anonymous mappings
+    // Zero the region for anonymous mappings. Mappings taken from the bump
+    // frontier at/above the high-water mark are virgin (engine-zero) memory —
+    // skip the redundant memset. MAP_FIXED can land anywhere (possibly reused),
+    // so zero it unconditionally.
     if is_anon {
-        mem::zero_mem(vm.ram_base, guest_addr, len as usize);
+        let end_addr = guest_addr + len;
+        let from_bump = !(is_fixed && addr != 0);
+        if !(from_bump && guest_addr >= MMAP_HWM) {
+            // MAP_FIXED, or a bump region rewound below the high-water mark
+            // (post-reset reuse) — may hold stale bytes, so zero the dirty part.
+            let zero_end = if from_bump { core::cmp::min(end_addr, MMAP_HWM) } else { end_addr };
+            if zero_end > guest_addr {
+                mem::zero_mem(vm.ram_base, guest_addr, (zero_end - guest_addr) as usize);
+            }
+        }
+        // else: virgin bump frontier — already engine-zero, skip the memset.
+        if from_bump && end_addr > MMAP_HWM {
+            MMAP_HWM = end_addr;
+        }
     }
 
     // Record in mmap table
