@@ -27,11 +27,25 @@ jobs:
 
       # build.sh does the Docker cross-compile (Dockerfile pins node v25.4.0 +
       # --with-intl=small-icu) and extracts the static ELF to images/node.
-      - name: Cross-compile node (RV64 / musl / small-icu)
-        run: bash build/node-riscv/build.sh
+      # Build via buildx with the GitHub Actions layer cache. The Dockerfile's
+      # slow, deterministic stages — the GCC riscv64 cross-toolchain (musl-cross-
+      # make, ~1.5-2h) and the linux headers — are cached, so re-runs and future
+      # node builds reuse them and only recompile Node (~30-60 min vs ~3-4h cold).
+      - uses: docker/setup-buildx-action@v3
+      - name: Cross-compile node (RV64 / musl / small-icu), cached toolchain
+        uses: docker/build-push-action@v6
+        with:
+          context: build/node-riscv
+          file: build/node-riscv/Dockerfile
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Final stage is `FROM scratch; COPY /node` → export it to ./node-out/node.
+          outputs: type=local,dest=node-out
 
-      - name: Inspect the artifact
-        run: file images/node && ls -lh images/node
+      - name: Stage + inspect the artifact
+        run: |
+          mkdir -p images && cp node-out/node images/node
+          file images/node && ls -lh images/node
 
       - name: Upload to the release
         env:
