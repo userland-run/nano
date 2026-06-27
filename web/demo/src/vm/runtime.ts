@@ -44,6 +44,7 @@ export async function ensureVM(): Promise<any> {
     // Ed25519-verified and chunks are cached in OPFS, so repeat boots are fast.
     // Installs are non-fatal — a CDN hiccup degrades a tool, it can't brick boot.
     const catalog = new Catalog();
+    if (typeof vmInstance.useCatalog === "function") vmInstance.useCatalog(catalog); // scripts can install apps
     const target = { writeFile: (p: string, bytes: Uint8Array) => vmInstance.addFile(p, bytes) };
     for (const ref of CATALOG_APPS) {
       try {
