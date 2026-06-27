@@ -354,6 +354,17 @@ export class BoaRuntime {
       members.push(`node: ${reg((args) => host.node(args), true)}`);
     }
 
+    // Catalog (asynchronous — fetch + verify + write the VFS). A script can load
+    // apps on demand: `await nano.catalog.install("ripgrep"); nano.run("rg ...")`.
+    // Gated by expose.catalog; the VM must have a catalog wired (vm.useCatalog).
+    if (expose.catalog && host.catalog && !syncOnly) {
+      const parts = [`install: ${reg((ref, opts) => host.catalog.install(ref, opts), true)}`];
+      if (host.catalog.installBundle) {
+        parts.push(`installBundle: ${reg((slug, opts) => host.catalog.installBundle(slug, opts), true)}`);
+      }
+      members.push(`catalog: Object.freeze({ ${parts.join(", ")} })`);
+    }
+
     // Host-side logging (synchronous).
     const log = reg((...args) => {
       if (host.log) host.log(...args);

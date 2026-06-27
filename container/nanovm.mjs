@@ -398,9 +398,37 @@ class NanoVM {
     }
   }
 
-  /** Host driver mapping the Boa bridge onto this VM's MemFS + run/node. */
+  /**
+   * Wire a catalog so apps can be installed into this VM — by the host, by the
+   * scripting layer (`nano.catalog.install(...)`), and via {@link installApp}.
+   * `catalog` is duck-typed (an SDK `Catalog`): it must expose
+   * `install(target, ref, opts)` and optionally `installBundle(target, slug, opts)`.
+   * The InstallTarget is this VM's VFS (addFile). Returns `this` for chaining.
+   */
+  useCatalog(catalog) {
+    const target = { writeFile: (p, bytes) => this.addFile(p, bytes) };
+    this._catalogInstaller = {
+      install: (ref, opts) => catalog.install(target, ref, opts),
+      installBundle: (slug, opts) =>
+        catalog.installBundle ? catalog.installBundle(target, slug, opts)
+          : Promise.reject(new Error("catalog has no installBundle")),
+    };
+    return this;
+  }
+
+  /** Install a catalog app into this VM's VFS (requires {@link useCatalog}). */
+  installApp(ref, opts) {
+    if (!this._catalogInstaller) return Promise.reject(new Error("no catalog wired — call vm.useCatalog(catalog)"));
+    return this._catalogInstaller.install(ref, opts);
+  }
+
+  /** Host driver mapping the Boa bridge onto this VM's MemFS + run/node + catalog. */
   _scriptingHost() {
     const vm = this;
+    const needCatalog = () => {
+      if (!vm._catalogInstaller) throw new Error("catalog not wired — call vm.useCatalog(catalog) before scripting");
+      return vm._catalogInstaller;
+    };
     return {
       fs: {
         readText: (p) => vm.readFileString(p),
@@ -415,6 +443,12 @@ class NanoVM {
       run: (command) => vm.run(command),
       node: (args) => vm.node(...(Array.isArray(args) ? args : [args])),
       log: (...a) => console.log(...a),
+      // Catalog: a script can load apps on demand (async; the Boa bridge supports
+      // host_call_async). e.g. `await nano.catalog.install("ripgrep"); nano.run("rg --version")`.
+      catalog: {
+        install: (ref, opts) => needCatalog().install(ref, opts),
+        installBundle: (slug, opts) => needCatalog().installBundle(slug, opts),
+      },
     };
   }
 
