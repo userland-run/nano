@@ -431,9 +431,18 @@ class NanoVM {
    * @returns {Promise<{exitCode: number, stdout: string}>}
    */
   async run(command, opts = {}) {
-    if (!this._busyboxElf) throw new Error("No busybox ELF loaded");
+    // Prefer the embedded busybox; otherwise exec a catalog-installed
+    // /bin/busybox from the guest VFS (the migration distributes it via the catalog).
+    const elf = this._busyboxElf || this._readElfFromVfs("/bin/busybox");
+    if (!elf) throw new Error("No busybox ELF loaded (embed it or install the busybox catalog app)");
     const argv = command.trim().split(/\s+/);
-    return this._execute(this._busyboxElf, argv, [], opts);
+    return this._execute(elf, argv, [], opts);
+  }
+
+  /** Read an installed ELF from the guest VFS (follows symlinks), or null. */
+  _readElfFromVfs(path) {
+    const node = this._memfs.resolve(path);
+    return node && node.isFile && node.data && node.data.length ? node.data : null;
   }
 
   /**
@@ -442,7 +451,9 @@ class NanoVM {
    * @returns {Promise<{exitCode: number, stdout: string}>}
    */
   async node(...argsAndOpts) {
-    if (!this._nodeElf) throw new Error("No node ELF loaded");
+    // Embedded node, else a catalog-installed /usr/bin/node from the guest VFS.
+    const nodeElf = this._nodeElf || this._readElfFromVfs("/usr/bin/node");
+    if (!nodeElf) throw new Error("No node ELF loaded (install the node catalog app)");
     let opts = {};
     let args;
     const last = argsAndOpts[argsAndOpts.length - 1];
@@ -453,7 +464,7 @@ class NanoVM {
       args = ["node", ...argsAndOpts];
     }
     const envVars = ["UV_THREADPOOL_SIZE=0"];
-    return this._execute(this._nodeElf, args, envVars, opts);
+    return this._execute(nodeElf, args, envVars, opts);
   }
 
   /** Cancel the currently running execution loop. */
