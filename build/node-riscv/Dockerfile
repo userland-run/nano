@@ -102,10 +102,14 @@ RUN CC=riscv64-linux-musl-gcc \
       --dest-os=linux \
       --cross-compiling \
       --fully-static \
-      --with-intl=none \
+      --with-intl=small-icu \
       --without-inspector \
       --without-npm \
       --openssl-no-asm
+# --with-intl=small-icu (was none): bundles ICU's full Unicode property tables
+# (English-only locale data) into the binary so V8 supports `\p{...}` regex —
+# required by prettier (and Intl basics). Builds from node's vendored
+# deps/icu-small (no download). Switch to full-icu if non-English Intl is needed.
 
 # Build with all available cores
 RUN make -j$(nproc)
