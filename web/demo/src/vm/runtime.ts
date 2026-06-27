@@ -7,7 +7,13 @@
 
 // @ts-ignore — nanovm.mjs is a JS module, no types
 import { NanoVM } from "@container/nanovm.mjs";
+// @ts-ignore — @sdk resolves to the built SDK bundle (vite alias)
+import { Catalog } from "@sdk";
 import * as opfs from "./opfs";
+
+// Apps installed from the catalog into the guest VFS at boot. node is the JS
+// runtime; typescript/eslint run on it. prettier is pending the full-ICU node.
+const CATALOG_APPS = ["node@25.4.0", "typescript@5.9.3", "eslint@10.0.0"];
 
 let vmInstance: any = null;
 let vmReady = false;
@@ -23,42 +29,28 @@ export async function ensureVM(): Promise<any> {
   }
 
   initPromise = (async () => {
-    // Fetch WASM chunks and concatenate (split to stay under GitHub's 100MB limit)
+    // The slim nano.wasm (~2.3 MB) — node/devenv are no longer embedded.
     const base = import.meta.env.BASE_URL;
-    const chunks = await Promise.all(
-      ["nano.wasm.aa", "nano.wasm.ab"].map(async (name) => {
-        const res = await fetch(base + name);
-        if (!res.ok) throw new Error(`Failed to fetch ${name}: ${res.status}`);
-        return new Uint8Array(await res.arrayBuffer());
-      })
-    );
-    const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);
-    const wasmBytes = new Uint8Array(totalLen);
-    let offset = 0;
-    for (const chunk of chunks) {
-      wasmBytes.set(chunk, offset);
-      offset += chunk.length;
-    }
+    const res = await fetch(base + "nano.wasm");
+    if (!res.ok) throw new Error(`Failed to fetch nano.wasm: ${res.status}`);
+    const wasmBytes = new Uint8Array(await res.arrayBuffer());
 
     vmInstance = await NanoVM.create({
       ramMB: 1800,
       wasm: wasmBytes.buffer,
     });
 
-    // Load bundled devenv tarball if available
-    const exports = vmInstance._exports || vmInstance.exports;
-    if (exports?.vm_bundled_devenv_ptr && exports?.vm_bundled_devenv_size) {
-      const devenvPtr = exports.vm_bundled_devenv_ptr();
-      const devenvSize = exports.vm_bundled_devenv_size();
-      if (devenvPtr > 0 && devenvSize > 0) {
-        console.log(`[NanoVM] Loading bundled devenv (${(devenvSize / 1024 / 1024).toFixed(1)} MB compressed)...`);
-        const wasmMemory = vmInstance._memory || vmInstance.memory;
-        if (wasmMemory) {
-          const tarGz = new Uint8Array(wasmMemory.buffer, devenvPtr, devenvSize);
-          const tarGzCopy = new Uint8Array(tarGz);
-          await vmInstance.loadTarGz(tarGzCopy);
-          console.log(`[NanoVM] Devenv loaded into VFS`);
-        }
+    // Install the toolchain from the catalog into the guest VFS. Each manifest is
+    // Ed25519-verified and chunks are cached in OPFS, so repeat boots are fast.
+    // Installs are non-fatal — a CDN hiccup degrades a tool, it can't brick boot.
+    const catalog = new Catalog();
+    const target = { writeFile: (p: string, bytes: Uint8Array) => vmInstance.addFile(p, bytes) };
+    for (const ref of CATALOG_APPS) {
+      try {
+        const m = await catalog.install(target, ref);
+        console.log(`[catalog] installed ${m.name}@${m.version}`);
+      } catch (e) {
+        console.warn(`[catalog] could not install ${ref}:`, e);
       }
     }
 

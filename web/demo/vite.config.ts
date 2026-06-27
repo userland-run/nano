@@ -8,6 +8,9 @@ import react from "@vitejs/plugin-react";
 import path from "path";
 
 const containerDir = path.resolve(__dirname, "../../container");
+// The catalog client (Catalog/installer) lives in the SDK; the demo installs
+// node + the toolchain from the catalog at boot now that nano.wasm is slim.
+const sdkDist = path.resolve(__dirname, "../../../sdk/dist/index.js");
 
 export default defineConfig({
   base: "/nano/",
@@ -15,6 +18,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@container": containerDir,
+      "@sdk": sdkDist,
     },
   },
   server: {
