@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+# Copyright (C) 2026 And The Next GmbH - https://userland.run
+#
+# Cross-compile the RV64 (musl, small-icu) Node.js guest in CI — the build needs
+# Docker, which GitHub runners have. Produces images/node and uploads it to the
+# v0.1.0 release, where the catalog `node` recipe sources it. Manual trigger:
+#   gh workflow run build-node.yml -R userland-run/nano
+# It is a long build (musl cross-toolchain + Node from source, ~1-2h).
+name: build-node
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to upload images/node to"
+        default: "v0.1.0"
+
+permissions:
+  contents: write   # upload images/node to the release
+
+jobs:
+  build-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # well under the 6h cap; the cross-compile is slow
+    steps:
+      - uses: actions/checkout@v4
+
+      # build.sh does the Docker cross-compile (Dockerfile pins node v25.4.0 +
+      # --with-intl=small-icu) and extracts the static ELF to images/node.
+      - name: Cross-compile node (RV64 / musl / small-icu)
+        run: bash build/node-riscv/build.sh
+
+      - name: Inspect the artifact
+        run: file images/node && ls -lh images/node
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.inputs.release_tag }}"
+          gh release upload "$tag" images/node -R "${{ github.repository }}" --clobber
+          echo "uploaded images/node → release $tag"
