@@ -561,7 +561,7 @@ class MemFS {
 
   // --- Seed helpers ---
 
-  createFile(path, content) {
+  createFile(path, content, mode) {
     const parts = path.split("/").filter(Boolean);
     const name = parts.pop();
     let dir = this.root;
@@ -578,7 +578,10 @@ class MemFS {
     }
     const enc = new TextEncoder();
     const data = typeof content === "string" ? enc.encode(content) : content;
-    const node = new FSNode(name, dir, 0o100644);
+    // Honor an explicit permission mode when given (e.g. the catalog installer
+    // passes 0o755 for executables); default to a regular 0o644 file otherwise.
+    const perm = typeof mode === "number" ? mode & 0o7777 : 0o644;
+    const node = new FSNode(name, dir, 0o100000 | perm);
     node.data = new Uint8Array(data);
     node.size = data.length;
     dir.children.set(name, node);
