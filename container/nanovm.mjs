@@ -941,48 +941,70 @@ class NanoVM {
    * @param {number} [opts.maxSteps] - max steps for warmup phase (default 50M)
    * @returns {Promise<Object>} snapshot object for use with restoreAndRun()
    */
-  async nodeSnapshot(opts = {}) {
-    // Use the embedded node ELF, or (slim wasm + catalog install) the one in the
-    // guest VFS — same fallback `node()` uses, so snapshots work without a
-    // node-bundled wasm.
-    const nodeElf = this._nodeElf || this._readElfFromVfs("/usr/bin/node");
-    if (!nodeElf) throw new Error("No node ELF loaded (install the node catalog app)");
-    const { maxSteps = 2_000_000_000 } = opts;
+  /**
+   * Generic app snapshot. Loads an ELF, seeds an optional launcher script, runs
+   * it with the given argv/env until the guest signals the `/dev/__snapshot__`
+   * sentinel, and captures the VM state. App-specifics (which ELF, the launcher,
+   * argv, env) are PARAMETERS — driven by the app's recipe — so the core stays
+   * runtime-agnostic. The launcher convention: write `/dev/__snapshot__`, then
+   * read + execute the per-run payload at `/dev/__run__` (see restoreAndRun).
+   *
+   * @param {object} opts
+   * @param {Uint8Array} [opts.elf] - ELF bytes (or read from elfPath).
+   * @param {string}     [opts.elfPath] - VFS path to read the ELF from.
+   * @param {string}     [opts.launcher] - launcher source seeded at launcherPath.
+   * @param {string}     [opts.launcherPath="/launcher.js"]
+   * @param {string[]}   opts.argv - process argv (e.g. ["node","/launcher.js"]).
+   * @param {string[]}   [opts.env=[]] - environment (["K=V", ...]).
+   * @param {number}     [opts.maxSteps=2e9]
+   */
+  async snapshotApp(opts = {}) {
+    const { elf, elfPath, launcher, launcherPath = "/launcher.js", argv, env = [], maxSteps = 2_000_000_000 } = opts;
+    const appElf = elf || (elfPath ? this._readElfFromVfs(elfPath) : null);
+    if (!appElf) throw new Error(`snapshotApp: no ELF (${elfPath || "pass elf or elfPath"})`);
+    if (!argv || !argv.length) throw new Error("snapshotApp: argv required");
 
-    // Seed the launcher script into MemFS
-    const launcher = [
-      "const fs = require('fs');",
-      "fs.writeFileSync('/dev/__snapshot__', 'snap');",
-      "const __s = fs.readFileSync('/dev/__run__', 'utf8');",
-      "(new Function(__s))();",
-    ].join("\n");
-    this._memfs.createFile("/launcher.js", launcher);
+    if (launcher) this._memfs.createFile(launcherPath, launcher);
 
     this._stdout = "";
     this._onStdout = null;
     this._resetProcessState();
 
-    // Reset and load Node ELF
     this._resetVM();
     const mem = new Uint8Array(this._memory.buffer);
-    mem.set(nodeElf, this._ramPtr);
+    mem.set(appElf, this._ramPtr);
 
     const X = this._exports;
-    const loadRc = X.vm_load_elf(this._vmPtr, 0, nodeElf.length);
+    const loadRc = X.vm_load_elf(this._vmPtr, 0, appElf.length);
     if (loadRc !== 0) throw new Error(`vm_load_elf failed: ${loadRc}`);
 
-    // Set up argv: node /launcher.js
-    const argv = ["node", "/launcher.js"];
-    const envVars = ["UV_THREADPOOL_SIZE=0"];
-    this._setupArgv(argv, envVars);
+    this._setupArgv(argv, env);
 
-    // Run until snapshot sentinel
     const result = await this._runLoop(maxSteps);
-    if (!result.snapshotReady) {
-      throw new Error("Node.js did not reach snapshot sentinel within budget");
-    }
-
+    if (!result.snapshotReady) throw new Error("App did not reach the snapshot sentinel within budget");
     return this.snapshot();
+  }
+
+  /**
+   * Node-specific convenience over {@link snapshotApp}. Prefer driving snapshotApp
+   * from an app recipe (the node specifics below live in the catalog node recipe);
+   * kept for backward compatibility.
+   */
+  async nodeSnapshot(opts = {}) {
+    const nodeElf = this._nodeElf || this._readElfFromVfs("/usr/bin/node");
+    return this.snapshotApp({
+      elf: nodeElf,
+      launcherPath: "/launcher.js",
+      launcher: [
+        "const fs = require('fs');",
+        "fs.writeFileSync('/dev/__snapshot__', 'snap');",
+        "const __s = fs.readFileSync('/dev/__run__', 'utf8');",
+        "(new Function(__s))();",
+      ].join("\n"),
+      argv: ["node", "/launcher.js"],
+      env: ["UV_THREADPOOL_SIZE=0"],
+      maxSteps: opts.maxSteps ?? 2_000_000_000,
+    });
   }
 
   // Getters for runtime.ts compatibility
