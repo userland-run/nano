@@ -942,7 +942,11 @@ class NanoVM {
    * @returns {Promise<Object>} snapshot object for use with restoreAndRun()
    */
   async nodeSnapshot(opts = {}) {
-    if (!this._nodeElf) throw new Error("No node ELF loaded");
+    // Use the embedded node ELF, or (slim wasm + catalog install) the one in the
+    // guest VFS — same fallback `node()` uses, so snapshots work without a
+    // node-bundled wasm.
+    const nodeElf = this._nodeElf || this._readElfFromVfs("/usr/bin/node");
+    if (!nodeElf) throw new Error("No node ELF loaded (install the node catalog app)");
     const { maxSteps = 2_000_000_000 } = opts;
 
     // Seed the launcher script into MemFS
@@ -961,10 +965,10 @@ class NanoVM {
     // Reset and load Node ELF
     this._resetVM();
     const mem = new Uint8Array(this._memory.buffer);
-    mem.set(this._nodeElf, this._ramPtr);
+    mem.set(nodeElf, this._ramPtr);
 
     const X = this._exports;
-    const loadRc = X.vm_load_elf(this._vmPtr, 0, this._nodeElf.length);
+    const loadRc = X.vm_load_elf(this._vmPtr, 0, nodeElf.length);
     if (loadRc !== 0) throw new Error(`vm_load_elf failed: ${loadRc}`);
 
     // Set up argv: node /launcher.js
