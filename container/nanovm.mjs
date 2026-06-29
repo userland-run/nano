@@ -359,6 +359,63 @@ class NanoVM {
     await this._memfs.loadTarGz(buffer);
   }
 
+  /**
+   * Create a directory (and any missing parents), like `mkdir -p`. Synchronous,
+   * direct MemFS — takes no VM step, so it is safe while an interactive shell
+   * owns the run loop. Idempotent on an existing directory; throws if the path
+   * already exists as a non-directory.
+   */
+  makeDir(path) {
+    const existing = this._memfs.resolve(path, false);
+    if (existing) {
+      if (existing.isDir) return; // idempotent
+      throw new Error(`makeDir: path exists and is not a directory: ${path}`);
+    }
+    this._memfs.createDir(path);
+  }
+
+  /**
+   * Recursively remove a file, symlink, or directory (like `rm -rf`).
+   * Synchronous, direct MemFS. Symlinks are removed as links — never followed —
+   * so a symlink cycle cannot hang the walk. No-op if the path does not exist.
+   */
+  removePath(path) {
+    const node = this._memfs.resolve(path, /*followSymlinks=*/ false);
+    if (!node) return;
+    if (node.isDir) {
+      const sep = path.endsWith("/") ? "" : "/";
+      for (const childName of [...node.children.keys()]) {
+        this.removePath(path + sep + childName);
+      }
+      const rc = this._memfs.unlink(path, 0x200); // AT_REMOVEDIR
+      if (rc < 0) throw new Error(`removePath: rmdir failed (errno ${rc}): ${path}`);
+    } else {
+      const rc = this._memfs.unlink(path, 0); // file or symlink (not followed)
+      if (rc < 0) throw new Error(`removePath: unlink failed (errno ${rc}): ${path}`);
+    }
+  }
+
+  /**
+   * Rename/move a path. Synchronous, direct MemFS. Overwrites an existing
+   * destination entry. Refuses to move a directory into its own descendant
+   * (which would orphan the subtree into a cycle).
+   */
+  renamePath(from, to) {
+    const norm = (p) => "/" + p.split("/").filter(Boolean).join("/");
+    const f = norm(from);
+    const t = norm(to);
+    if (t === f || t.startsWith(f + "/")) {
+      throw new Error(`renamePath: cannot move ${from} into its own descendant: ${to}`);
+    }
+    const rc = this._memfs.rename(from, to);
+    if (rc < 0) throw new Error(`renamePath: rename failed (errno ${rc}): ${from} -> ${to}`);
+  }
+
+  /** Working directory of the process currently in the run loop (e.g. "/root"). */
+  cwd() {
+    return this._readCwd();
+  }
+
   // ============================================================
   // Public API — Scripting (host-side Boa engine)
   // ============================================================
@@ -930,6 +987,31 @@ class NanoVM {
   get virtualServer() { return this._virtualServer; }
 
   // ============================================================
+  // Public API — Introspection (terminal footer stats)
+  // ============================================================
+
+  /** Total guest instructions retired so far (for an insns/sec readout). */
+  instructionCount() {
+    const X = this._exports;
+    if (!X || !X.debug_block_insns) return 0;
+    return Number(X.debug_block_insns(this._vmPtr)) + Number(X.debug_baseline_insns(this._vmPtr));
+  }
+
+  /**
+   * Whether a guest server is listening this run. Sticky once detected (a server
+   * either via EPOLL accept-block or a "listening …" banner); cleared on the next
+   * run/reset. Good enough for a footer "port open" hint.
+   */
+  get serving() {
+    return !!this._serverMode;
+  }
+
+  /** The listening port (best-effort, from the server banner) while serving, else null. */
+  get servingPort() {
+    return this._serverMode ? this._servingPort ?? null : null;
+  }
+
+  // ============================================================
   // Internal — Execution loop
   // ============================================================
 
@@ -989,6 +1071,9 @@ class NanoVM {
     let stepCounter = 0;
     let serverMode = false;
     this._snapshotRequested = false;
+    this._lastYieldPc = null; // adaptive-yield progress tracker (see _adaptiveYield)
+    this._serverMode = false; // set once a guest server is listening (see get serving)
+    this._servingPort = null;
     const myRunId = ++this._runId;
 
     for (let iter = 0; iter < maxIter; iter++) {
@@ -1044,7 +1129,8 @@ class NanoVM {
 
       if (status === STATUS_EPOLL_BLOCKED) {
         serverMode = true;
-        await new Promise(r => setTimeout(r, 0));
+        this._serverMode = true; // a guest server is listening (footer indicator)
+        await this._adaptiveYield(X);
         this._pollConnections();
         const dv = new DataView(this._memory.buffer);
         dv.setBigInt64(this._vmPtr + 80, BigInt(-4), true); // a0 = -EINTR
@@ -1059,17 +1145,60 @@ class NanoVM {
 
       if (!serverMode && /listening/i.test(this._stdout)) {
         serverMode = true;
+        this._serverMode = true;
+        // Best-effort: pull the port from the server's banner ("listening on
+        // 8080", "running at http://localhost:3000", ":5173", …).
+        const tail = this._stdout.slice(-240);
+        const m =
+          /(?:listening|running|started)[^\d]{0,14}(\d{2,5})/i.exec(tail) ||
+          /:(\d{2,5})\b/.exec(tail);
+        if (m) this._servingPort = parseInt(m[1], 10);
       }
       if (serverMode) iter--;
 
       this._pollConnections();
 
       if (stepCounter % 5 === 0) {
-        await new Promise(r => setTimeout(r, 0));
+        await this._adaptiveYield(X);
       }
     }
 
     return { exitCode: -1, stdout: this._stdout };
+  }
+
+  /**
+   * Macrotask yield via MessageChannel. Unlike `setTimeout(0)` — which Chrome
+   * clamps to ~1s in background/hidden tabs — `postMessage` is NOT throttled, so
+   * an actively-running guest (cold-starting Node, serving HTTP) keeps full
+   * interpreter speed even when the tab isn't focused. Used by {@link _adaptiveYield}.
+   */
+  _fastYield() {
+    if (!this._yieldChannel) {
+      this._yieldQueue = [];
+      this._yieldChannel = new MessageChannel();
+      this._yieldChannel.port1.onmessage = () => {
+        const r = this._yieldQueue.shift();
+        if (r) r();
+      };
+    }
+    return new Promise((resolve) => {
+      this._yieldQueue.push(resolve);
+      this._yieldChannel.port2.postMessage(0);
+    });
+  }
+
+  /**
+   * Yield to the host event loop, fast or slow depending on whether the guest is
+   * making progress. While it executes (PC advancing) or a connection is pending,
+   * use the unthrottled MessageChannel yield; when idle (e.g. an interactive
+   * shell parked on an empty stdin read — same PC, no pending work), fall back to
+   * `setTimeout(0)` so a quiet terminal doesn't busy-spin the CPU.
+   */
+  _adaptiveYield(X) {
+    const pc = X.debug_pc ? X.debug_pc(this._vmPtr) : null;
+    const active = pc === null || pc !== this._lastYieldPc || this._pendingConnections.length > 0;
+    this._lastYieldPc = pc;
+    return active ? this._fastYield() : new Promise((r) => setTimeout(r, 0));
   }
 
   _pollConnections() {
@@ -1089,20 +1218,54 @@ class NanoVM {
         // Copy response bytes from WASM memory
         const bytes = new Uint8Array(this._memory.buffer, scratchPtr, n);
         conn.responseChunks.push(new Uint8Array(bytes));
+        conn.received = (conn.received || 0) + n;
         conn.stalePollCount = 0;
+        // Once headers arrive, learn the expected length so we read the whole
+        // body (a large static asset streams in many 16 KB chunks).
+        if (conn.expectedTotal === undefined) conn.expectedTotal = this._expectedResponseLength(conn);
+        if (conn.expectedTotal != null && conn.received >= conn.expectedTotal) {
+          this._resolveConnection(X, conn, pending, i);
+        }
       } else if (n === -1) {
         // Connection closed — response is complete
         this._resolveConnection(X, conn, pending, i);
       } else if (conn.responseChunks.length > 0) {
-        // n === 0 but we already have data — server may be waiting for
-        // client-side close (HTTP Connection: close deadlock).
-        // After a few stale polls, force-close to break the deadlock.
+        // n === 0 (no bytes ready this poll). If a Content-Length told us the
+        // body isn't finished, keep waiting — the server is mid-stream. Only
+        // force-close when the length is unknown (Connection: close streaming),
+        // after enough stale polls, to break the close-deadlock.
+        if (conn.expectedTotal === undefined) conn.expectedTotal = this._expectedResponseLength(conn);
         conn.stalePollCount = (conn.stalePollCount || 0) + 1;
-        if (conn.stalePollCount >= 10) {
+        const limit = conn.expectedTotal === null ? 200 : 20000; // unknown-len vs hung-server backstop
+        if (conn.stalePollCount >= limit) {
           this._resolveConnection(X, conn, pending, i);
         }
       }
     }
+  }
+
+  /**
+   * Inspect a connection's accumulated bytes and return the expected total
+   * response size (header + body) once the headers are complete:
+   *   - a number   → Content-Length known; read until `received` reaches it
+   *   - `null`     → chunked or no Content-Length → rely on connection close
+   *   - `undefined`→ headers not fully received yet → keep reading
+   */
+  _expectedResponseLength(conn) {
+    let total = 0;
+    for (const c of conn.responseChunks) total += c.length;
+    const buf = new Uint8Array(total);
+    let off = 0;
+    for (const c of conn.responseChunks) { buf.set(c, off); off += c.length; }
+    let sep = -1;
+    for (let j = 0; j + 3 < buf.length; j++) {
+      if (buf[j] === 13 && buf[j + 1] === 10 && buf[j + 2] === 13 && buf[j + 3] === 10) { sep = j; break; }
+    }
+    if (sep === -1) return undefined; // headers not complete
+    const header = new TextDecoder().decode(buf.subarray(0, sep));
+    if (/transfer-encoding:\s*chunked/i.test(header)) return null;
+    const m = /content-length:\s*(\d+)/i.exec(header);
+    return m ? sep + 4 + parseInt(m[1], 10) : null;
   }
 
   _resolveConnection(X, conn, pending, i) {
