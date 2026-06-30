@@ -2,6 +2,13 @@
 
 A RISC-V Linux userland emulator compiled to WebAssembly. Runs BusyBox, Node.js, and the full npm/TypeScript toolchain entirely in the browser — no server required.
 
+> 📚 **Documentation lives at <https://userland.run/docs/>.** This README is a quick orientation; the
+> hosted docs cover the CLI/JS API, syscalls, host API, architecture, build, and the full SDK reference.
+> NanoVM is the emulator core of **[userland.run](https://userland.run)** — most users consume it through
+> the [SDK](https://github.com/userland-run/sdk), the [terminal](https://github.com/userland-run/terminal)
+> web component, and the [app catalog](https://github.com/userland-run/catalog) (see
+> [Part of userland.run](#part-of-userlandrun) below).
+
 ## What it does
 
 NanoVM emulates an RV64GC RISC-V CPU with ~80 Linux syscalls, enough to run:
@@ -11,6 +18,10 @@ NanoVM emulates an RV64GC RISC-V CPU with ~80 Linux syscalls, enough to run:
 - **npm toolchain** — TypeScript compiler, ESLint, Prettier
 
 Everything runs inside a single WASM module. The emulator handles memory management (brk/mmap), file I/O (via an in-memory POSIX filesystem), sockets, epoll, timerfds, futex-based threading, and ELF loading.
+
+The default build is **slim** (~2.4 MB, BusyBox only): Node.js and the dev tools are not embedded — they
+are installed on demand from the signed [app catalog](https://github.com/userland-run/catalog) at
+runtime. A fully-bundled build (`make build-full`, ~68 MB) embeds BusyBox + Node.js + devenv for offline use.
 
 ## Quick start
 
@@ -77,12 +88,30 @@ build/              Devenv Docker build scripts
 
 ## Documentation
 
+**Full, hosted documentation: <https://userland.run/docs/>** — getting started, CLI & JS API,
+syscalls, host API, networking, architecture, performance, build, and the complete SDK reference.
+
+The source pages also live in this repo under `docs/`:
+
 - [Architecture](docs/architecture.md) — Design principles, memory layout, execution model, VM struct
 - [Syscalls](docs/syscalls.md) — Complete syscall reference with handling modes
 - [Host API](docs/host-api.md) — WASM imports/exports and FS_PENDING protocol
 - [Virtual Server](docs/virtual-server.md) — HTTP request injection for the preview iframe
 - [Build Guide](docs/build.md) — Build targets, feature flags, testing, devenv setup
 - [Demo](docs/demo.md) — Web IDE architecture and Service Worker bridge
+
+## Part of userland.run
+
+NanoVM is the emulator core of the **[userland.run](https://userland.run)** workspace — a set of
+repos that turn the raw VM into a product:
+
+| Repo | What it is |
+| ---- | ---------- |
+| **[nano](https://github.com/userland-run/nano)** | The RV64GC → WASM emulator core — **this repo** |
+| [sdk](https://github.com/userland-run/sdk) | `@userland-run/nano-sdk` — typed TypeScript SDK that drives the VM (code / terminal / serve / scripting / worker) |
+| [terminal](https://github.com/userland-run/terminal) | `<nano-terminal>` Shadow-DOM web component — the terminal UI, consumed via the SDK |
+| [catalog](https://github.com/userland-run/catalog) | Signed, content-addressed app marketplace (node, typescript, eslint, prettier, …) installed on demand |
+| [website](https://github.com/userland-run/website) | Landing page + the hosted docs at [userland.run/docs](https://userland.run/docs/) |
 
 ## Tests
 
