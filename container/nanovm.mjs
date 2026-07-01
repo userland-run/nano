@@ -590,6 +590,22 @@ class NanoVM {
       this._stdinQueue.push(bytes.slice());
     }
     this._stdinEof = false; // new input cancels a prior EOF
+    if (this._stdinWake) this._stdinWake(); // wake a run loop parked on idle stdin
+  }
+
+  /**
+   * Park the run loop while the guest is blocked on an idle interactive stdin
+   * read: resolve as soon as writeStdin()/closeStdin() supplies input, otherwise
+   * re-check after a short fallback. Replaces a busy-poll that spun the tty ring
+   * ~50k times/sec at an idle prompt — near-zero idle CPU, no added input latency.
+   */
+  _parkStdin() {
+    if (this._stdinAvailable() > 0 || this._stdinEof) return Promise.resolve();
+    return new Promise((resolve) => {
+      const wake = () => { this._stdinWake = null; clearTimeout(timer); resolve(); };
+      const timer = setTimeout(wake, 50);
+      this._stdinWake = wake;
+    });
   }
 
   /**
@@ -610,6 +626,7 @@ class NanoVM {
     this._stdinEof = true;
     const X = this._exports;
     if (X && X.vm_stdin_eof) X.vm_stdin_eof(this._vmPtr);
+    if (this._stdinWake) this._stdinWake(); // wake a run loop parked on idle stdin
   }
 
   /** Total bytes currently queued on stdin. */
@@ -1147,7 +1164,11 @@ class NanoVM {
           if (an.read) this._serveNetRead(an.bufPtr, an.bufLen);
         }
         iter--; // FS operations don't consume execution budget
-        if (++yieldCounter % 200 === 0) {
+        if (this._blockedOnStdin) {
+          // Idle interactive prompt: sleep until keystrokes arrive (or a short
+          // fallback) instead of busy-polling the tty ~50k times/sec.
+          await this._parkStdin();
+        } else if (++yieldCounter % 200 === 0) {
           await new Promise(r => setTimeout(r, 0));
         }
         continue;
@@ -1696,6 +1717,7 @@ class NanoVM {
 
   _processFsRequest() {
     const X = this._exports;
+    this._blockedOnStdin = false; // set true below when a stdin read parks (idle prompt)
     const reqPtr = X.vm_fs_request_ptr(this._vmPtr);
     const dv = new DataView(this._memory.buffer);
     const ramPtr = this._ramPtr;
@@ -1717,6 +1739,9 @@ class NanoVM {
         (gfd >= 0 && gfd < MAX_FDS && this._fdRead(dv, gfd).fd_type === FD_TYPE_STDIN);
       if (isStdin) {
         X.vm_io_retry(this._vmPtr); // completes (sets a0 + status) or leaves pending
+        // Still pending → the guest is parked on an idle interactive stdin read.
+        // Let the run loop sleep until input arrives instead of busy-polling.
+        this._blockedOnStdin = X.debug_status(this._vmPtr) === STATUS_FS_PENDING;
         return;
       }
     }
