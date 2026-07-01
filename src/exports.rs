@@ -514,3 +514,20 @@ pub unsafe extern "C" fn vm_snapshot_restore_reset() {
 pub extern "C" fn console_queue_char(_ch: i32) {
     // Intentionally empty - reference binary aliases this to free (no-op)
 }
+
+// ---------- Signal handler preservation across a serialized fork ----------
+
+/// Copy the process-global signal handler/flag tables into a scratch buffer and
+/// return its address; the host reads it into the parent's fork snapshot so a
+/// child's execve() reset can't wipe the parent shell's SIGINT handler.
+#[no_mangle]
+pub unsafe extern "C" fn vm_signals_dump() -> u32 {
+    crate::syscall::signals_dump()
+}
+
+/// Restore the signal handler/flag tables from the scratch buffer (host wrote the
+/// parent's saved tables back before this call). Paired with vm_signals_dump().
+#[no_mangle]
+pub unsafe extern "C" fn vm_signals_load() {
+    crate::syscall::signals_load();
+}

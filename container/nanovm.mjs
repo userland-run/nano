@@ -827,12 +827,24 @@ class NanoVM {
     const lowEnd = Math.min(Math.max(brkCurrent, mmapNext), this._ramSize);
     const sp = Number(dv.getBigUint64(v + 16, true));
     const stackStart = Math.max(lowEnd, (sp - 65536) & ~0xFFF);
+    // Signal handler tables live in Rust statics (not the Vm struct / guest RAM),
+    // so capture them separately — a forked child's execve() resets them and would
+    // otherwise wipe the PARENT shell's handlers (e.g. its interactive SIGINT
+    // handler, so Ctrl-C at the next prompt would kill the shell instead of the
+    // input line).
+    let sigState = null, sigAddr = 0;
+    if (this._exports.vm_signals_dump) {
+      sigAddr = this._exports.vm_signals_dump();
+      sigState = new Uint8Array(this._memory.buffer, sigAddr, 2 * 64 * 8).slice();
+    }
     return {
       vmStruct: new Uint8Array(this._memory.buffer, v, VM_STRUCT_SIZE).slice(),
       lowRAM: new Uint8Array(this._memory.buffer, this._ramPtr, lowEnd).slice(),
       stackRAM: new Uint8Array(this._memory.buffer, this._ramPtr + stackStart, this._ramSize - stackStart).slice(),
       lowEnd,
       stackStart,
+      sigState,
+      sigAddr,
     };
   }
 
@@ -851,6 +863,12 @@ class NanoVM {
       mem.fill(0, this._ramPtr + snap.lowEnd, this._ramPtr + snap.stackStart);
     }
     if (snap.stackRAM.length) mem.set(snap.stackRAM, this._ramPtr + snap.stackStart);
+    // Restore the parent's signal handler tables (see _forkSnapshot) so the child's
+    // execve() reset can't leave the shell with a default (fatal) SIGINT.
+    if (snap.sigState && this._exports.vm_signals_load) {
+      new Uint8Array(this._memory.buffer, snap.sigAddr, snap.sigState.length).set(snap.sigState);
+      this._exports.vm_signals_load();
+    }
   }
 
   snapshot() {

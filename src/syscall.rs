@@ -287,6 +287,36 @@ pub unsafe fn signals_reset() {
     TRAMPOLINE_READY = false;
 }
 
+// Serialized-fork signal preservation. SIG_HANDLERS/SIG_FLAGS are process-global
+// statics, but a forked child's execve() runs reset_statics()/signals_reset() —
+// which would also clobber the PARENT shell's handlers (they share the globals).
+// The host saves them on clone() and restores them when the child exits, through
+// this scratch buffer, so an interactive shell KEEPS its SIGINT handler across
+// running a command → Ctrl-C at the prompt aborts the input line, it doesn't kill
+// the shell. (A real OS keeps handlers per-process; only the exec'ing child resets.)
+static mut SIG_DUMP: [u64; 2 * NSIG] = [0; 2 * NSIG];
+
+/// Copy the current handler/flag tables into the scratch buffer; return its addr.
+pub unsafe fn signals_dump() -> u32 {
+    let mut i = 0;
+    while i < NSIG {
+        SIG_DUMP[i] = SIG_HANDLERS[i];
+        SIG_DUMP[NSIG + i] = SIG_FLAGS[i];
+        i += 1;
+    }
+    SIG_DUMP.as_ptr() as u32
+}
+
+/// Restore the handler/flag tables from the scratch buffer (written by the host).
+pub unsafe fn signals_load() {
+    let mut i = 0;
+    while i < NSIG {
+        SIG_HANDLERS[i] = SIG_DUMP[i];
+        SIG_FLAGS[i] = SIG_DUMP[NSIG + i];
+        i += 1;
+    }
+}
+
 /// Mark a signal pending on this VM (from ^C, kill, or the host).
 pub unsafe fn raise_signal(vm: &mut Vm, signum: u32) {
     if signum >= 1 && (signum as usize) <= NSIG {
@@ -313,7 +343,20 @@ unsafe fn ensure_trampoline(vm: &Vm) {
 /// signal. No-op while already inside a handler.
 pub unsafe fn deliver_signals(vm: &mut Vm) {
     if SIG_ACTIVE {
-        return;
+        // A handler that returns normally clears SIG_ACTIVE via the rt_sigreturn
+        // trampoline. But busybox ash's SIGINT handler (onsig) escapes through
+        // longjmp and never runs the trampoline — which would leave SIG_ACTIVE
+        // stuck true forever, blocking every later signal and (via io_retry's
+        // EINTR path) spinning the shell in a prompt-reprint storm. Detect the
+        // escape by the stack pointer: the guest SP (x[2]) always sits BELOW the
+        // pre-handler SP (SIG_SAVED_X[2]) while the handler frame is live, so once
+        // it has unwound to/above that level the frame is gone (longjmped out) and
+        // we can safely recover and deliver the next signal.
+        if vm.x[2] >= SIG_SAVED_X[2] {
+            SIG_ACTIVE = false;
+        } else {
+            return;
+        }
     }
     let deliverable = vm.sig_pending & !vm.sig_mask;
     if deliverable == 0 {
