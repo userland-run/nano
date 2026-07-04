@@ -88,6 +88,18 @@ fi
 echo ""
 
 # ============================================================
+# Phase 2b: Net bridge streaming unit tests (pure JS, no WASM needed)
+# ============================================================
+
+echo "--- Net Bridge Unit Tests ---"
+if node "$SCRIPT_DIR/test_net.mjs" 2>/dev/null; then
+    ok "Net bridge streaming unit tests"
+else
+    fail "Net bridge streaming unit tests"
+fi
+echo ""
+
+# ============================================================
 # Phase 3: ELF execution tests
 # ============================================================
 

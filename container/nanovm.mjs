@@ -67,6 +67,11 @@ const SYS_UTIMENSAT  = 88;
 const SYS_RENAMEAT2  = 276;
 const SYS_STATX      = 291;
 
+// Network bridge: responses whose Content-Length is at or below this stay on
+// the legacy fully-buffered path (exact old framing, byte-compatible); larger
+// or unsized responses stream incrementally and are terminated by EOF.
+const NET_BUFFER_MAX = 256 * 1024;
+
 // ============================================================
 // NanoVM class
 // ============================================================
@@ -1168,6 +1173,11 @@ class NanoVM {
           // Idle interactive prompt: sleep until keystrokes arrive (or a short
           // fallback) instead of busy-polling the tty ~50k times/sec.
           await this._parkStdin();
+        } else if (this._blockedOnNet) {
+          // Net read arrived before the next response chunk: sleep until the
+          // stream pump delivers data / EOF (or a short fallback), mirroring
+          // the stdin park above. The pending read is then re-attempted.
+          await this._parkNet();
         } else if (++yieldCounter % 200 === 0) {
           await new Promise(r => setTimeout(r, 0));
         }
@@ -1643,15 +1653,30 @@ class NanoVM {
     this._netDisabled = !!disabled;
   }
 
-  // Concatenate the accumulated request bytes, do the host fetch, buffer the
-  // HTTP-like response for the guest's reads.
+  /**
+   * Register an in-page LLM bridge. Requests to the internal origin
+   * `nanoinfer.internal` (any scheme/port) bypass fetch() and are handed to
+   * `handler({ method, url, headers, body })`, which returns (a Promise of)
+   * either a WHATWG `Response` or a plain
+   * `{ status, statusText, headers, body: Uint8Array|string|ReadableStream }`.
+   * A ReadableStream body flows through the same streaming path as network
+   * responses, so an in-page OpenAI facade can serve SSE token-by-token.
+   * Pass `null` to unregister.
+   */
+  setLlmBridge(handler) {
+    this._llmBridge = handler || null;
+  }
+
+  // Concatenate the accumulated request bytes, do the host fetch, and expose
+  // the HTTP-like response as an incremental chunk stream for the guest's
+  // reads. Resolves as soon as the response HEAD is available (the body may
+  // still be arriving via the background pump).
   async _netFetch() {
     const parts = this._netReq || []; this._netReq = [];
     let total = 0; for (const p of parts) total += p.length;
     const reqBytes = new Uint8Array(total); let o = 0;
     for (const p of parts) { reqBytes.set(p, o); o += p.length; }
-    this._netResp = await this._doNetFetch(reqBytes);
-    this._netRespPos = 0;
+    this._netStream = await this._doNetFetch(reqBytes);
   }
 
   async _doNetFetch(reqBytes) {
@@ -1666,41 +1691,180 @@ class NanoVM {
     const url = first[1];
     const headers = {};
     for (const l of lines) { const i = l.indexOf(":"); if (i > 0) headers[l.slice(0, i).trim()] = l.slice(i + 1).trim(); }
-    if (!url) return this._httpResp(400, "Bad Request", {}, "nano-net: missing URL");
-    const opts = { method, headers };
-    if (method !== "GET" && method !== "HEAD" && body) opts.body = body;
+    if (!url) return this._bufferedNetStream(this._httpResp(400, "Bad Request", {}, "nano-net: missing URL"));
     try {
+      // Internal origin: route to the in-page LLM bridge instead of fetch().
+      let host = "";
+      try { host = new URL(url).hostname; } catch { /* non-URL → let fetch fail */ }
+      if (host === "nanoinfer.internal") {
+        if (!this._llmBridge) {
+          return this._bufferedNetStream(this._httpResp(502, "Bad Gateway", {}, "nano-net: no LLM bridge registered"));
+        }
+        const r = await this._llmBridge({ method, url, headers, body });
+        return await this._llmResultToStream(r);
+      }
+      const opts = { method, headers };
+      if (method !== "GET" && method !== "HEAD" && body) opts.body = body;
       let resp;
       try {
         resp = await fetch(url, opts);
       } catch (e) {
-        // Direct fetch blocked (CORS/network) → retry via the Tier-1.5 proxy if set.
+        // Direct fetch blocked (CORS/network) → retry via the Tier-1.5 proxy if
+        // set. This only ever runs before the first response byte exists, so
+        // the retry can never interleave with streamed output.
         if (this._corsProxyUrl) {
           const u = this._corsProxyUrl + (this._corsProxyUrl.includes("?") ? "&" : "?") + "apiurl=" + encodeURIComponent(url);
           resp = await fetch(u, opts);
         } else throw e;
       }
-      const buf = new Uint8Array(await resp.arrayBuffer());
-      const hdrs = {}; resp.headers.forEach((v, k) => { hdrs[k] = v; });
-      return this._httpResp(resp.status, resp.statusText || "", hdrs, buf);
+      return await this._respToNetStream(resp);
     } catch (e) {
-      return this._httpResp(502, "Bad Gateway", {}, "nano-net: " + (e?.message || String(e)));
+      return this._bufferedNetStream(this._httpResp(502, "Bad Gateway", {}, "nano-net: " + (e?.message || String(e))));
     }
   }
 
-  // Copy the next chunk of the buffered response into the guest read buffer and
-  // complete the read (a0 = bytes copied; 0 = EOF). Resets status to OK.
+  // Turn a fetch()-style Response into a net stream. Small responses with a
+  // known Content-Length keep the legacy fully-buffered framing (byte-identical
+  // to the pre-streaming bridge); everything else streams and ends with EOF.
+  async _respToNetStream(resp) {
+    const hdrs = {}; resp.headers.forEach((v, k) => { hdrs[k] = v; });
+    const cl = parseInt(resp.headers.get("content-length") ?? "", 10);
+    if (!resp.body || (Number.isFinite(cl) && cl <= NET_BUFFER_MAX)) {
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      return this._bufferedNetStream(this._httpResp(resp.status, resp.statusText || "", hdrs, buf));
+    }
+    return this._pumpNetStream(resp.status, resp.statusText || "", hdrs, resp.body.getReader());
+  }
+
+  // Normalize a setLlmBridge() handler result into a net stream.
+  async _llmResultToStream(r) {
+    if (typeof Response !== "undefined" && r instanceof Response) return this._respToNetStream(r);
+    if (!r) return this._bufferedNetStream(this._httpResp(502, "Bad Gateway", {}, "nano-net: empty LLM bridge result"));
+    const status = r.status ?? 200;
+    const statusText = r.statusText ?? "";
+    const hdrs = {};
+    const rh = r.headers;
+    if (rh && typeof rh.forEach === "function" && typeof rh.get === "function") rh.forEach((v, k) => { hdrs[k] = v; });
+    else if (rh) Object.assign(hdrs, rh);
+    const b = r.body;
+    if (b && typeof b.getReader === "function") return this._pumpNetStream(status, statusText, hdrs, b.getReader());
+    const bytes = b == null ? new Uint8Array(0) : (typeof b === "string" ? new TextEncoder().encode(b) : b);
+    return this._bufferedNetStream(this._httpResp(status, statusText, hdrs, bytes));
+  }
+
+  // A net stream whose full framed response is already in memory (legacy path).
+  _bufferedNetStream(bytes) {
+    return { chunks: [bytes], pos: 0, ended: true, error: null, reader: null,
+             served: false, eofDelivered: false, waker: null };
+  }
+
+  // Emit the response head immediately (no content-length — the body length is
+  // unknown up-front; the guest reads until EOF), then pump body chunks from
+  // `reader` into the queue in the background, waking any parked guest read.
+  _pumpNetStream(status, statusText, headers, reader) {
+    const st = { chunks: [], pos: 0, ended: false, error: null, reader,
+                 served: false, eofDelivered: false, waker: null };
+    let head = `HTTP/1.1 ${status} ${statusText}\r\n`;
+    for (const [k, v] of Object.entries(headers)) {
+      const kl = k.toLowerCase();
+      // The streamed body is decoded/reframed by the host, so the origin's
+      // length/coding headers no longer describe it — drop them.
+      if (kl === "content-length" || kl === "transfer-encoding" || kl === "content-encoding") continue;
+      head += `${k}: ${v}\r\n`;
+    }
+    head += `\r\n`;
+    st.chunks.push(new TextEncoder().encode(head));
+    (async () => {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.length) {
+            st.chunks.push(value);
+            if (st.waker) st.waker();
+          }
+        }
+      } catch (e) {
+        st.error = e; // surfaced as EIO once the queued chunks are drained
+      }
+      st.ended = true;
+      if (st.waker) st.waker();
+    })();
+    return st;
+  }
+
+  // Copy the next chunk(s) of the response stream into the guest read buffer
+  // and complete the read (a0 = bytes copied; 0 = EOF; -EIO on a mid-stream
+  // reader error once queued data is drained). If the queue is empty but the
+  // stream is still open, leave the syscall FS_PENDING and park the run loop
+  // (mirrors the blocked-stdin park); the read is re-attempted on wake.
   _serveNetRead(bufPtr, bufLen) {
     const dv = new DataView(this._memory.buffer);
-    const resp = this._netResp || new Uint8Array(0);
-    const pos = this._netRespPos || 0;
-    const n = Math.min(bufLen, resp.length - pos);
-    if (n > 0) {
-      new Uint8Array(this._memory.buffer, this._ramPtr + bufPtr, n).set(resp.subarray(pos, pos + n));
-      this._netRespPos = pos + n;
+    const st = this._netStream;
+    if (!st || bufLen === 0) {
+      this._setA0(dv, 0);
+      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+      return;
     }
-    this._setA0(dv, n);
-    dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+    let copied = 0;
+    while (copied < bufLen && st.chunks.length) {
+      const c = st.chunks[0];
+      const n = Math.min(c.length - st.pos, bufLen - copied);
+      new Uint8Array(this._memory.buffer, this._ramPtr + bufPtr + copied, n).set(c.subarray(st.pos, st.pos + n));
+      st.pos += n; copied += n;
+      if (st.pos >= c.length) { st.chunks.shift(); st.pos = 0; }
+    }
+    if (copied > 0) {
+      st.served = true;
+      this._setA0(dv, copied);
+      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+      return;
+    }
+    if (st.error) {
+      st.eofDelivered = true;
+      this._setA0(dv, -5); // EIO
+      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+      return;
+    }
+    if (st.ended) {
+      st.eofDelivered = true;
+      this._setA0(dv, 0); // EOF
+      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+      return;
+    }
+    // Stream open, no data yet: park (status stays FS_PENDING; the run loop
+    // sleeps in _parkNet and then re-enters this read via _processFsRequest).
+    this._blockedOnNet = true;
+  }
+
+  // Guest closed the /dev/__net__ fd. If it read from this response, the cycle
+  // is over: cancel a still-open host stream (early close) and drop the stream
+  // so the next request starts clean. A close with served=false is the
+  // "printf > dev; cat dev" pattern — keep the response for the follow-up
+  // open+read.
+  _netOnClose() {
+    const st = this._netStream;
+    if (st && st.served) {
+      if (!st.ended && st.reader) { try { st.reader.cancel(); } catch { /* already errored/closed */ } }
+      st.ended = true;
+      if (st.waker) st.waker();
+      this._netStream = null;
+    }
+  }
+
+  /**
+   * Park the run loop while a guest net read waits for the next response
+   * chunk: resolve as soon as the stream pump delivers data / EOF / an error,
+   * otherwise re-check after a short fallback. Mirror of {@link _parkStdin}.
+   */
+  _parkNet() {
+    const st = this._netStream;
+    if (!st || st.chunks.length || st.ended) return Promise.resolve();
+    return new Promise((resolve) => {
+      const wake = () => { st.waker = null; clearTimeout(timer); resolve(); };
+      const timer = setTimeout(wake, 50);
+      st.waker = wake;
+    });
   }
 
   // Frame a host response as HTTP/1.1 (status line + headers + body) for the guest.
@@ -1718,6 +1882,7 @@ class NanoVM {
   _processFsRequest() {
     const X = this._exports;
     this._blockedOnStdin = false; // set true below when a stdin read parks (idle prompt)
+    this._blockedOnNet = false;   // set true below when a net read parks awaiting a stream chunk
     const reqPtr = X.vm_fs_request_ptr(this._vmPtr);
     const dv = new DataView(this._memory.buffer);
     const ramPtr = this._ramPtr;
@@ -1811,6 +1976,9 @@ class NanoVM {
     // response; the actual host fetch runs in the (async) run loop after close.
     if (syscallNr === SYS_OPENAT && path === "/dev/__net__") {
       if (this._netDisabled) { this._setA0(dv, -13); dv.setInt32(this._vmPtr + 528, STATUS_OK, true); return; } // EACCES
+      // A fully-consumed previous response (guest saw EOF/EIO) is stale — drop
+      // it so this open can start a fresh request/response cycle.
+      if (this._netStream && this._netStream.eofDelivered) this._netStream = null;
       const newGfd = this._fdAlloc(dv);
       if (newGfd >= 0) this._fdWrite(dv, newGfd, FD_TYPE_FILE, -98, 0, 0);
       this._setA0(dv, newGfd >= 0 ? newGfd : -28);
@@ -1850,7 +2018,7 @@ class NanoVM {
         }
       }
       // Network sentinel fd (host_fd === -98): accumulate the request on write,
-      // serve the buffered response on read; close after a write triggers fetch.
+      // serve the streamed response on read; close after a write triggers fetch.
       if (fe.host_fd === -98) {
         if (syscallNr === SYS_WRITE) {
           const count = bufLen || arg1;
@@ -1863,7 +2031,7 @@ class NanoVM {
         if (syscallNr === SYS_READ) {
           // First read after a written request (single-fd RDWR shim): fetch first,
           // then serve — the run loop awaits and calls _serveNetRead.
-          if (this._netReq && this._netReq.length && !this._netResp) {
+          if (this._netReq && this._netReq.length && !this._netStream) {
             this._asyncNet = { read: true, bufPtr, bufLen };
             return; // leave FS_PENDING; the run loop completes this read
           }
@@ -1881,9 +2049,10 @@ class NanoVM {
         }
         if (syscallNr === SYS_CLOSE) {
           this._fdClear(dv, gfd);
+          this._netOnClose();
           // A request written then closed without reading (printf>; cat pattern):
           // fetch now so the next open+read serves it.
-          if (this._netReq && this._netReq.length && !this._netResp) this._asyncNet = { read: false };
+          if (this._netReq && this._netReq.length && !this._netStream) this._asyncNet = { read: false };
           this._setA0(dv, 0);
           dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
           return;
