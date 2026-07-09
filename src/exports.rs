@@ -540,3 +540,15 @@ pub unsafe extern "C" fn vm_signals_dump() -> u32 {
 pub unsafe extern "C" fn vm_signals_load() {
     crate::syscall::signals_load();
 }
+
+/// Address + byte size of the in-memory socket table. The host copies these bytes
+/// into snapshot() and writes them back in restoreAndRun() (after the restore
+/// reset) so a warm-restored server keeps its listening/connected sockets.
+#[no_mangle]
+pub unsafe extern "C" fn vm_sockets_ptr() -> u32 {
+    crate::syscall::sockets_ptr()
+}
+#[no_mangle]
+pub unsafe extern "C" fn vm_sockets_size() -> u32 {
+    crate::syscall::sockets_bytes()
+}

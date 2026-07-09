@@ -169,6 +169,20 @@ const EMPTY_SOCKET: SocketSlot = SocketSlot {
 
 static mut SOCKETS: [SocketSlot; MAX_SOCKETS] = [EMPTY_SOCKET; MAX_SOCKETS];
 
+/// Address + byte size of the SOCKETS table, so the host can persist the
+/// in-memory socket state (listening sockets, accept queues, recv rings) across
+/// snapshot()/restoreAndRun(). SocketSlot is pure value state (no host handles /
+/// pointers), so a raw byte copy round-trips it. reset_statics() zeroes SOCKETS,
+/// so the host must write these bytes back AFTER vm_snapshot_restore_reset() —
+/// otherwise a warm-restored server (e.g. `opencode serve`) loses the sockets it
+/// bound before the snapshot and its event loop watches dead fds.
+pub unsafe fn sockets_ptr() -> u32 {
+    core::ptr::addr_of!(SOCKETS) as u32
+}
+pub unsafe fn sockets_bytes() -> u32 {
+    (MAX_SOCKETS * core::mem::size_of::<SocketSlot>()) as u32
+}
+
 // ============================================================
 // Epoll interest list (tracks registered FD watches)
 // ============================================================

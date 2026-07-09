@@ -920,7 +920,16 @@ class NanoVM {
     // Serialize MemFS
     const memfs = this._memfs.serialize();
 
-    return { vmStruct, lowRAM, lowEnd, stackRAM, stackStart, memfs };
+    // Capture the in-memory socket table (listening/connected sockets, accept
+    // queues, recv rings). restoreAndRun()'s reset zeroes it, so without this a
+    // warm-restored server (e.g. `opencode serve`) loses the sockets it bound
+    // before the snapshot and its event loop watches dead fds.
+    const X = this._exports;
+    const sockets = X.vm_sockets_ptr
+      ? new Uint8Array(this._memory.buffer, X.vm_sockets_ptr(), X.vm_sockets_size()).slice()
+      : null;
+
+    return { vmStruct, lowRAM, lowEnd, stackRAM, stackStart, memfs, sockets };
   }
 
   /**
@@ -950,6 +959,12 @@ class NanoVM {
       // Fallback: reset separately
       if (X.vm_reset_blocks) X.vm_reset_blocks();
       if (X.vm_reset_statics) X.vm_reset_statics();
+    }
+
+    // 1b. Restore the socket table AFTER the reset zeroed it, so a warm-restored
+    // server keeps its bound listening/connected sockets.
+    if (snap.sockets && X.vm_sockets_ptr) {
+      mem.set(snap.sockets, X.vm_sockets_ptr());
     }
 
     // 2. Restore VM struct
