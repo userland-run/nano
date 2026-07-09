@@ -2525,4 +2525,72 @@ class VirtualServer {
   }
 }
 
-export { NanoVM, MemFS };
+// ============================================================
+// Snapshot ↔ bytes — serialize a snapshot() to one portable Uint8Array (and
+// back) so it can be gzipped, shipped in a recipe, and restored on a fresh VM.
+// Format v1: "NSN1" | u32 metaLen | meta(JSON) | vmStruct|lowRAM|stackRAM|
+// sockets|evloop|blocks | memfs-node-data-blobs (in node order). The big regions
+// are already Uint8Arrays; the 1.3GB RAM is mostly zero pages → ~170MB gzipped.
+// ============================================================
+const _SNAP_MAGIC = [0x4e, 0x53, 0x4e, 0x31]; // "NSN1"
+
+function serializeSnapshot(snap) {
+  const emptyU8 = new Uint8Array(0);
+  const regions = [snap.vmStruct, snap.lowRAM, snap.stackRAM, snap.sockets || emptyU8, snap.evloop || emptyU8, snap.blocks || emptyU8];
+  const meta = {
+    v: 1,
+    lowEnd: snap.lowEnd,
+    stackStart: snap.stackStart,
+    regions: {
+      vmStruct: snap.vmStruct.length,
+      lowRAM: snap.lowRAM.length,
+      stackRAM: snap.stackRAM.length,
+      sockets: snap.sockets ? snap.sockets.length : 0,
+      evloop: snap.evloop ? snap.evloop.length : 0,
+      blocks: snap.blocks ? snap.blocks.length : 0,
+    },
+    memfs: snap.memfs.map((n) => ({
+      id: n.id, parentId: n.parentId, name: n.name, mode: n.mode, nlink: n.nlink, size: n.size,
+      dataLen: n.data ? n.data.length : -1,
+      target: n.target === undefined ? null : n.target,
+    })),
+  };
+  const metaBytes = new TextEncoder().encode(JSON.stringify(meta));
+  let total = 8 + metaBytes.length;
+  for (const r of regions) total += r.length;
+  for (const n of snap.memfs) if (n.data) total += n.data.length;
+  const out = new Uint8Array(total);
+  out.set(_SNAP_MAGIC, 0);
+  new DataView(out.buffer).setUint32(4, metaBytes.length, true);
+  out.set(metaBytes, 8);
+  let o = 8 + metaBytes.length;
+  for (const r of regions) { out.set(r, o); o += r.length; }
+  for (const n of snap.memfs) if (n.data) { out.set(n.data, o); o += n.data.length; }
+  return out;
+}
+
+function deserializeSnapshot(bytes) {
+  if (bytes[0] !== 0x4e || bytes[1] !== 0x53 || bytes[2] !== 0x4e || bytes[3] !== 0x31) {
+    throw new Error("deserializeSnapshot: bad magic");
+  }
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const metaLen = dv.getUint32(4, true);
+  const meta = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + metaLen)));
+  let o = 8 + metaLen;
+  const take = (len) => { const s = bytes.subarray(o, o + len).slice(); o += len; return s; };
+  const vmStruct = take(meta.regions.vmStruct);
+  const lowRAM = take(meta.regions.lowRAM);
+  const stackRAM = take(meta.regions.stackRAM);
+  const sockets = meta.regions.sockets ? take(meta.regions.sockets) : null;
+  const evloop = meta.regions.evloop ? take(meta.regions.evloop) : null;
+  const blocks = meta.regions.blocks ? take(meta.regions.blocks) : null;
+  const memfs = meta.memfs.map((n) => {
+    const node = { id: n.id, parentId: n.parentId, name: n.name, mode: n.mode, nlink: n.nlink, size: n.size };
+    if (n.dataLen >= 0) node.data = take(n.dataLen);
+    if (n.target !== null) node.target = n.target;
+    return node;
+  });
+  return { vmStruct, lowRAM, lowEnd: meta.lowEnd, stackRAM, stackStart: meta.stackStart, memfs, sockets, evloop, blocks };
+}
+
+export { NanoVM, MemFS, serializeSnapshot, deserializeSnapshot };
