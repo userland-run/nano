@@ -467,6 +467,67 @@ unsafe fn sys_rt_sigreturn(vm: &mut Vm) -> i64 {
     vm.x[10] as i64
 }
 
+// Event-loop syscall statics that reset_statics() clears but a warm snapshot
+// must preserve (paired with the SOCKETS ptr/size restore): the epoll interest
+// list + count, eventfd counters + alloc, timerfd expiries/intervals + alloc,
+// and the finite-timeout latch. Serialized into a scratch buffer for the host,
+// mirroring signals_dump(). Without these, a warm-restored server's libuv loop
+// watches an empty epoll set and never wakes. Layout: EPOLL_ENTRIES |
+// EVENTFD_COUNTERS | TIMERFD_EXPIRY | TIMERFD_INTERVAL | 4 u64 counters.
+const EVLOOP_DUMP_SIZE: usize = MAX_EPOLL_ENTRIES * core::mem::size_of::<EpollEntry>()
+    + MAX_EVENTFDS * 4
+    + MAX_TIMERFDS * 8
+    + MAX_TIMERFDS * 8
+    + 4 * 8;
+static mut EVLOOP_DUMP: [u8; EVLOOP_DUMP_SIZE] = [0; EVLOOP_DUMP_SIZE];
+
+pub unsafe fn evloop_size() -> u32 {
+    EVLOOP_DUMP_SIZE as u32
+}
+
+/// Copy the event-loop statics into the scratch buffer; return its address.
+pub unsafe fn evloop_dump() -> u32 {
+    let dst = core::ptr::addr_of_mut!(EVLOOP_DUMP) as *mut u8;
+    let mut o = 0usize;
+    let n_ep = MAX_EPOLL_ENTRIES * core::mem::size_of::<EpollEntry>();
+    core::ptr::copy_nonoverlapping(core::ptr::addr_of!(EPOLL_ENTRIES) as *const u8, dst.add(o), n_ep);
+    o += n_ep;
+    let n_ev = MAX_EVENTFDS * 4;
+    core::ptr::copy_nonoverlapping(core::ptr::addr_of!(EVENTFD_COUNTERS) as *const u8, dst.add(o), n_ev);
+    o += n_ev;
+    let n_tf = MAX_TIMERFDS * 8;
+    core::ptr::copy_nonoverlapping(core::ptr::addr_of!(TIMERFD_EXPIRY_MS) as *const u8, dst.add(o), n_tf);
+    o += n_tf;
+    core::ptr::copy_nonoverlapping(core::ptr::addr_of!(TIMERFD_INTERVAL_MS) as *const u8, dst.add(o), n_tf);
+    o += n_tf;
+    let c = [EPOLL_COUNT as u64, EVENTFD_ALLOC as u64, TIMERFD_ALLOC as u64, EPOLL_FINITE_TIMEOUT_ACTIVE as u64];
+    core::ptr::copy_nonoverlapping(c.as_ptr() as *const u8, dst.add(o), 4 * 8);
+    dst as u32
+}
+
+/// Restore the event-loop statics from the scratch buffer (host wrote it back).
+pub unsafe fn evloop_load() {
+    let src = core::ptr::addr_of!(EVLOOP_DUMP) as *const u8;
+    let mut o = 0usize;
+    let n_ep = MAX_EPOLL_ENTRIES * core::mem::size_of::<EpollEntry>();
+    core::ptr::copy_nonoverlapping(src.add(o), core::ptr::addr_of_mut!(EPOLL_ENTRIES) as *mut u8, n_ep);
+    o += n_ep;
+    let n_ev = MAX_EVENTFDS * 4;
+    core::ptr::copy_nonoverlapping(src.add(o), core::ptr::addr_of_mut!(EVENTFD_COUNTERS) as *mut u8, n_ev);
+    o += n_ev;
+    let n_tf = MAX_TIMERFDS * 8;
+    core::ptr::copy_nonoverlapping(src.add(o), core::ptr::addr_of_mut!(TIMERFD_EXPIRY_MS) as *mut u8, n_tf);
+    o += n_tf;
+    core::ptr::copy_nonoverlapping(src.add(o), core::ptr::addr_of_mut!(TIMERFD_INTERVAL_MS) as *mut u8, n_tf);
+    o += n_tf;
+    let mut c = [0u64; 4];
+    core::ptr::copy_nonoverlapping(src.add(o), c.as_mut_ptr() as *mut u8, 4 * 8);
+    EPOLL_COUNT = c[0] as usize;
+    EVENTFD_ALLOC = c[1] as usize;
+    TIMERFD_ALLOC = c[2] as usize;
+    EPOLL_FINITE_TIMEOUT_ACTIVE = c[3] != 0;
+}
+
 /// Reset all static mut globals to their initial state.
 /// Must be called before each new program execution to avoid stale state.
 pub unsafe fn reset_statics() {

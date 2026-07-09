@@ -928,8 +928,14 @@ class NanoVM {
     const sockets = X.vm_sockets_ptr
       ? new Uint8Array(this._memory.buffer, X.vm_sockets_ptr(), X.vm_sockets_size()).slice()
       : null;
+    // Event-loop statics (epoll interest list, eventfd/timerfd tables + counters)
+    // are also zeroed by the restore reset — a warm server needs them so its
+    // libuv loop keeps watching its fds. dump() copies them into a scratch buffer.
+    const evloop = X.vm_evloop_dump
+      ? new Uint8Array(this._memory.buffer, X.vm_evloop_dump(), X.vm_evloop_size()).slice()
+      : null;
 
-    return { vmStruct, lowRAM, lowEnd, stackRAM, stackStart, memfs, sockets };
+    return { vmStruct, lowRAM, lowEnd, stackRAM, stackStart, memfs, sockets, evloop };
   }
 
   /**
@@ -961,10 +967,17 @@ class NanoVM {
       if (X.vm_reset_statics) X.vm_reset_statics();
     }
 
-    // 1b. Restore the socket table AFTER the reset zeroed it, so a warm-restored
-    // server keeps its bound listening/connected sockets.
+    // 1b. Restore the socket table + event-loop statics AFTER the reset zeroed
+    // them, so a warm-restored server keeps its bound sockets AND its libuv loop
+    // keeps watching them (epoll interest list / eventfd / timerfd). vm_evloop_dump
+    // returns the (stable) scratch address; we overwrite it with the saved bytes
+    // and load() copies them back into the statics.
     if (snap.sockets && X.vm_sockets_ptr) {
       mem.set(snap.sockets, X.vm_sockets_ptr());
+    }
+    if (snap.evloop && X.vm_evloop_dump) {
+      mem.set(snap.evloop, X.vm_evloop_dump());
+      X.vm_evloop_load();
     }
 
     // 2. Restore VM struct

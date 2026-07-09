@@ -552,3 +552,21 @@ pub unsafe extern "C" fn vm_sockets_ptr() -> u32 {
 pub unsafe extern "C" fn vm_sockets_size() -> u32 {
     crate::syscall::sockets_bytes()
 }
+
+/// Event-loop statics (epoll interest list, eventfd/timerfd tables + counters)
+/// that reset_statics() clears. dump copies them into a scratch buffer and
+/// returns its address; the host reads it into snapshot() and writes it back
+/// before load() in restoreAndRun() — so a warm-restored server's libuv loop
+/// keeps its fd watches. Paired with vm_sockets_ptr/size.
+#[no_mangle]
+pub unsafe extern "C" fn vm_evloop_size() -> u32 {
+    crate::syscall::evloop_size()
+}
+#[no_mangle]
+pub unsafe extern "C" fn vm_evloop_dump() -> u32 {
+    crate::syscall::evloop_dump()
+}
+#[no_mangle]
+pub unsafe extern "C" fn vm_evloop_load() {
+    crate::syscall::evloop_load();
+}
