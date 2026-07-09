@@ -83,6 +83,14 @@ pub unsafe extern "C" fn vm_thread_step(vm_ptr: u32, budget: i32) -> i32 {
     vm_step(vm_ptr, budget)
 }
 
+/// The epoll_pwait timeout (ms; -1 = infinite) of the wait that yielded the
+/// current STATUS_EPOLL_BLOCKED. The host reads this to park an idle listening
+/// server for the right duration instead of busy-polling the event loop.
+#[no_mangle]
+pub unsafe extern "C" fn vm_epoll_timeout_ms() -> i32 {
+    crate::syscall::epoll_blocked_timeout_ms()
+}
+
 /// Load an ELF binary from guest memory
 #[no_mangle]
 pub unsafe extern "C" fn vm_load_elf(vm_ptr: u32, elf_offset: u32, elf_size: u32) -> i32 {

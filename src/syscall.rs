@@ -223,6 +223,18 @@ static mut TIMERFD_ALLOC: usize = 0;
 /// to advance.
 static mut EPOLL_FINITE_TIMEOUT_ACTIVE: bool = false;
 
+/// The epoll_pwait timeout (ms, -1 = infinite) of the wait that most recently
+/// yielded STATUS_EPOLL_BLOCKED. The host reads this via vm_epoll_timeout_ms()
+/// to park an idle listening server for exactly that long (waking early on an
+/// injected connection) instead of busy re-entering the event loop every
+/// macrotask — which pinned the tab at 100% for `opencode serve`.
+static mut EPOLL_BLOCKED_TIMEOUT_MS: i32 = 0;
+
+/// Timeout (ms; -1 = infinite) the last STATUS_EPOLL_BLOCKED wait asked for.
+pub unsafe fn epoll_blocked_timeout_ms() -> i32 {
+    EPOLL_BLOCKED_TIMEOUT_MS
+}
+
 // ioctl constants
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
@@ -453,6 +465,7 @@ pub unsafe fn reset_statics() {
     TIMERFD_INTERVAL_MS = [0.0; MAX_TIMERFDS];
     TIMERFD_ALLOC = 0;
     EPOLL_FINITE_TIMEOUT_ACTIVE = false;
+    EPOLL_BLOCKED_TIMEOUT_MS = 0;
     MMAP_FREE_COUNT = 0; // free-list isn't part of the snapshot image
     crate::tty::reset();
     signals_reset();
@@ -2552,6 +2565,9 @@ unsafe fn sys_epoll_pwait(
         // We do NOT yield for timeout == -1 without a listening socket, as that
         // would slow down V8 init where worker threads block with infinite waits.
         if has_listening_socket() || timeout > 0 {
+            // Hand the requested timeout to the host so it can park for the right
+            // duration (libuv's next-timer deadline) rather than spin-polling.
+            EPOLL_BLOCKED_TIMEOUT_MS = timeout;
             vm.status = STATUS_EPOLL_BLOCKED;
             return 0; // host will set a0 to -EINTR before resuming
         }

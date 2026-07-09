@@ -43,6 +43,14 @@ const STATUS_FS_PENDING     = 6;
 const STATUS_EPOLL_BLOCKED  = 7;
 const STATUS_RUNNING        = 18;
 
+// Safety heartbeat (ms) for parking an idle listening server whose epoll_pwait
+// asked for an INFINITE wait (no near libuv timer). We wake instantly on an
+// injected connection (see injectConnection); this bound is only a backstop so
+// GC / missed wakes still get a turn. Finite waits honor the guest's own
+// timeout instead. Small enough to feel responsive, large enough to keep an
+// otherwise-idle `serve` near 0% CPU.
+const SERVER_IDLE_HEARTBEAT_MS = 1000;
+
 // Syscall numbers (RISC-V Linux)
 const SYS_GETCWD     = 17;
 const SYS_CLONE      = 220;
@@ -207,6 +215,8 @@ class NanoVM {
     // Virtual server — bridges SW HTTP requests into VM sockets
     this._pendingConnections = []; // { connId, resolve, responseChunks }
     this._virtualServer = new VirtualServer(this);
+    this._serverWake = null;         // resolver for a run loop parked on an idle server
+    this._serverWakePending = false; // a connection arrived while not parked → don't sleep next time
 
     // Pre-warm WASM JIT: run a trivial busybox command so the browser's
     // optimizing compiler (TurboFan) starts compiling exec() in the background.
@@ -596,6 +606,7 @@ class NanoVM {
     }
     this._stdinEof = false; // new input cancels a prior EOF
     if (this._stdinWake) this._stdinWake(); // wake a run loop parked on idle stdin
+    if (this._serverWake) this._serverWake(); // …or one parked on an idle server
   }
 
   /**
@@ -774,6 +785,8 @@ class NanoVM {
     this._nodeElf = null;
     this._pendingConnections = [];
     this._virtualServer = null;
+    this._serverWake = null;
+    this._serverWakePending = false;
   }
 
   // ============================================================
@@ -1205,7 +1218,18 @@ class NanoVM {
       if (status === STATUS_EPOLL_BLOCKED) {
         serverMode = true;
         this._serverMode = true; // a guest server is listening (footer indicator)
-        await this._adaptiveYield(X);
+        this._pollConnections();
+        // Truly park the run loop until a connection is injected, the guest's
+        // epoll_pwait timeout (libuv's next-timer deadline) elapses, or stdin
+        // arrives — instead of re-entering the event loop every macrotask. The
+        // old _adaptiveYield poll pinned an idle `opencode serve` (and any HTTP
+        // server) at 100% CPU: its per-loop libuv work keeps advancing the PC, so
+        // the "idle" heuristic never triggered and it used the unthrottled
+        // MessageChannel yield. vm_epoll_timeout_ms() is the guest's requested
+        // timeout in ms (-1 = infinite); fall back to the idle heartbeat on older
+        // wasm without the export.
+        const timeoutMs = X.vm_epoll_timeout_ms ? X.vm_epoll_timeout_ms() : -1;
+        await this._parkServer(timeoutMs);
         this._pollConnections();
         const dv = new DataView(this._memory.buffer);
         dv.setBigInt64(this._vmPtr + 80, BigInt(-4), true); // a0 = -EINTR
@@ -1885,6 +1909,33 @@ class NanoVM {
     });
   }
 
+  /**
+   * Park the run loop while a guest server sits in epoll_pwait with nothing
+   * ready. Resolves as soon as {@link VirtualServer#injectConnection} delivers a
+   * connection (or writeStdin supplies input), otherwise after the guest's own
+   * epoll timeout — libuv's next-timer deadline — so timers still fire on time.
+   * `timeoutMs < 0` means the guest asked for an infinite wait (idle listening
+   * server, no near timer); we back that with a heartbeat and rely on the
+   * connection wake for real responsiveness. Replaces the _adaptiveYield poll
+   * that busy-re-entered the event loop and pinned an idle server at 100% CPU.
+   * Mirror of {@link _parkStdin} / {@link _parkNet}.
+   * @param {number} timeoutMs
+   */
+  _parkServer(timeoutMs) {
+    // A connection is already queued (or arrived while we weren't parked) →
+    // re-enter the guest immediately so it can accept it.
+    if (this._pendingConnections.length > 0 || this._serverWakePending) {
+      this._serverWakePending = false;
+      return Promise.resolve();
+    }
+    const ms = timeoutMs < 0 ? SERVER_IDLE_HEARTBEAT_MS : Math.max(1, timeoutMs);
+    return new Promise((resolve) => {
+      const wake = () => { this._serverWake = null; clearTimeout(timer); resolve(); };
+      const timer = setTimeout(wake, ms);
+      this._serverWake = wake;
+    });
+  }
+
   // Frame a host response as HTTP/1.1 (status line + headers + body) for the guest.
   _httpResp(status, statusText, headers, body) {
     const bodyBytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
@@ -2350,6 +2401,11 @@ class VirtualServer {
         resolve,
         responseChunks: [],
       });
+      // Wake a run loop parked on an idle server so it accepts this connection
+      // now instead of after the heartbeat. If it isn't parked yet, latch the
+      // wake so the next _parkServer() returns immediately.
+      vm._serverWakePending = true;
+      if (vm._serverWake) vm._serverWake();
     });
   }
 }
