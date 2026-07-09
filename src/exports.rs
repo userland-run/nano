@@ -570,3 +570,16 @@ pub unsafe extern "C" fn vm_evloop_dump() -> u32 {
 pub unsafe extern "C" fn vm_evloop_load() {
     crate::syscall::evloop_load();
 }
+
+/// Address + byte size of the decoded-block cache. The host snapshots it with
+/// guest RAM and writes it back after the restore reset, so a warm-restored VM
+/// keeps its warm blocks instead of re-decoding everything cold (the dominant
+/// cost of a serve warm-restore).
+#[no_mangle]
+pub unsafe extern "C" fn vm_blocks_ptr() -> u32 {
+    crate::cpu::blocks_ptr()
+}
+#[no_mangle]
+pub unsafe extern "C" fn vm_blocks_size() -> u32 {
+    crate::cpu::blocks_bytes()
+}
