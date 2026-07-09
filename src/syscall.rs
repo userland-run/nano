@@ -1694,7 +1694,18 @@ unsafe fn set_futex_addr(vm: &mut Vm, slot: usize, addr: u64) {
 }
 
 /// Find a runnable thread slot (not the current one). Returns slot or -1.
-unsafe fn find_runnable(vm: &Vm, exclude: usize) -> i32 {
+/// Find a thread to switch to. The first two passes return a thread that will
+/// make real progress (RUNNABLE, or an EPOLL_WAIT thread whose fds are ready).
+///
+/// `allow_idle_epoll` controls the third pass, which returns an EPOLL_WAIT thread
+/// that has *no* ready events. That is a spin hazard: node's event loop runs on
+/// two idle EPOLL_WAIT threads, and letting one eventless epoll_pwait switch to
+/// the other just ping-pongs between them at 100% CPU, never yielding to the
+/// host. So `sys_epoll_pwait` passes `false` — an eventless wait with no
+/// progressable peer yields STATUS_EPOLL_BLOCKED to the host instead. `sys_futex`
+/// passes `true` (a blocked futex has genuinely nowhere else to go; the epoll
+/// thread it wakes will itself park via the fixed epoll path).
+unsafe fn find_runnable(vm: &Vm, exclude: usize, allow_idle_epoll: bool) -> i32 {
     let n = vm.thread_count as usize;
     // First pass: prefer RUNNABLE threads
     let mut i = 0;
@@ -1714,11 +1725,8 @@ unsafe fn find_runnable(vm: &Vm, exclude: usize) -> i32 {
         }
         i += 1;
     }
-    // Third pass: pick any EPOLL_WAIT thread if there's a listening socket
-    // or an active timer wait. This wakes the event loop thread so it can
-    // yield to the host for real time to advance (timers) or to accept
-    // incoming connections (servers).
-    if has_listening_socket() || EPOLL_FINITE_TIMEOUT_ACTIVE {
+    // Third pass (opt-in): any EPOLL_WAIT thread even without ready events.
+    if allow_idle_epoll && (has_listening_socket() || EPOLL_FINITE_TIMEOUT_ACTIVE) {
         i = 0;
         while i < n && i < MAX_THREADS {
             if i != exclude && get_tstate(vm, i) == TSTATE_EPOLL_WAIT {
@@ -1829,7 +1837,7 @@ unsafe fn sys_futex(
             }
 
             // Would block. Try to switch to another runnable thread.
-            let target = find_runnable(vm, current_slot);
+            let target = find_runnable(vm, current_slot, true);
             if target >= 0 {
                 let target = target as usize;
 
@@ -2529,7 +2537,10 @@ unsafe fn sys_epoll_pwait(
     // No events found — context-switch to let other threads run.
     if timeout != 0 {
         let current_slot = vm._tid_extra as usize;
-        let target = find_runnable(vm, current_slot);
+        // Only switch to a thread that can make progress (RUNNABLE or an
+        // epoll thread with ready events) — NOT another eventless epoll thread
+        // (that just ping-pongs node's two idle event-loop threads at 100% CPU).
+        let target = find_runnable(vm, current_slot, false);
         if target >= 0 {
             let target = target as usize;
             log_switch(current_slot, target, 2); // 2=epoll_wait
@@ -2558,20 +2569,16 @@ unsafe fn sys_epoll_pwait(
             vm._tid_extra = target as i32;
             return vm.x[10] as i64;
         }
-        // No other thread to switch to — all threads are deadlocked.
-        // Yield to the host when:
-        // - there's a listening socket (server waiting for connections), OR
-        // - timeout > 0 (finite wait, e.g. libuv timer — real time must advance)
-        // We do NOT yield for timeout == -1 without a listening socket, as that
-        // would slow down V8 init where worker threads block with infinite waits.
-        if has_listening_socket() || timeout > 0 {
-            // Hand the requested timeout to the host so it can park for the right
-            // duration (libuv's next-timer deadline) rather than spin-polling.
-            EPOLL_BLOCKED_TIMEOUT_MS = timeout;
-            vm.status = STATUS_EPOLL_BLOCKED;
-            return 0; // host will set a0 to -EINTR before resuming
-        }
-        // No listening socket and infinite timeout: return 0 (timeout expired).
+        // No thread can make progress: the whole VM is idle (every other thread
+        // is futex-wait or eventless epoll-wait). Yield to the host so it parks
+        // and real time advances (libuv timers) or a connection / stdin can wake
+        // us. Park for ANY timeout, infinite included — spinning while everything
+        // is blocked achieves nothing, and gating on this whole-VM-idle condition
+        // is what avoids stalling V8 init: during init some thread is RUNNABLE, so
+        // find_runnable returns it above and we switch instead of parking.
+        EPOLL_BLOCKED_TIMEOUT_MS = timeout;
+        vm.status = STATUS_EPOLL_BLOCKED;
+        return 0; // host will set a0 to -EINTR before resuming
     }
     0 // Return 0 events
 }
