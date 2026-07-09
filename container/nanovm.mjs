@@ -1077,6 +1077,66 @@ class NanoVM {
   }
 
   /**
+   * Snapshot a long-running server WHEN IT IS READY, not at a guest sentinel.
+   * Starts the ELF, then drives a host-side readiness probe (injectConnection of
+   * `readyRequest` on `readyPort`) until it returns HTTP `readyStatus`. The probe
+   * also warms the request path, so capturing at that point yields a snapshot that
+   * restores to an immediately-serviceable server (routes registered + handler +
+   * block cache warm) — the fast-restore recipe. Use this for servers whose
+   * readiness can't be reported from a guest launcher (the guest can't loopback to
+   * its own listening socket the way the host injectConnection can).
+   * @param {object} opts - elf|elfPath, argv, env, maxSteps, readyPort,
+   *   readyRequest (raw HTTP), readyStatus=200, readyTimeoutMs=180000.
+   * @returns {Promise<object>} snapshot for restoreAndRun().
+   */
+  async snapshotAppReady(opts = {}) {
+    const { elf, elfPath, argv, env = [], maxSteps = 80_000_000_000,
+      readyPort, readyRequest, readyStatus = 200, readyTimeoutMs = 180_000 } = opts;
+    const appElf = elf || (elfPath ? this._readElfFromVfs(elfPath) : null);
+    if (!appElf) throw new Error(`snapshotAppReady: no ELF (${elfPath || "pass elf or elfPath"})`);
+    if (!argv || !argv.length) throw new Error("snapshotAppReady: argv required");
+    if (!readyPort || !readyRequest) throw new Error("snapshotAppReady: readyPort + readyRequest required");
+
+    this._stdout = "";
+    this._onStdout = null;
+    this._resetProcessState();
+    this._resetVM();
+    const mem = new Uint8Array(this._memory.buffer);
+    mem.set(appElf, this._ramPtr);
+    const X = this._exports;
+    if (X.vm_load_elf(this._vmPtr, 0, appElf.length) !== 0) throw new Error("vm_load_elf failed");
+    this._setupArgv(argv, env);
+
+    // Start the app; the run loop pumps while we probe readiness from the host.
+    let done = false;
+    void this._runLoop(maxSteps).then(() => { done = true; }).catch(() => { done = true; });
+    const t0 = Date.now();
+    while (Date.now() - t0 < readyTimeoutMs && !done) {
+      await new Promise((r) => setTimeout(r, 200));
+      let status = 0;
+      try {
+        const bytes = await Promise.race([
+          this._virtualServer.injectConnection(readyPort, readyRequest),
+          new Promise((r) => setTimeout(() => r(null), 1500)),
+        ]);
+        if (bytes) {
+          const txt = typeof bytes === "string" ? bytes : new TextDecoder().decode(Uint8Array.from(Object.values(bytes)));
+          status = parseInt((txt.match(/HTTP\/1\.1 (\d+)/) || [])[1] || "0", 10);
+        }
+      } catch { /* server not up yet */ }
+      if (status === readyStatus) {
+        // Ready + warm. Let the loop settle to idle, then capture.
+        await new Promise((r) => setTimeout(r, 300));
+        const snap = this.snapshot();
+        this.cancelRun();
+        return snap;
+      }
+    }
+    this.cancelRun();
+    throw new Error(`snapshotAppReady: not ready on :${readyPort} within ${readyTimeoutMs}ms`);
+  }
+
+  /**
    * Node-specific convenience over {@link snapshotApp}. Prefer driving snapshotApp
    * from an app recipe (the node specifics below live in the catalog node recipe);
    * kept for backward compatibility.
