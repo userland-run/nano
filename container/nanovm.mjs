@@ -67,7 +67,9 @@ const SYS_READ       = 63;
 const SYS_WRITE      = 64;
 const SYS_PPOLL      = 73;
 const SYS_PREAD64    = 67;
+const SYS_PWRITE64   = 68;
 const SYS_PREADV     = 69;
+const SYS_PWRITEV    = 70;
 const SYS_READLINKAT = 78;
 const SYS_NEWFSTATAT = 79;
 const SYS_FSTAT      = 80;
@@ -2233,6 +2235,23 @@ class NanoVM {
         const bufPhys = ramPtr + bufPtr;
         const n = memfs.pread(fe.host_fd, this._memory, bufPhys, count, preadOffset);
         result = n;
+        break;
+      }
+
+      // Positioned writes: write at an explicit offset WITHOUT moving the fd
+      // cursor (mirror of pread64/preadv). SQLite's unix VFS uses pwrite for all
+      // DB-file writes, so without these opencode's migrations fail with
+      // "SQL logic error" / "Failed to execute statement". (pwritev delegates the
+      // first non-empty iovec from Rust, exactly like preadv.)
+      case SYS_PWRITE64:
+      case SYS_PWRITEV: {
+        if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
+        const fe = this._fdRead(dv, gfd);
+        if (fe.fd_type !== FD_TYPE_FILE) { result = -9; break; }
+        const count = bufLen || arg1;
+        const pwriteOffset = arg2;
+        const bufPhys = ramPtr + bufPtr;
+        result = memfs.pwrite(fe.host_fd, this._memory, bufPhys, count, pwriteOffset);
         break;
       }
 
