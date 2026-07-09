@@ -42,27 +42,65 @@ pub unsafe fn clear_code_pages() {
     CODE_DIRTY = false;
 }
 
+// Opt-in diagnostic (cargo feature `memcheck`, off by default → zero cost):
+// log any guest access whose effective address leaves linear memory, or whose
+// u64 address truncates in the `addr as u32` cast (silent aliasing). Each hit
+// is emitted via debug_log as addr (3 words) + guest pc (2 words) so the host
+// can symbolize the faulting guest instruction. Costs a memory_size() per
+// access, so it's only compiled into `--features memcheck` debug builds. This
+// is how the Intl.Segmenter/NULL-BreakIterator guest fault was root-caused.
+#[cfg(feature = "memcheck")]
+static mut DBG_PC: u64 = 0;
+
+/// Record the guest pc of the instruction about to execute (memcheck builds).
+#[cfg(feature = "memcheck")]
+#[inline(always)]
+pub unsafe fn set_dbg_pc(pc: u64) {
+    DBG_PC = pc;
+}
+
+#[cfg(feature = "memcheck")]
+#[inline(always)]
+unsafe fn dbg_check(base: u32, addr: u64, len: u64) {
+    let eff = base as u64 + (addr as u32) as u64;
+    let mem = (core::arch::wasm32::memory_size(0) as u64) * 65536;
+    if eff + len > mem || addr > u32::MAX as u64 {
+        crate::host::debug_log((0x7A000000u32 | ((addr & 0xFFFFFF) as u32)) as i32);
+        crate::host::debug_log((0x7B000000u32 | (((addr >> 24) & 0xFFFFFF) as u32)) as i32);
+        crate::host::debug_log((0x7C000000u32 | (((addr >> 48) & 0xFFFF) as u32)) as i32);
+        crate::host::debug_log((0x7D000000u32 | ((DBG_PC & 0xFFFFFF) as u32)) as i32);
+        crate::host::debug_log((0x7E000000u32 | (((DBG_PC >> 24) & 0xFFFFFF) as u32)) as i32);
+    }
+}
+#[cfg(not(feature = "memcheck"))]
+#[inline(always)]
+unsafe fn dbg_check(_base: u32, _addr: u64, _len: u64) {}
+
 /// Read u8 from guest address
 #[inline(always)]
 pub unsafe fn read_u8(base: u32, addr: u64) -> u8 {
+    dbg_check(base, addr, 1);
     *((base + addr as u32) as *const u8)
 }
 
 /// Read u16 LE from guest address (single WASM i32.load16_u)
 #[inline(always)]
 pub unsafe fn read_u16(base: u32, addr: u64) -> u16 {
+    dbg_check(base, addr, 2);
     ((base + addr as u32) as *const u16).read_unaligned()
 }
 
 /// Read u32 LE from guest address (single WASM i32.load)
 #[inline(always)]
 pub unsafe fn read_u32(base: u32, addr: u64) -> u32 {
+    dbg_check(base, addr, 4);
     ((base + addr as u32) as *const u32).read_unaligned()
 }
 
 /// Read u64 LE from guest address (single WASM i64.load)
 #[inline(always)]
 pub unsafe fn read_u64(base: u32, addr: u64) -> u64 {
+    dbg_check(base, addr, 8);
     ((base + addr as u32) as *const u64).read_unaligned()
 }
 
@@ -93,6 +131,7 @@ pub unsafe fn read_i64(base: u32, addr: u64) -> i64 {
 /// Write u8 to guest address
 #[inline(always)]
 pub unsafe fn write_u8(base: u32, addr: u64, val: u8) {
+    dbg_check(base, addr, 1);
     note_store(addr);
     *((base + addr as u32) as *mut u8) = val;
 }
@@ -100,6 +139,7 @@ pub unsafe fn write_u8(base: u32, addr: u64, val: u8) {
 /// Write u16 LE to guest address (single WASM i32.store16)
 #[inline(always)]
 pub unsafe fn write_u16(base: u32, addr: u64, val: u16) {
+    dbg_check(base, addr, 2);
     note_store(addr);
     ((base + addr as u32) as *mut u16).write_unaligned(val);
 }
@@ -107,6 +147,7 @@ pub unsafe fn write_u16(base: u32, addr: u64, val: u16) {
 /// Write u32 LE to guest address (single WASM i32.store)
 #[inline(always)]
 pub unsafe fn write_u32(base: u32, addr: u64, val: u32) {
+    dbg_check(base, addr, 4);
     note_store(addr);
     ((base + addr as u32) as *mut u32).write_unaligned(val);
 }
@@ -114,6 +155,7 @@ pub unsafe fn write_u32(base: u32, addr: u64, val: u32) {
 /// Write u64 LE to guest address (single WASM i64.store)
 #[inline(always)]
 pub unsafe fn write_u64(base: u32, addr: u64, val: u64) {
+    dbg_check(base, addr, 8);
     note_store(addr);
     ((base + addr as u32) as *mut u64).write_unaligned(val);
 }
@@ -121,6 +163,7 @@ pub unsafe fn write_u64(base: u32, addr: u64, val: u64) {
 /// Write a byte slice to guest memory
 #[inline]
 pub unsafe fn write_bytes(base: u32, addr: u64, data: &[u8]) {
+    dbg_check(base, addr, data.len() as u64);
     let dst = (base + addr as u32) as *mut u8;
     core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
 }
@@ -128,6 +171,7 @@ pub unsafe fn write_bytes(base: u32, addr: u64, data: &[u8]) {
 /// Read bytes from guest memory into a slice
 #[inline]
 pub unsafe fn read_bytes(base: u32, addr: u64, buf: &mut [u8]) {
+    dbg_check(base, addr, buf.len() as u64);
     let src = (base + addr as u32) as *const u8;
     core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len());
 }
@@ -135,6 +179,7 @@ pub unsafe fn read_bytes(base: u32, addr: u64, buf: &mut [u8]) {
 /// Zero a region of guest memory
 #[inline]
 pub unsafe fn zero_mem(base: u32, addr: u64, len: usize) {
+    dbg_check(base, addr, len as u64);
     let dst = (base + addr as u32) as *mut u8;
     core::ptr::write_bytes(dst, 0, len);
 }
@@ -142,6 +187,8 @@ pub unsafe fn zero_mem(base: u32, addr: u64, len: usize) {
 /// Copy a region of guest memory (handles overlapping via memmove)
 #[inline]
 pub unsafe fn copy_within(base: u32, src_addr: u64, dst_addr: u64, len: usize) {
+    dbg_check(base, src_addr, len as u64);
+    dbg_check(base, dst_addr, len as u64);
     let src = (base + src_addr as u32) as *const u8;
     let dst = (base + dst_addr as u32) as *mut u8;
     core::ptr::copy(src, dst, len); // handles overlap

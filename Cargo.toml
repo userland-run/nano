@@ -19,6 +19,7 @@ node = []     # Embed images/node RISC-V ELF (~52MB) — legacy; prefer the cata
 devenv = []   # Embed build/devenv.tar.gz — legacy; prefer the catalog typescript/eslint recipes
 demo = ["busybox", "node", "devenv"]  # All bundled: the legacy offline all-in-one (make build-full)
 trace = []    # Emit a debug_log(0x0A | nr) event on every syscall (conformance coverage)
+memcheck = []  # TEMP diagnostic: log OOB/truncating guest accesses (mem.rs dbg_check)
 
 [dependencies]
 # Terminal model parser (Console). default-features=false → no_std, no heap

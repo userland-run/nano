@@ -381,6 +381,10 @@ unsafe fn exec_block(
         let mut loop_back = false;
 
         while i < len {
+            #[cfg(feature = "memcheck")]
+            {
+                crate::mem::set_dbg_pc(pc);
+            }
             let p = blk.packed[i];
             let op = (p >> 32) as u32;
             let imm = p as u32 as i32;

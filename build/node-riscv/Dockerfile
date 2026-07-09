@@ -102,14 +102,22 @@ RUN CC=riscv64-linux-musl-gcc \
       --dest-os=linux \
       --cross-compiling \
       --fully-static \
-      --with-intl=small-icu \
+      --with-intl=full-icu \
+      --download=all \
       --without-inspector \
       --without-npm \
       --openssl-no-asm
-# --with-intl=small-icu (was none): bundles ICU's full Unicode property tables
-# (English-only locale data) into the binary so V8 supports `\p{...}` regex —
-# required by prettier (and Intl basics). Builds from node's vendored
-# deps/icu-small (no download). Switch to full-icu if non-English Intl is needed.
+# --with-intl=full-icu (was small-icu, was none): the full ICU data set.
+# small-icu gives `\p{...}` regex + English Intl, but its trimmed data file
+# OMITS the break-iteration (brkitr) rules — `Intl.Segmenter.prototype.segment`
+# then does a virtual call through a NULL icu::BreakIterator inside V8
+# (JSSegments::Create) and crashes the whole process. opencode's yargs/
+# string-width path hits Segmenter on plain `--help`, so full data is required
+# (root-caused in-guest 2026-07-08). full-icu is NOT in node's vendored
+# deps/icu-small, so `--download=all` fetches the full ICU tarball (per
+# tools/icu/current_ver.dep) into deps/icu at configure time. The data is an
+# architecture-independent .dat blob (host-side genrb), so it cross-compiles
+# fine; it adds ~28 MB to the binary. This also fully unblocks prettier.
 
 # Build with all available cores
 RUN make -j$(nproc)

@@ -33,6 +33,10 @@ const SYS_PREAD64: u64 = 67;
 const SYS_PWRITE64: u64 = 68;
 const SYS_PREADV: u64 = 69;
 const SYS_PWRITEV: u64 = 70;
+const SYS_SYNC: u64 = 81;      // whole-system sync — no-op (memfs is in RAM)
+const SYS_FSYNC: u64 = 82;     // flush a file — no-op (memfs is in RAM)
+const SYS_FDATASYNC: u64 = 83; // flush file data — no-op (memfs is in RAM)
+const SYS_SYNCFS: u64 = 267;   // sync a filesystem — no-op (memfs is in RAM)
 const SYS_RISCV_FLUSH_ICACHE: u64 = 259; // RISC-V: flush icache (no-op on the interpreter)
 const SYS_IO_URING_SETUP: u64 = 425;     // io_uring: intentionally unavailable (callers fall back)
 const SYS_READLINKAT: u64 = 78;
@@ -449,6 +453,7 @@ pub unsafe fn reset_statics() {
     TIMERFD_INTERVAL_MS = [0.0; MAX_TIMERFDS];
     TIMERFD_ALLOC = 0;
     EPOLL_FINITE_TIMEOUT_ACTIVE = false;
+    MMAP_FREE_COUNT = 0; // free-list isn't part of the snapshot image
     crate::tty::reset();
     signals_reset();
 }
@@ -698,6 +703,12 @@ pub unsafe fn handle(vm: &mut Vm) {
         SYS_RECVFROM => sys_recvfrom(vm, a0 as i32, a1, a2 as u32, a3 as i32),
         SYS_SOCKETPAIR => ENOSYS, // not supported
 
+        // Durability syscalls: the memfs lives in RAM, so there is nothing to
+        // flush to stable storage — succeed. Without this, fsync/fdatasync fall
+        // through to ENOSYS and SQLite's unix VFS reports SQLITE_IOERR_FSYNC
+        // ("disk I/O error") on every commit, blocking all file-backed node:sqlite.
+        SYS_SYNC | SYS_FSYNC | SYS_FDATASYNC | SYS_SYNCFS => 0,
+
         // RISC-V icache flush after JIT codegen — the interpreter re-reads guest
         // memory every step, so there is no separate icache to flush. Succeed.
         SYS_RISCV_FLUSH_ICACHE => 0,
@@ -780,22 +791,44 @@ unsafe fn sys_mmap(
 
     let ram_limit = vm.ram_size as u64;
 
+    // True when this address came from the munmap free list (below the frontier,
+    // holding stale bytes) → must be fully zeroed for MAP_ANONYMOUS.
+    let mut reused = false;
     let guest_addr = if is_fixed && addr != 0 {
         // MAP_FIXED: must use the exact address
         addr
     } else {
-        // Bump allocator — check bounds BEFORE advancing pointer
-        let next = vm.mmap_next_addr;
-        let end = next + len;
-        if end > ram_limit {
-            // Log: next_addr in KB (fits in 24 bits up to 16GB)
-            host::debug_log(0x1E000000 | ((next >> 10) as i32 & 0xFFFFFF));
-            // Log: len in KB
-            host::debug_log(0x1F000000 | ((len >> 10) as i32 & 0xFFFFFF));
-            return ENOMEM;
+        // Anonymous requests first try to reuse a previously-freed region so a
+        // long-running guest stays bounded to its working set; otherwise bump.
+        if is_anon {
+            if let Some(a) = take_free_region(len) {
+                reused = true;
+                a
+            } else {
+                let next = vm.mmap_next_addr;
+                let end = next + len;
+                if end > ram_limit {
+                    host::debug_log(0x1E000000 | ((next >> 10) as i32 & 0xFFFFFF));
+                    host::debug_log(0x1F000000 | ((len >> 10) as i32 & 0xFFFFFF));
+                    return ENOMEM;
+                }
+                vm.mmap_next_addr = end;
+                next
+            }
+        } else {
+            // Bump allocator — check bounds BEFORE advancing pointer
+            let next = vm.mmap_next_addr;
+            let end = next + len;
+            if end > ram_limit {
+                // Log: next_addr in KB (fits in 24 bits up to 16GB)
+                host::debug_log(0x1E000000 | ((next >> 10) as i32 & 0xFFFFFF));
+                // Log: len in KB
+                host::debug_log(0x1F000000 | ((len >> 10) as i32 & 0xFFFFFF));
+                return ENOMEM;
+            }
+            vm.mmap_next_addr = end;
+            next
         }
-        vm.mmap_next_addr = end;
-        next
     };
 
     // Check bounds for MAP_FIXED
@@ -806,9 +839,11 @@ unsafe fn sys_mmap(
 
     // Zero the region for anonymous mappings. Mappings taken from the bump
     // frontier at/above the high-water mark are virgin (engine-zero) memory —
-    // skip the redundant memset. MAP_FIXED can land anywhere (possibly reused),
-    // so zero it unconditionally.
-    if is_anon {
+    // skip the redundant memset. MAP_FIXED and free-list reuse can land on dirty
+    // memory, so zero those unconditionally.
+    if is_anon && reused {
+        mem::zero_mem(vm.ram_base, guest_addr, len as usize);
+    } else if is_anon {
         let end_addr = guest_addr + len;
         let from_bump = !(is_fixed && addr != 0);
         if !(from_bump && guest_addr >= MMAP_HWM) {
@@ -841,9 +876,89 @@ unsafe fn sys_mmap(
     guest_addr as i64
 }
 
-unsafe fn sys_munmap(vm: &mut Vm, _addr: u64, _length: u64) -> i64 {
-    // Stub: we don't actually free memory in the bump allocator
+unsafe fn sys_munmap(vm: &mut Vm, addr: u64, length: u64) -> i64 {
+    // Frontier reclaim: the mmap bump allocator normally never shrinks, so a
+    // long-running guest (e.g. `opencode serve`, whose V8 GC churns tens of
+    // thousands of mmap/munmap pairs) marches mmap_next_addr to the RAM limit
+    // and OOMs. When a region ends exactly at the frontier, pull the frontier
+    // back so the space is reused — this reclaims LIFO-freed allocations (the
+    // common V8 page-pool pattern) with zero bookkeeping and no reuse hazard
+    // (only the bump pointer moves; nothing stale is ever handed back live).
+    // Also absorb any free-listed regions that are now adjacent to the frontier.
+    if addr != 0 && length != 0 {
+        let len = (length + PAGE_SIZE - 1) & PAGE_MASK;
+        let end = addr + len;
+        if end == vm.mmap_next_addr {
+            vm.mmap_next_addr = addr;
+            coalesce_free_frontier(vm);
+            return 0;
+        }
+        // Not at the frontier: record it for first-fit reuse (bounded list; a
+        // full list just means that region stays un-reclaimed — degrades to the
+        // old no-op, never corrupts).
+        if MMAP_FREE_COUNT < MMAP_FREE_CAP {
+            MMAP_FREE[MMAP_FREE_COUNT] = (addr, len);
+            MMAP_FREE_COUNT += 1;
+        }
+    }
     0
+}
+
+// Bounded free list of non-frontier munmap'd regions, reused by later anonymous
+// mmap (first-fit) so the guest address space stays bounded to the working set.
+// Module-global (single guest, cooperative — like BRK_HWM/MMAP_HWM); cleared on
+// program load via reset_mmap_free() so a new program never reuses stale ranges.
+const MMAP_FREE_CAP: usize = 1024;
+static mut MMAP_FREE: [(u64, u64); MMAP_FREE_CAP] = [(0, 0); MMAP_FREE_CAP];
+static mut MMAP_FREE_COUNT: usize = 0;
+
+/// Clear the mmap free list (call whenever the mmap frontier is reset — new ELF
+/// load / snapshot restore — so freed ranges from a prior image aren't reused).
+pub unsafe fn reset_mmap_free() {
+    MMAP_FREE_COUNT = 0;
+}
+
+/// After the frontier moves back, absorb any free-listed region that now ends at
+/// the frontier (repeatedly), turning scattered LIFO frees into one contiguous
+/// reclaim.
+unsafe fn coalesce_free_frontier(vm: &mut Vm) {
+    let mut progress = true;
+    while progress {
+        progress = false;
+        let mut i = 0;
+        while i < MMAP_FREE_COUNT {
+            let (faddr, flen) = MMAP_FREE[i];
+            if faddr + flen == vm.mmap_next_addr {
+                vm.mmap_next_addr = faddr;
+                MMAP_FREE[i] = MMAP_FREE[MMAP_FREE_COUNT - 1];
+                MMAP_FREE_COUNT -= 1;
+                progress = true;
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// First-fit a freed region of at least `len` bytes; returns its address and
+/// removes/splits it from the free list, or None. The caller must zero it
+/// (MAP_ANONYMOUS memory must read as zero and a reused region isn't virgin).
+unsafe fn take_free_region(len: u64) -> Option<u64> {
+    let mut i = 0;
+    while i < MMAP_FREE_COUNT {
+        let (faddr, flen) = MMAP_FREE[i];
+        if flen >= len {
+            if flen == len {
+                MMAP_FREE[i] = MMAP_FREE[MMAP_FREE_COUNT - 1];
+                MMAP_FREE_COUNT -= 1;
+            } else {
+                MMAP_FREE[i] = (faddr + len, flen - len); // keep the remainder free
+            }
+            return Some(faddr);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// mremap(old_addr, old_size, new_size, flags, [new_addr])
@@ -1973,6 +2088,39 @@ unsafe fn sys_fcntl(vm: &mut Vm, fd: i32, cmd: i32, arg: u64) -> i64 {
             // F_SETFL
             vm.fd_table[fd as usize].flags = arg as i32;
             0
+        }
+        // POSIX advisory record locks (F_GETLK=5, F_SETLK=6, F_SETLKW=7) and the
+        // open-file-description variants (F_OFD_GETLK=36, F_OFD_SETLK=37,
+        // F_OFD_SETLKW=38). The VM runs one guest process cooperatively, so these
+        // locks never contend — grant every request. Without this, SQLite's unix
+        // VFS gets a lock error on the first write to a file-backed DB and reports
+        // SQLITE_IOERR_LOCK ("disk I/O error"), which blocks node:sqlite (e.g.
+        // opencode's serve DB) entirely. For the GETLK queries, report the region
+        // as unlocked so the caller proceeds: struct flock has `short l_type` at
+        // offset 0; F_UNLCK = 2.
+        5 | 36 => {
+            if arg != 0 {
+                mem::write_u16(vm.ram_base, arg, 2); // l_type = F_UNLCK
+            }
+            0
+        }
+        6 | 7 | 37 | 38 => 0,
+        // F_DUPFD_CLOEXEC: dup to the lowest free fd >= arg, like F_DUPFD. (The
+        // VM has no exec-time fd table to close, so the CLOEXEC bit is a no-op;
+        // returning the dup is what callers need.)
+        1030 => {
+            let min = arg as usize;
+            let mut result: i64 = -24; // EMFILE
+            let mut i = min;
+            while i < MAX_FDS {
+                if vm.fd_table[i].fd_type == FD_TYPE_NONE {
+                    vm.fd_table[i] = vm.fd_table[fd as usize];
+                    result = i as i64;
+                    break;
+                }
+                i += 1;
+            }
+            result
         }
         _ => EINVAL,
     }

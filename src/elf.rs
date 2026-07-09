@@ -167,6 +167,9 @@ pub unsafe fn load(vm: &mut Vm, elf_addr: u64, elf_size: u32) -> ElfLoadResult {
 
     // mmap region starts well above brk
     vm.mmap_next_addr = brk_start + 64 * 1024 * 1024; // 64MB above brk
+    // New program image → drop any munmap free-list entries from a prior run so
+    // stale address ranges are never handed back to the fresh program.
+    crate::syscall::reset_mmap_free();
 
     // Store TLS info
     if tls_memsz > 0 {

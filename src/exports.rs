@@ -144,6 +144,7 @@ pub unsafe extern "C" fn vm_load_raw(
     vm.brk_start = (end + PAGE_SIZE - 1) & PAGE_MASK;
     vm.brk_current = vm.brk_start;
     vm.mmap_next_addr = vm.brk_start + 64 * 1024 * 1024;
+    crate::syscall::reset_mmap_free();
 
     0
 }
