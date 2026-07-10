@@ -183,8 +183,14 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
         else
             fail "nodert ↔ real BusyBox cross-tier"
         fi
+        # Kernel-native applets difftested byte-for-byte vs BusyBox (UL-SPEC/applets)
+        if node "$NODERT_DIR/test/applets-difftest.mjs" 2>/dev/null; then
+            ok "kernel-native applets == BusyBox (difftest + S2 fallback)"
+        else
+            fail "kernel-native applets difftest"
+        fi
     else
-        skip "real-VM cross-tier" "images/busybox not present"
+        skip "real-VM cross-tier + applet difftest" "images/busybox not present"
     fi
 else
     skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"

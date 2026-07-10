@@ -10,6 +10,8 @@ export { PortTable } from "./net/ports.mjs";
 export { ServiceRegistry } from "./services/registry.mjs";
 export { CasStore } from "./persist/cas-store.mjs";
 export { materializePackages } from "./persist/node-modules.mjs";
+export { registerKernelApplets } from "./applets/runner.mjs";
+export { NATIVE_APPLETS, flagsSupported } from "./applets/native.mjs";
 export {
   registerBuiltinServices,
   createZlibService,
