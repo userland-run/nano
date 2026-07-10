@@ -10,8 +10,8 @@
 // kind:"wasm-service" manifest driving registration, and non-string payloads.
 
 import { Kernel, registerBuiltinServices } from "../../kernel/index.mjs";
-import { createWasiService, registerWasmServiceFromManifest } from "../src/host/wasi-service.mjs";
-import { stdinEchoModule } from "./wasm-fixtures.mjs";
+import { createWasiService, createWarmWasmService, registerWasmServiceFromManifest } from "../src/host/wasi-service.mjs";
+import { stdinEchoModule, counterReactorModule } from "./wasm-fixtures.mjs";
 
 let passed = 0, failed = 0, current = "";
 function assert(c, m) { if (!c) { console.error(`  FAIL: ${current} - ${m}`); failed++; return false; } return true; }
@@ -69,6 +69,49 @@ await test("JSON payload is serialized to the request stream", async () => {
   const svc = createWasiService(k, { id: "j", wasmBytes: stdinEchoModule("") });
   const r = await svc.invoke("run", { a: 1, b: "two" });
   assertEqual(r.stdout, '{"a":1,"b":"two"}', "object payload → JSON on stdin, echoed back");
+});
+
+// --- persistent / warm services (W-3 tail) ---
+
+await test("warm service instance persists state across invokes", async () => {
+  const k = await newKernel();
+  const svc = createWarmWasmService(k, { id: "counter", version: "1.0.0", wasmBytes: counterReactorModule(), methods: ["increment", "add"] });
+  assert(!svc.isWarm(), "cold before first invoke");
+  const a = await svc.invoke("increment");
+  const b = await svc.invoke("increment");
+  const c = await svc.invoke("increment");
+  assert(svc.isWarm(), "warm after first invoke");
+  assertEqual(a.result, 1, "first increment");
+  assertEqual(b.result, 2, "state persisted → second");
+  assertEqual(c.result, 3, "state persisted → third");
+});
+
+await test("warm service: a different method on the same warm instance", async () => {
+  const k = await newKernel();
+  const svc = createWarmWasmService(k, { id: "calc", wasmBytes: counterReactorModule(), methods: ["increment", "add"] });
+  assertEqual((await svc.invoke("add", { args: [40, 2] })).result, 42, "add(40,2)");
+  assertEqual((await svc.invoke("increment")).result, 1, "increment on the same instance");
+});
+
+await test("warm service reset() drops state (next invoke is cold)", async () => {
+  const k = await newKernel();
+  const svc = createWarmWasmService(k, { id: "c2", wasmBytes: counterReactorModule() });
+  await svc.invoke("increment"); await svc.invoke("increment");
+  assertEqual((await svc.invoke("increment")).result, 3, "warmed to 3");
+  svc.reset();
+  assert(!svc.isWarm(), "cold after reset");
+  assertEqual((await svc.invoke("increment")).result, 1, "fresh instance restarts state");
+});
+
+await test("warm service is kind:'wasm-service' + persistent, registrable on the bus", async () => {
+  const k = await newKernel();
+  const svc = createWarmWasmService(k, { id: "warmsvc", wasmBytes: counterReactorModule(), methods: ["increment"] });
+  assertEqual(svc.kind, "wasm-service", "kind");
+  assert(svc.persistent === true, "flagged persistent");
+  k.services.register(svc);
+  const r = await k.services.invoke("warmsvc", "increment");
+  assertEqual(r.result, 1, "reachable + invocable over svc.*");
+  assertEqual((await k.services.invoke("warmsvc", "increment")).result, 2, "warm across bus invokes");
 });
 
 console.log(`\n=== nodert WASI service runner (W-3): ${passed} passed, ${failed} failed ===`);

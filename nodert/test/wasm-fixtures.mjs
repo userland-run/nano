@@ -209,6 +209,42 @@ function stdinEchoModule(prefix = "WASI:") {
   });
 }
 
+/**
+ * counterReactor: a wasip1 REACTOR (no _start; pure compute, no WASI imports)
+ * that keeps STATE in memory. Exports `increment()` — mem[0] += 1; return it —
+ * and `add(a,b)`. A WARM service instantiates this ONCE and reuses it, so
+ * successive increment() calls return 1,2,3 (state persists); a cold per-invoke
+ * runner would return 1,1,1. Proves persistent/warm services (W-3 tail).
+ */
+function counterReactorModule() {
+  const ADD = 0x6a;
+  return buildModule({
+    types: [
+      { params: [], results: [I32] },        // 0: increment() -> i32
+      { params: [I32, I32], results: [I32] }, // 1: add(a,b) -> i32
+    ],
+    imports: [],
+    funcs: [
+      // increment: mem[0] = mem[0] + 1; return mem[0]
+      { type: 0, body: [
+        I32_CONST, 0x00,                       // addr for the store
+        I32_CONST, 0x00, I32_LOAD, 0x02, 0x00, // load mem[0]
+        I32_CONST, 0x01, ADD,                  // + 1
+        I32_STORE, 0x02, 0x00,                 // mem[0] = new
+        I32_CONST, 0x00, I32_LOAD, 0x02, 0x00, // load mem[0] to return
+      ] },
+      // add(a,b): local.get 0 + local.get 1
+      { type: 1, body: [LOCAL_GET, 0, LOCAL_GET, 1, ADD] },
+    ],
+    memory: { min: 1 },
+    exports: [
+      { name: "memory", kind: KIND_MEM, index: 0 },
+      { name: "increment", kind: KIND_FUNC, index: 0 },
+      { name: "add", kind: KIND_FUNC, index: 1 },
+    ],
+  });
+}
+
 // wasip1-threads module (minimal, exercises X4): imports a SHARED memory +
 // wasi_thread_spawn. _start spawns one thread and spin-waits (atomic load) on a
 // flag at addr 0; the thread (wasi_thread_start) atomically stores 1 to that
@@ -254,4 +290,4 @@ function threadsModule() {
   });
 }
 
-export { helloModule, exitModule, readFileModule, threadsModule, stdinEchoModule, buildModule };
+export { helloModule, exitModule, readFileModule, threadsModule, stdinEchoModule, counterReactorModule, buildModule };

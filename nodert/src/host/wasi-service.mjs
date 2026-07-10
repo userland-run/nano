@@ -91,6 +91,72 @@ function registerWasmServiceFromManifest(kernel, manifest, wasmBytes, opts = {})
   return kernel.services.register(svc);
 }
 
+/**
+ * A PERSISTENT / WARM wasm service (W-3 tail; the SWC-style variant). Unlike
+ * createWasiService (a fresh per-invoke wasip1 command filter), this
+ * instantiates the module ONCE and reuses it, so its memory/state persists
+ * across invokes. Intended for pure-compute REACTORS (`_initialize`, no
+ * `_start`) — each `svc.invoke(method, payload)` calls the export named
+ * `method`. Runs on the calling thread (no WASI I/O); a module that imports
+ * wasi gets a minimal no-op shim.
+ *
+ * @param {import("../../../kernel/kernel.mjs").Kernel} kernel
+ * @param {{ id: string, wasmBytes: Uint8Array, version?: string, methods?: string[],
+ *           imports?: object, decode?: (result:any, exports:object)=>any }} cfg
+ */
+function createWarmWasmService(kernel, cfg) {
+  let instance = null;
+  let initPromise = null;
+  async function ensure() {
+    if (instance) return instance;
+    if (!initPromise) initPromise = (async () => {
+      const module = await WebAssembly.compile(cfg.wasmBytes);
+      const imports = cfg.imports ?? noopWasiImports(module);
+      instance = await WebAssembly.instantiate(module, imports);
+      if (typeof instance.exports._initialize === "function") instance.exports._initialize();
+      return instance;
+    })();
+    return initPromise;
+  }
+  return {
+    id: cfg.id,
+    version: cfg.version ?? "0.0.0",
+    kind: "wasm-service",
+    persistent: true,
+    methods: cfg.methods ?? ["run"],
+    async invoke(method, payload) {
+      const inst = await ensure();
+      const fn = inst.exports[method];
+      if (typeof fn !== "function") {
+        throw new KernelErrorLite(`warm service '${cfg.id}' has no export '${method}'`);
+      }
+      const args = Array.isArray(payload?.args) ? payload.args : (payload == null ? [] : [payload]);
+      const result = fn(...args);
+      return { ok: true, result: cfg.decode ? cfg.decode(result, inst.exports) : result };
+    },
+    /** Whether the module has been instantiated (warm). */
+    isWarm: () => !!instance,
+    /** Drop the instance so the next invoke re-instantiates (cold). */
+    reset() { instance = null; initPromise = null; },
+    available: () => true,
+  };
+}
+
+// A wasip1 reactor doing only compute needs no real WASI; give any declared
+// wasi import a no-op so instantiation succeeds. (I/O reactors should use the
+// worker-backed per-invoke runner instead.)
+function noopWasiImports(module) {
+  const imports = {};
+  for (const imp of WebAssembly.Module.imports(module)) {
+    (imports[imp.module] ??= {});
+    if (imp.kind === "function") imports[imp.module][imp.name] = () => 0;
+    else if (imp.kind === "memory") imports[imp.module][imp.name] = new WebAssembly.Memory({ initial: 1 });
+  }
+  return imports;
+}
+
+class KernelErrorLite extends Error {}
+
 function toBytes(payload) {
   if (payload == null) return new Uint8Array(0);
   if (payload instanceof Uint8Array) return payload;
@@ -100,4 +166,4 @@ function toBytes(payload) {
   return new TextEncoder().encode(JSON.stringify(payload));
 }
 
-export { createWasiService, registerWasmServiceFromManifest };
+export { createWasiService, createWarmWasmService, registerWasmServiceFromManifest };
