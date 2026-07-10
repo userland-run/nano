@@ -74,6 +74,38 @@ function createBindings(ctx) {
       runMicrotasks: () => {},
       setPromiseRejectCallback: () => {},
     }),
+    // async_wrap: enough async-hooks state for streams/AsyncResource. The two
+    // typed arrays have separate index namespaces (hook fields vs id fields).
+    async_wrap: () => {
+      if (!hostState.asyncIdFields) {
+        hostState.asyncHookFields = new Uint32Array(9);
+        hostState.asyncIdFields = new Float64Array(4);
+        hostState.asyncIdFields[0] = 1; // kExecutionAsyncId = 1 (main)
+        hostState.asyncIdFields[2] = 1; // kAsyncIdCounter
+        // The JS async-hooks layer pushes/pops execution+trigger ids here.
+        hostState.asyncIdsStack = new Float64Array(1024);
+      }
+      return {
+        async_hook_fields: hostState.asyncHookFields,
+        async_id_fields: hostState.asyncIdFields,
+        async_ids_stack: hostState.asyncIdsStack,
+        execution_async_resources: [],
+        constants: {
+          kInit: 0, kBefore: 1, kAfter: 2, kDestroy: 3, kPromiseResolve: 4, kTotals: 5,
+          kCheck: 6, kStackLength: 7, kUsesExecutionAsyncResource: 8,
+          kExecutionAsyncId: 0, kTriggerAsyncId: 1, kAsyncIdCounter: 2, kDefaultTriggerAsyncId: 3,
+        },
+        setCallbackTrampoline: () => {},
+        pushAsyncContext: () => {},
+        popAsyncContext: () => true,
+        clearAsyncIdStack: () => {},
+        queueDestroyAsyncId: () => {},
+        setPromiseHooks: () => {},
+        registerDestroyHook: () => {},
+        enablePromiseHook: () => {},
+        disablePromiseHook: () => {},
+      };
+    },
     timers: () => ({
       immediateInfo: hostState.immediateInfo,
       timeoutInfo: hostState.timeoutInfo,
@@ -118,7 +150,11 @@ function createBindings(ctx) {
     report: () => ({ getReport: () => "{}", writeReport: () => "", shouldReportOnSignal: () => false }),
     contextify: () => makeContextifyBinding(),
     module_wrap: () => ({ ModuleWrap: class ModuleWrap {}, setImportModuleDynamicallyCallback: () => {}, setInitializeImportMetaObjectCallback: () => {} }),
-    messaging: () => ({ MessageChannel: globalThis.MessageChannel, MessagePort: globalThis.MessagePort, setDeserializerCreateObjectFunction: () => {}, stopMessagePort: () => {}, checkMessagePort: () => false }),
+    messaging: () => ({
+      MessageChannel: globalThis.MessageChannel, MessagePort: globalThis.MessagePort,
+      DOMException: globalThis.DOMException, // internal/util reads it from here
+      setDeserializerCreateObjectFunction: () => {}, stopMessagePort: () => {}, checkMessagePort: () => false,
+    }),
     worker: () => ({ threadId: hostState.pid ?? 0, isMainThread: true, ownsProcessState: true, getEnvMessagePort: () => null, Worker: class Worker {} }),
     symbols: () => makeSymbols(),
   };
@@ -254,8 +290,23 @@ function makeEncodingBinding() {
 function makeUtilBinding(privateSymbols) {
   return {
     privateSymbols,
-    constants: { kExiting: 0, kExitCode: 1, kHasExitCode: 2, kArrowMessagePrivateSymbolIndex: 0, kDecoratedPrivateSymbolIndex: 1 },
-    getOwnNonIndexProperties: (o) => Object.getOwnPropertyNames(o ?? {}),
+    constants: {
+      kExiting: 0, kExitCode: 1, kHasExitCode: 2, kArrowMessagePrivateSymbolIndex: 0, kDecoratedPrivateSymbolIndex: 1,
+      // util.inspect destructures these from `util.constants`.
+      ALL_PROPERTIES: 0, ONLY_WRITABLE: 1, ONLY_ENUMERABLE: 2, ONLY_CONFIGURABLE: 4, ONLY_ENUM_WRITABLE: 3, SKIP_STRINGS: 8, SKIP_SYMBOLS: 16,
+      kPending: 0, kFulfilled: 1, kRejected: 2,
+    },
+    // Property filter constants match Node's util binding (bit flags).
+    propertyFilter: { ALL_PROPERTIES: 0, ONLY_WRITABLE: 1, ONLY_ENUMERABLE: 2, ONLY_CONFIGURABLE: 4, ONLY_WRITABLE_AND_ENUMERABLE: 3, SKIP_STRINGS: 8, SKIP_SYMBOLS: 16 },
+    // Own properties EXCLUDING array-index keys (so util.inspect doesn't
+    // double-print array elements as properties). Respects the enumerable bit.
+    getOwnNonIndexProperties: (o, filter = 0) => {
+      const isIndex = (k) => { const n = +k; return Number.isInteger(n) && n >= 0 && n < 4294967295 && String(n) === k; };
+      let names = Object.getOwnPropertyNames(o ?? {}).filter((k) => !isIndex(k));
+      if (filter & 2) names = names.filter((k) => Object.getOwnPropertyDescriptor(o, k)?.enumerable);
+      if (filter & 1) names = names.filter((k) => Object.getOwnPropertyDescriptor(o, k)?.writable);
+      return names;
+    },
     getConstructorName: (o) => o?.constructor?.name ?? "Object",
     getExternalValue: () => 0n,
     getPromiseDetails: () => [0, undefined], // host gap → util.inspect degradation (divergence)

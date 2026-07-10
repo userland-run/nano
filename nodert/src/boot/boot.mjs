@@ -47,6 +47,15 @@ async function boot(ctx) {
     catch { /* messageport/domexception may reference host globals — non-fatal in M0 */ }
   }
 
+  // Web-platform globals Node exposes that the vendored lib relies on. The
+  // per_context/domexception install is best-effort (§8.2); ensure the global
+  // exists for internal/abort_controller etc.
+  if (typeof globalThis.DOMException !== "function") {
+    globalThis.DOMException = class DOMException extends Error {
+      constructor(message = "", name = "Error") { super(message); this.name = name; this.code = 0; }
+    };
+  }
+
   // 2. host state feeding the process_methods/timers bindings + the loop.
   const loop = new EventLoop({ now: () => performance.now() });
   let exitCode = 0;
@@ -111,13 +120,21 @@ async function boot(ctx) {
   const proc = makeProcess();
   globalThis.process = proc;
 
-  // Minimal process.stdout/stderr writers (M0 — real tty/Writable streams in
-  // M1). Enough for `process.stdout.write(...)` and `.isTTY`.
-  proc.stdout = makeStdioWriter(writeStdout, init.stdio?.isTTY?.[1]);
-  proc.stderr = makeStdioWriter(writeStderr, init.stdio?.isTTY?.[2]);
-  proc.stdin = { isTTY: !!init.stdio?.isTTY?.[0], read: () => null, on: () => proc.stdin, resume: () => {}, pause: () => {}, setEncoding: () => proc.stdin };
-
-  const consoleObj = makeConsole({ write: writeStdout, writeErr: writeStderr, Buffer });
+  // process.stdout/stderr as REAL upstream Writable streams (M1) backed by the
+  // stdio pipes over the bus. Falls back to lean writers if `stream` can't load.
+  let consoleObj;
+  try {
+    const { Writable } = requireModule("stream");
+    proc.stdout = makeStdioStream(Writable, 1, init.stdio?.isTTY?.[1]);
+    proc.stderr = makeStdioStream(Writable, 2, init.stdio?.isTTY?.[2]);
+    proc.stdin = makeStdinStream(requireModule("stream").Readable, init.stdio?.isTTY?.[0]);
+    consoleObj = makeUpstreamConsole(proc.stdout, proc.stderr);
+  } catch {
+    proc.stdout = makeStdioWriter(writeStdout, init.stdio?.isTTY?.[1]);
+    proc.stderr = makeStdioWriter(writeStderr, init.stdio?.isTTY?.[2]);
+    proc.stdin = { isTTY: !!init.stdio?.isTTY?.[0], read: () => null, on: () => proc.stdin, resume: () => {}, pause: () => {}, setEncoding: () => proc.stdin };
+  }
+  if (!consoleObj) consoleObj = makeConsole({ write: writeStdout, writeErr: writeStderr, Buffer });
   globalThis.console = consoleObj;
 
   // Timers wired to the loop.
@@ -128,6 +145,10 @@ async function boot(ctx) {
   let resolveExit;
   const exitP = new Promise((r) => { resolveExit = r; });
   loop._onExit = (code) => { try { sync("proc.exit", { code }); } catch {} resolveExit(code); };
+
+  // 4b. Initialize the upstream internal modules that the full bootstrap/node.js
+  // normally sets up (we run a lean boot, so do the load-bearing ones here).
+  initUpstreamInternals();
 
   // 5. run the entry program.
   loop.onUncaught = (e) => {
@@ -154,6 +175,11 @@ async function boot(ctx) {
   return waitExit();
 
   // ---- helpers ----
+  function initUpstreamInternals() {
+    // debuglog: bootstrap/node.js calls initializeDebugEnv(NODE_DEBUG).
+    try { requireModule("internal/util/debuglog").initializeDebugEnv(proc.env.NODE_DEBUG ?? ""); } catch {}
+  }
+
   function computeArgv() {
     // Match Node's argv rules: `-e <code>` → ["node"] (the code is not in
     // argv); a script file → ["node", <path>, ...extraArgs].
@@ -258,6 +284,40 @@ async function boot(ctx) {
     fn.call(mod.exports, mod.exports, requireModule, mod, filename, dirname, proc, Buffer, consoleObj);
   }
 
+  // A real upstream Writable whose _write pushes bytes to the Kernel stdio pipe.
+  function makeStdioStream(Writable, fd, isTTY) {
+    const enc = new TextEncoder();
+    const s = new Writable({
+      write(chunk, encoding, cb) {
+        const bytes = typeof chunk === "string" ? enc.encode(chunk) : new Uint8Array(chunk.buffer ?? chunk, chunk.byteOffset ?? 0, chunk.byteLength ?? chunk.length);
+        try { sync("proc.stdio_write", { fd, data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) }); cb(); } catch (e) { cb(e); }
+      },
+      decodeStrings: false,
+    });
+    s.fd = fd;
+    s.isTTY = !!isTTY;
+    if (isTTY) { s.columns = 80; s.rows = 24; s.clearLine = () => true; s.cursorTo = () => true; s.moveCursor = () => true; }
+    s._type = isTTY ? "tty" : "pipe";
+    return s;
+  }
+  function makeStdinStream(Readable, isTTY) {
+    const s = new Readable({ read() {} });
+    s.isTTY = !!isTTY;
+    s.fd = 0;
+    s.setRawMode = () => s;
+    // No stdin data source wired in M0/M1 headless — push EOF so reads end.
+    queueMicrotask(() => s.push(null));
+    return s;
+  }
+  function makeUpstreamConsole(stdout, stderr) {
+    try {
+      const { Console } = requireModule("console");
+      return new Console({ stdout, stderr, colorMode: false });
+    } catch {
+      return makeConsole({ write: (s) => stdout.write(s), writeErr: (s) => stderr.write(s), Buffer });
+    }
+  }
+
   function makeStdioWriter(write, isTTY) {
     const w = {
       isTTY: !!isTTY,
@@ -322,7 +382,9 @@ async function boot(ctx) {
       case "fs": return () => makeFsModule({ internalBinding, sync, Buffer });
       case "os": return () => makeOs();
       case "buffer": return () => ({ Buffer, kMaxLength: 4294967296, kStringMaxLength: (1 << 29) - 24, constants: { MAX_LENGTH: 4294967296, MAX_STRING_LENGTH: (1 << 29) - 24 }, atob: (s) => globalThis.atob(s), btoa: (s) => globalThis.btoa(s), Blob: globalThis.Blob });
-      case "util": return () => makeUtil();
+      // util: prefer upstream lib/util.js (inspect/format now run verbatim);
+      // fall back to the lean shim if its dependency closure fails to load.
+      case "util": return () => { try { return compileUpstream("util"); } catch { return makeUtil(); } };
       case "assert": return () => makeAssert();
       case "process": return () => proc;
       case "zlib": case "node:zlib": return () => makeZlib();

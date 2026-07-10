@@ -64,5 +64,32 @@ await check("url: URL + searchParams",
   `const {URL}=require("url"); const u=new URL("https://a.com:8080/p?x=1#h"); console.log(u.hostname, u.port, u.pathname, u.searchParams.get("x"))`,
   "a.com 8080 /p 1");
 
+// upstream streams (M1) — verbatim lib/stream + internal/streams/*
+await check("stream: Readable.pipe(Writable)",
+  `const {Readable,Writable}=require("stream"); const out=[]; const w=new Writable({write(c,e,cb){out.push(c.toString());cb();}}); w.on("finish",()=>console.log(out.join(""))); Readable.from(["a","b","c"]).pipe(w)`,
+  "abc");
+await check("stream: Transform",
+  `const {Transform,Readable}=require("stream"); const up=new Transform({transform(c,e,cb){cb(null,c.toString().toUpperCase());}}); let o="";up.on("data",d=>o+=d);up.on("end",()=>console.log(o));Readable.from(["ab","cd"]).pipe(up)`,
+  "ABCD");
+await check("stream: async iteration",
+  `const {Readable}=require("stream");(async()=>{let s="";for await(const c of Readable.from(["x","y","z"]))s+=c;console.log(s)})()`,
+  "xyz");
+await check("stream: pipeline",
+  `const {Readable,Writable,pipeline}=require("stream"); const out=[]; pipeline(Readable.from(["1","2"]), new Writable({write(c,e,cb){out.push(c.toString());cb();}}), (err)=>console.log(err?"ERR":out.join("")))`,
+  "12");
+
+// upstream util (inspect/format/promisify/types) — verbatim lib/util.js
+await check("util: inspect nested + Map/Set",
+  `const u=require("util"); console.log(u.inspect({a:[1,2],m:new Map([["k",1]]),s:new Set([3])}))`,
+  "{ a: [ 1, 2 ], m: Map(1) { 'k' => 1 }, s: Set(1) { 3 } }");
+await check("util: format specifiers + promisify",
+  `const u=require("util"); const p=u.promisify((x,cb)=>cb(null,x*2)); p(21).then(v=>console.log(u.format("%s=%d","v",v)))`,
+  "v=42");
+
+// upstream console (M1) — real Console over Writable stdout, util.inspect
+await check("console: array + object inspect matches Node",
+  `console.log([1,"two",{k:3}]); console.log({nested:{a:1,b:[2,3]}})`,
+  `[ 1, 'two', { k: 3 } ]\n{ nested: { a: 1, b: [ 2, 3 ] } }`);
+
 console.log(`\n=== nodert upstream-verbatim: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);

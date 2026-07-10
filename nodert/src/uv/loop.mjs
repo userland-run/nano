@@ -151,12 +151,16 @@ class EventLoop {
     this._scheduled = false;
     if (this._stopped) return;
 
-    // Drain the nextTick queue, then yield so the host microtask queue drains
-    // to exhaustion (transitively) before any loop phase runs or we decide to
-    // exit. This gives Node's "microtasks settle between turns" semantics.
-    this._drainTicks();
-    await null;
-    this._drainTicks();
+    // Settle nextTicks + microtasks to a fixpoint before any phase runs or we
+    // decide to exit. A stream/async-iterator ping-pongs between the nextTick
+    // queue and the microtask queue across several turns; keep draining while
+    // either keeps producing work so we never exit mid-chain (Node's
+    // "microtasks settle between turns" semantics, taken to a fixpoint).
+    let guard = 0;
+    do {
+      this._drainTicks();
+      await null;
+    } while (this._nextTickQueue.length && ++guard < 100000);
     if (this._stopped) return;
 
     // timers phase
@@ -196,12 +200,21 @@ class EventLoop {
     // Loop continuation / exit decision (§10.4).
     if (this.alive) {
       this._schedule();
-    } else {
-      // Nothing keeps the loop alive → beforeExit; if it queued work, continue.
-      this._onBeforeExit();
-      if (this.alive) this._schedule();
-      else if (!this._stopped) this.stop(this._exitCode);
+      return;
     }
+    // Appears idle. A pending promise chain tied to a stream/async-iterator can
+    // schedule its next nextTick a couple of microtask turns later than our
+    // drain concluded (promises aren't observable to the loop). Give a bounded
+    // grace: settle a few more turns; if work reappears, keep running.
+    for (let i = 0; i < 8 && !this.alive && !this._stopped; i++) {
+      await null;
+      this._drainTicks();
+    }
+    if (this.alive) { this._schedule(); return; }
+    // Truly idle → beforeExit; if it queued work, continue.
+    this._onBeforeExit();
+    if (this.alive) this._schedule();
+    else if (!this._stopped) this.stop(this._exitCode);
   }
 
   onClose(cb) { this._closeCallbacks.push(cb); this._schedule(); }
