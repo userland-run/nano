@@ -181,6 +181,27 @@ function buildHandlers(hub) {
     return {};
   });
   h.set(OP["proc.waitpid"], async (p, a) => hub.kernel.proc.waitpid(a.pid, p.pid));
+  h.set(OP["proc.kill"], (p, a) => (hub.kernel.signals.kill(a.pid, a.signal ?? "SIGTERM"), {}));
+  h.set(OP["proc.pipe"], () => ({ pipeId: hub.kernel.pipes.create().id }));
+  h.set(OP["proc.spawn"], async (p, a) => {
+    // The tier comes from the routing table, not the caller — re-check the
+    // spawn capability against the RESOLVED tier (the generic checkCap saw
+    // only the caller-declared default).
+    const { tier, command } = hub.kernel.router.route(a.argv ?? [], a.hints ?? {});
+    if (!p.caps.spawn[tier]) throw KernelError.capDenied(`spawn.${tier}`, command);
+    const delegate = hub.kernel.router.delegateFor(tier);
+    if (!delegate) {
+      throw new KernelError(ERRNO.ENOSYS, undefined, `no ${tier} spawn delegate registered`);
+    }
+    return delegate({
+      parent: p,
+      argv: a.argv ?? [],
+      cwd: a.cwd ?? p.cwd,
+      env: a.env ?? p.env,
+      caps: a.caps,
+      stdio: a.stdio,
+    });
+  });
 
   // --- env.* ---
   h.set(OP["env.get_all"], (p) => ({ env: { ...p.env } }));

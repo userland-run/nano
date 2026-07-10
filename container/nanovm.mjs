@@ -1740,6 +1740,32 @@ class NanoVM {
     const argv = this._readGuestStrArray(argvPtr);
     const envp = this._readGuestStrArray(envpPtr);
 
+    // Kernel routing seam (spec §14.2): consult the spawn routing table
+    // BEFORE the VM-side resolution. When a non-vm tier delegate is
+    // registered (nodert M1+), the spawn leaves the emulator here with
+    // stdio bridged through Kernel pipes; until then route() always says
+    // "vm" and this block is a strict no-op.
+    if (this._kernel) {
+      const route = this._kernel.router.route(argv.length ? argv : [execPath]);
+      if (route.tier !== "vm" && this._kernel.router.delegateFor(route.tier)) {
+        const delegate = this._kernel.router.delegateFor(route.tier);
+        delegate({
+          parent: this._process,
+          argv: argv.length ? argv : [execPath],
+          env: Object.fromEntries(envp.map((e) => {
+            const i = e.indexOf("=");
+            return i > 0 ? [e.slice(0, i), e.slice(i + 1)] : [e, ""];
+          })),
+          cwd: this._readCwd(),
+          fromExecve: true,
+        });
+        // The guest's exec'ing task ends; the delegate owns the child.
+        this._setA0(dv, 0);
+        dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+        return;
+      }
+    }
+
     // Resolve the target in the guest VFS (following symlinks).
     const target = this._memfs.resolve(execPath, true);
     if (!target || !target.isFile) {

@@ -22,6 +22,9 @@ import { KernelVfs } from "./vfs/vfs.mjs";
 import { PortTable } from "./net/ports.mjs";
 import { FetchBridge } from "./net/fetch-bridge.mjs";
 import { ProcessTable } from "./proc/table.mjs";
+import { PipeRegistry } from "./proc/pipes.mjs";
+import { SignalRouter } from "./proc/signals.mjs";
+import { SpawnRouter } from "./proc/router.mjs";
 import * as caps from "./caps/caps.mjs";
 import * as profiles from "./caps/profiles.mjs";
 
@@ -40,7 +43,9 @@ class Kernel {
     this._channels = new Map();
     this.ports = new PortTable();
     this.fetchBridge = new FetchBridge();
-    this.signals = null; // K7: kernel/proc/signals.mjs
+    this.pipes = new PipeRegistry();
+    this.signals = new SignalRouter(this);
+    this.router = new SpawnRouter(opts.routing);
     this.services = null; // registry for Kernel Services (SWC, DuckDB, …)
   }
 
