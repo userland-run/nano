@@ -78,5 +78,24 @@ await run(
   "roundtrip: svc\n"
 );
 
+// child_process.fork — a node child with an IPC channel (§12.2).
+await (async () => {
+  const kernel = new Kernel();
+  await registerBuiltinServices(kernel);
+  registerNodertDelegate(kernel);
+  kernel.vfs.mkdir("/app", 0o755);
+  kernel.vfs.rootMem.createFile("/app/child.js", `process.on("message", (m) => { if (m.n < 4) process.send({ n: m.n + 1 }); else { console.log("child done " + m.n); process.exit(0); } });`);
+  const src = `const cp = require("child_process");
+   const c = cp.fork("/app/child.js");
+   c.on("message", (m) => { console.log("parent " + m.n); c.send({ n: m.n + 1 }); });
+   c.on("exit", (code) => { console.log("exit " + code); process.exit(0); });
+   c.send({ n: 0 });`;
+  const r = await runNode(kernel, { argv: ["node", "-e", src], source: src, cwd: "/", env: {}, timeoutMs: 20000 });
+  const name = "child_process.fork IPC ping-pong";
+  const want = "parent 1\nparent 3\nchild done 4\nexit 0\n";
+  if (r.stdout === want && r.exitCode === 0) { passed++; console.log(`  PASS: ${name}`); }
+  else { failed++; console.error(`  FAIL: ${name}\n    got ${JSON.stringify(r.stdout)} exit ${r.exitCode}`); if (r.stderr) console.error(`    stderr ${r.stderr.split("\n").slice(0, 2).join(" | ")}`); }
+})();
+
 console.log(`\n=== cross-tier spawn: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);

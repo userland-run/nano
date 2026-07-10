@@ -86,23 +86,85 @@ async function boot(ctx) {
   const moduleCache = new Map();
   const shimCache = new Map();
   globalThis.__nodert_require = requireModule; // used by util.defineLazyProperties
+  // Require a user CJS module by absolute path (ESM→CJS interop in the loader).
+  globalThis.__nodert_require_path = (path) => compileUser(path);
 
-  function requireModule(id) {
+  function requireModule(id, fromDir = "/") {
     const norm = id.replace(/^node:/, "");
     if (shimCache.has(norm)) return shimCache.get(norm);
-    if (moduleCache.has(norm)) return moduleCache.get(norm).exports;
 
     // nodert-provided modules (the M0 bring-up set).
     const shim = shimFactory(norm);
     if (shim) { const ex = shim(); shimCache.set(norm, ex); return ex; }
 
-    // upstream lib modules run verbatim.
-    if (REAL_UPSTREAM.has(norm) && hasModule(norm)) {
-      return compileUpstream(norm);
+    // Relative / absolute / bare user modules resolve over the VFS.
+    if (/^\.\.?\//.test(id) || id.startsWith("/") || (!hasModule(norm) && !isNodeBuiltinName(norm))) {
+      const resolved = resolveUserModule(id, fromDir);
+      if (resolved) return compileUser(resolved);
     }
-    // Fall back to the bundle for anything else pure enough to load.
+
+    if (moduleCache.has(norm)) return moduleCache.get(norm).exports;
+    // upstream lib modules run verbatim (builtins + internals).
     if (hasModule(norm)) return compileUpstream(norm);
     throw makeError("MODULE_NOT_FOUND", `Cannot find module '${id}'`);
+  }
+
+  function isNodeBuiltinName(n) {
+    return ["fs", "path", "os", "util", "events", "stream", "crypto", "net", "http", "https", "url", "querystring", "punycode", "string_decoder", "assert", "buffer", "zlib", "child_process", "process", "worker_threads", "sqlite"].includes(n);
+  }
+
+  // Resolve a user module path over the VFS (relative, absolute, or a
+  // node_modules walk for bare specifiers). Returns a realpath or null.
+  function resolveUserModule(id, fromDir) {
+    const exists = (p) => { try { sync("fs.access", { path: p }); return true; } catch { return false; } };
+    const isDir = (p) => { try { return sync("fs.stat", { path: p }).isDir; } catch { return false; } };
+    const tryFile = (p) => {
+      for (const e of ["", ".js", ".cjs", ".mjs", ".json", ".ts"]) if (exists(p + e) && !isDir(p + e)) return p + e;
+      if (isDir(p)) {
+        if (exists(p + "/package.json")) {
+          try { const main = JSON.parse(sync_readFile(p + "/package.json")).main ?? "index.js"; const m = tryFile(joinPath(p, main)); if (m) return m; } catch {}
+        }
+        for (const idx of ["/index.js", "/index.cjs", "/index.json"]) if (exists(p + idx)) return p + idx;
+      }
+      return null;
+    };
+    if (id.startsWith("/")) return tryFile(id);
+    if (/^\.\.?\//.test(id)) return tryFile(joinPath(fromDir, id));
+    // bare: walk node_modules upward
+    let dir = fromDir;
+    for (;;) {
+      const hit = tryFile(joinPath(dir, "node_modules/" + id));
+      if (hit) return hit;
+      if (dir === "/" || dir === "") break;
+      dir = dir.slice(0, dir.lastIndexOf("/")) || "/";
+    }
+    return null;
+  }
+
+  function compileUser(path) {
+    if (moduleCache.has(path)) return moduleCache.get(path).exports;
+    const raw = sync_readFile(path);
+    if (path.endsWith(".json")) { const ex = JSON.parse(raw); moduleCache.set(path, { exports: ex, loaded: true }); return ex; }
+    let src = raw;
+    if (/\.ts$/.test(path)) { try { src = sync("svc.invoke", { service: "swc", method: "transform", payload: { code: raw } }).result.code; } catch {} }
+    const dir = path.slice(0, path.lastIndexOf("/")) || "/";
+    const mod = { exports: {}, id: path, filename: path, loaded: false, paths: [] };
+    moduleCache.set(path, mod);
+    const req = (spec) => requireModule(spec, dir);
+    req.resolve = (spec) => resolveUserModule(spec, dir) ?? spec;
+    req.cache = {};
+    const fn = new Function("exports", "require", "module", "__filename", "__dirname", "process", "Buffer", "console",
+      `${src}\n//# sourceURL=${path}`);
+    fn.call(mod.exports, mod.exports, req, mod, path, dir, process, Buffer, consoleObj);
+    mod.loaded = true;
+    return mod.exports;
+  }
+
+  function joinPath(a, b) {
+    if (b.startsWith("/")) b = b.slice(1), a = "/";
+    const parts = (a + "/" + b).split("/"); const out = [];
+    for (const s of parts) { if (s === "" || s === ".") continue; if (s === "..") out.pop(); else out.push(s); }
+    return "/" + out.join("/");
   }
 
   function compileUpstream(norm) {
@@ -149,6 +211,31 @@ async function boot(ctx) {
   // watchers) so they keep the process alive like a libuv handle (§10.4).
   globalThis.__nodert_ref = () => loop.refHandle();
   globalThis.__nodert_unref = () => loop.unrefHandle();
+
+  // child_process.fork IPC child side: process.send / process.on('message').
+  if (init.ipcRead != null && !init.isWorker) {
+    let sendBuf = "";
+    proc.send = (message) => {
+      if (init.ipcWrite == null) return false;
+      const line = JSON.stringify({ v: message }) + "\n";
+      sync("proc.pipe_write", { pipeId: init.ipcWrite, data: new TextEncoder().encode(line).buffer });
+      return true;
+    };
+    proc.connected = true;
+    proc.disconnect = () => { proc.connected = false; if (init.ipcWrite != null) { try { sync("proc.pipe_close", { pipeId: init.ipcWrite }); } catch {} } };
+    loop.refHandle();
+    (async () => {
+      try {
+        for (;;) {
+          const r = await busAsync.call("proc.pipe_read", { pipeId: init.ipcRead });
+          if (r.eof) break;
+          sendBuf += new TextDecoder().decode(new Uint8Array(r.data));
+          let nl;
+          while ((nl = sendBuf.indexOf("\n")) >= 0) { const line = sendBuf.slice(0, nl); sendBuf = sendBuf.slice(nl + 1); if (line) try { proc.emit("message", JSON.parse(line).v); } catch {} }
+        }
+      } catch {} finally { loop.unrefHandle(); proc.connected = false; proc.emit("disconnect"); }
+    })();
+  }
 
   // Exit-promise plumbing (declared before the run so a synchronous program
   // that exits during runMain still resolves).
@@ -331,12 +418,15 @@ async function boot(ctx) {
 
   function runMain(source, filename) {
     const mod = { exports: {}, id: ".", filename, loaded: false };
-    const dirname = filename.includes("/") ? filename.slice(0, filename.lastIndexOf("/")) : ".";
+    const dirname = filename.includes("/") ? (filename.slice(0, filename.lastIndexOf("/")) || "/") : proc.cwd();
+    const req = (spec) => requireModule(spec, dirname);
+    req.resolve = (spec) => resolveUserModule(spec, dirname) ?? spec;
+    req.cache = {};
     const fn = new Function(
       "exports", "require", "module", "__filename", "__dirname", "process", "Buffer", "console",
       `${source}\n//# sourceURL=${filename}`
     );
-    fn.call(mod.exports, mod.exports, requireModule, mod, filename, dirname, proc, Buffer, consoleObj);
+    fn.call(mod.exports, mod.exports, req, mod, filename, dirname, proc, Buffer, consoleObj);
   }
 
   // A real upstream Writable whose _write pushes bytes to the Kernel stdio pipe.
@@ -555,9 +645,10 @@ async function boot(ctx) {
     const spawn = (cmd, args, options = {}) => {
       const opts = Array.isArray(args) ? options : (args ?? {});
       const argv = Array.isArray(args) ? [cmd, ...args] : [cmd];
-      const r = sync("proc.spawn", { argv, cwd: opts.cwd ?? proc.cwd(), env: opts.env ?? proc.env, wait: false });
+      const ipc = Array.isArray(opts.stdio) ? opts.stdio.includes("ipc") : !!opts.ipc;
+      const r = sync("proc.spawn", { argv, cwd: opts.cwd ?? proc.cwd(), env: opts.env ?? proc.env, wait: false, ipc });
       const res = r.result ?? r;
-      return makeChildHandle(res);
+      return makeChildHandle(res, ipc);
     };
     return {
       spawnSync, execSync, execFileSync, spawn,
@@ -566,11 +657,12 @@ async function boot(ctx) {
         queueMicrotask(() => { try { const out = execSync(command, typeof options === "object" ? options : {}); cb?.(null, out.toString(), ""); } catch (e) { cb?.(e, e.stdout?.toString() ?? "", e.stderr ?? ""); } });
         return makeChildHandle({ pid: 0 });
       },
-      fork: (modulePath, args = [], options = {}) => spawn("node", [modulePath, ...args], options),
+      // fork() → a node child with an IPC channel (process.send / 'message').
+      fork: (modulePath, args = [], options = {}) => spawn("node", [modulePath, ...(Array.isArray(args) ? args : [])], { ...(Array.isArray(args) ? options : args), ipc: true }),
     };
   }
 
-  function makeChildHandle(res) {
+  function makeChildHandle(res, ipc) {
     const listeners = new Map();
     const emit = (ev, ...a) => (listeners.get(ev) ?? []).forEach((fn) => fn(...a));
     const readable = (pipeId) => ({
@@ -578,26 +670,55 @@ async function boot(ctx) {
       pipe(dest) { if (pipeId != null) drainPipe(pipeId, (b) => dest.write?.(Buffer.from(b))); return dest; },
       setEncoding() { return this; },
     });
+    // IPC (fork): JSON-framed messages over the crossed IPC pipe pair.
+    let ipcBuf = "";
     const child = {
       pid: res.pid ?? 0,
+      connected: !!ipc,
       stdout: readable(res.stdout), stderr: readable(res.stderr),
       stdin: { write: (d) => { if (res.stdin != null) sync("proc.pipe_write", { pipeId: res.stdin, data: typeof d === "string" ? new TextEncoder().encode(d) : d }); }, end: () => { if (res.stdin != null) sync("proc.pipe_close", { pipeId: res.stdin }); } },
       on(ev, fn) { (listeners.get(ev) ?? listeners.set(ev, []).get(ev)).push(fn); return child; },
-      once(ev, fn) { const w = (...a) => { fn(...a); }; return child.on(ev, w); },
+      once(ev, fn) { const w = (...a) => { child.off?.(ev, w); fn(...a); }; return child.on(ev, w); },
+      off(ev, fn) { const l = listeners.get(ev); if (l) { const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); } return child; },
+      send(message) { if (res.ipcWrite != null) { globalThis.__nodert_ref?.(); const line = JSON.stringify({ v: message }) + "\n"; sync("proc.pipe_write", { pipeId: res.ipcWrite, data: new TextEncoder().encode(line).buffer }); globalThis.__nodert_unref?.(); } return true; },
+      disconnect() { child.connected = false; if (res.ipcWrite != null) { try { sync("proc.pipe_close", { pipeId: res.ipcWrite }); } catch {} } },
       kill: (sig) => { if (res.pid) sync("proc.kill", { pid: res.pid, signal: sig ?? "SIGTERM" }); },
     };
+    // fork() default (silent:false): the child's stdout/stderr flow to the
+    // parent's (Node's inherit-ish behavior).
+    if (ipc) {
+      if (res.stdout != null) drainPipe(res.stdout, (b) => proc.stdout.write(Buffer.from(b)));
+      if (res.stderr != null) drainPipe(res.stderr, (b) => proc.stderr.write(Buffer.from(b)));
+    }
+    if (ipc && res.ipcRead != null) {
+      globalThis.__nodert_ref?.();
+      (async () => {
+        try {
+          for (;;) {
+            const r = await busAsync.call("proc.pipe_read", { pipeId: res.ipcRead });
+            if (r.eof) break;
+            ipcBuf += new TextDecoder().decode(new Uint8Array(r.data));
+            let nl;
+            while ((nl = ipcBuf.indexOf("\n")) >= 0) { const line = ipcBuf.slice(0, nl); ipcBuf = ipcBuf.slice(nl + 1); if (line) try { emit("message", JSON.parse(line).v); } catch {} }
+          }
+        } catch {} finally { globalThis.__nodert_unref?.(); child.connected = false; emit("disconnect"); }
+      })();
+    }
     // Bridge child-exit events (async plane) to 'exit'/'close'.
     busAsync?.onEvent?.((msg) => { if (msg.ev === "child-exit" && msg.pid === res.pid) { emit("exit", msg.exitCode, msg.signal); emit("close", msg.exitCode, msg.signal); } });
     return child;
   }
 
   function drainPipe(pipeId, onData) {
+    globalThis.__nodert_ref?.();
     (async () => {
-      for (;;) {
-        const r = sync("proc.pipe_read", { pipeId });
-        if (r.eof) break;
-        if (r.bytes > 0) onData(new Uint8Array(r.data));
-      }
+      try {
+        for (;;) {
+          const r = await busAsync.call("proc.pipe_read", { pipeId });
+          if (r.eof) break;
+          if (r.bytes > 0) onData(new Uint8Array(r.data));
+        }
+      } catch {} finally { globalThis.__nodert_unref?.(); }
     })();
   }
 

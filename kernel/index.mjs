@@ -8,6 +8,8 @@ export { Kernel } from "./kernel.mjs";
 export { FetchBridge, NET_BUFFER_MAX } from "./net/fetch-bridge.mjs";
 export { PortTable } from "./net/ports.mjs";
 export { ServiceRegistry } from "./services/registry.mjs";
+export { CasStore } from "./persist/cas-store.mjs";
+export { materializePackages } from "./persist/node-modules.mjs";
 export {
   registerBuiltinServices,
   createZlibService,

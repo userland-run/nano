@@ -58,7 +58,7 @@ function createEsmLoader(host) {
   function resolveBare(spec, fromDir) {
     let dir = fromDir;
     for (;;) {
-      const base = join(dir, "node_modules", spec);
+      const base = join(dir, "node_modules/" + spec);
       if (host.exists(base) || host.exists(base + ".mjs") || host.exists(base + ".js")) return resolveFile(base);
       if (dir === "/" || dir === "") break;
       dir = dirname(dir);
@@ -66,16 +66,21 @@ function createEsmLoader(host) {
     throw moduleNotFound(spec);
   }
 
-  // ---- graph: path → { source(after type-strip), json, scan, deps:[{spec,path,builtin}] } ----
+  // ---- graph: path → { source(after type-strip), json, cjs, scan, deps:[...] } ----
   function loadModule(path) {
     const raw = host.readFile(path);
     const json = path.endsWith(".json");
-    if (json) return { path, json: true, source: `export default ${raw};`, scan: { statics: [], dynamics: [], hasImportMeta: false }, deps: [] };
+    if (json) return { path, json: true, cjs: false, source: `export default ${raw};`, scan: { statics: [], dynamics: [], hasImportMeta: false }, deps: [] };
     let source = raw;
     if (/\.ts$|\.mts$/.test(path)) source = host.stripTypes(source);
     const scan = scanEsm(source);
+    // A resolved file with no ESM syntax that uses CommonJS is a CJS dependency
+    // (§9.2 step 5): wrap it as an ESM facade re-exporting module.exports.
+    const isCjs = !path.endsWith(".mjs") && scan.statics.length === 0 && scan.dynamics.length === 0 &&
+      !/(^|\n)\s*export\s/.test(source) && /(module\.exports|exports\.|require\s*\()/.test(source);
+    if (isCjs) return { path, json: false, cjs: true, source, scan: { statics: [], dynamics: [], hasImportMeta: false }, deps: [] };
     const deps = scan.statics.map((s) => ({ ...resolveSpec(s.spec, path), spec: s.spec, start: s.start, end: s.end }));
-    return { path, json: false, source, scan, deps };
+    return { path, json: false, cjs: false, source, scan, deps };
   }
 
   function resolveGraph(entryPath) {
@@ -133,9 +138,25 @@ function createEsmLoader(host) {
 
   function buildSingle(graph, path) {
     const mod = graph.get(path);
-    const rewritten = mod.json ? mod.source : rewriteModule(mod, (dep) => JSON.stringify(depUrl(graph, dep)));
+    let rewritten;
+    if (mod.cjs) rewritten = cjsFacadeSource(path);
+    else if (mod.json) rewritten = mod.source;
+    else rewritten = rewriteModule(mod, (dep) => JSON.stringify(depUrl(graph, dep)));
     const { url, revoke } = createModuleUrl(rewritten);
     urls.set(path, url); revokers.push(revoke);
+  }
+
+  // ESM facade for a CJS user module: default = module.exports, plus named
+  // exports for each own identifier-keyed property (cjs-module-lexer-lite).
+  function cjsFacadeSource(path) {
+    let named = [];
+    try {
+      const m = globalThis.__nodert_require_path(path);
+      named = (m && typeof m === "object") ? Object.keys(m).filter((k) => /^[A-Za-z_$][\w$]*$/.test(k) && k !== "default") : [];
+    } catch { /* default only */ }
+    return `const m = globalThis.__nodert_require_path(${JSON.stringify(path)});\n` +
+      `export default (m && m.__esModule && m.default !== undefined) ? m.default : m;\n` +
+      named.map((k) => `export const ${k} = m[${JSON.stringify(k)}];`).join("\n") + "\n";
   }
 
   // Concatenate a multi-node SCC into one module: intra-SCC imports are dropped

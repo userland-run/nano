@@ -26,6 +26,7 @@ import { PipeRegistry } from "./proc/pipes.mjs";
 import { SignalRouter } from "./proc/signals.mjs";
 import { SpawnRouter } from "./proc/router.mjs";
 import { ServiceRegistry } from "./services/registry.mjs";
+import { CasStore } from "./persist/cas-store.mjs";
 import * as caps from "./caps/caps.mjs";
 import * as profiles from "./caps/profiles.mjs";
 
@@ -48,6 +49,16 @@ class Kernel {
     this.signals = new SignalRouter(this);
     this.router = new SpawnRouter(opts.routing);
     this.services = new ServiceRegistry();
+    // Content-addressable store for package artifacts (spec §6.4); node_modules
+    // is hardlink-materialized from it (pnpm model). Opt-in so a bare Kernel
+    // doesn't seed the /.cas tree unless used.
+    this._cas = null;
+  }
+
+  /** Lazily-created content-addressable store (spec §6.4). */
+  get cas() {
+    if (!this._cas) this._cas = new CasStore(this.vfs, this.opts.cas);
+    return this._cas;
   }
 
   /**
@@ -80,6 +91,11 @@ class Kernel {
     const sab = new SharedArrayBuffer(SYNC_HEADER + (opts.window ?? SYNC_WINDOW));
     const sabChannel = new SabChannel(this.hub, proc, sab, () => portChannel._helloDone);
     this._channels.set(pid, { portChannel, sabChannel });
+    // Deliver SIGCHLD-equivalent child-exit events to this process (§7.2) as
+    // async-plane events, so child_process/worker handles fire 'exit'.
+    this.proc.onChildExit(pid, (info) =>
+      this.hub.sendEvent(pid, { ev: "child-exit", pid: info.pid, exitCode: info.exitCode, signal: info.signal })
+    );
     return { pid, token, port: port2, sab };
   }
 
