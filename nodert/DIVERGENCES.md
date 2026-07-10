@@ -23,6 +23,8 @@ Format: `id | area | nodert behavior | reference behavior | rationale | spec | t
 | WASM-TERM | wasip1 apps | no termios / raw-mode TUI | native TTY | wasip1 has no termios; line-oriented tools only | wasm-tier T3 |
 | WASM-SIGNAL | wasip1 apps | kill always terminates | signal delivery | wasip1 has no signals; SIGTERM/SIGKILL both teardown | wasm-tier T4 |
 | WASM-SOCK | wasip1 apps | sock_* → ENOTSUP | sockets | wasip1 has no sockets outside wasi-http (W-3) | wasm-tier P3 |
+| DIV-ESM-CYCLE | ESM circular imports | multi-node SCC concatenated into one module (shared scope) | separate module records with live bindings | The blob-URL model can't cycle across URLs; concatenation resolves the cycle intra-module — top-level name collisions across cycle members are the caller's responsibility | §9.2 |
+| DIV-ESM-DATAURL | ESM module URLs (Node) | data: URLs (headless) | blob: URLs (browser) | Node has no URL.createObjectURL; the browser uses flat blob: URLs. Behavior identical; deep graphs are larger under data: | §9.2 |
 
 ## Upstream modules running VERBATIM (P2 — no reimplementation)
 

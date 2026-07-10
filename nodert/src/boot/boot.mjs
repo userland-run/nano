@@ -21,6 +21,7 @@ import { makeFsModule } from "./fs.mjs";
 import { makeCrypto } from "./crypto.mjs";
 import { makeNet } from "./net.mjs";
 import { makeHttp } from "./http.mjs";
+import { createEsmLoader } from "../loader/esm.mjs";
 
 // Upstream lib modules we run VERBATIM in M0 (pure or near-pure — their
 // dependency closure is satisfied by the bindings + primordials).
@@ -162,9 +163,17 @@ async function boot(ctx) {
     addEventListener?.("unhandledrejection", (ev) => { writeStderr(formatUncaught(ev.reason)); doExit(1); });
   }
 
+  const entrySource = init.source ?? (init.entryPath ? sync_readFile(init.entryPath) : "");
+  const entryPath = init.entryPath ?? "[eval]";
+  if (isEsmEntry(entryPath, entrySource)) {
+    // ESM entries run through the blob-URL loader (async); errors surface as
+    // uncaught → exit 1. The loop still runs for any pending async work.
+    runMainEsm(entrySource, entryPath).catch((e) => { writeStderr(formatUncaught(e)); doExit(1); });
+    loop.start();
+    return waitExit();
+  }
   try {
-    const entrySource = init.source ?? (init.entryPath ? sync_readFile(init.entryPath) : "");
-    runMain(entrySource, init.entryPath ?? "[eval]");
+    runMain(entrySource, entryPath);
   } catch (e) {
     writeStderr(formatUncaught(e));
     doExit(1);
@@ -178,6 +187,43 @@ async function boot(ctx) {
   return waitExit();
 
   // ---- helpers ----
+  function isEsmEntry(path, source) {
+    if (init.inputType === "module") return true;
+    if (init.inputType === "commonjs") return false;
+    if (/\.mjs$|\.mts$/.test(path)) return true;
+    if (/\.cjs$/.test(path)) return false;
+    // -e / .js / .ts: ESM if it uses top-level import/export syntax.
+    return /(^|\n)\s*(import\s[\s\S]*?from\s|import\s*[{*'"]|export\s(default|const|let|var|function|class|\{|\*))/.test(source);
+  }
+
+  function esmLoaderHost() {
+    return {
+      cwd: proc.cwd(),
+      readFile: (p) => sync_readFile(p),
+      exists: (p) => { try { sync("fs.access", { path: p }); return true; } catch { return false; } },
+      isDir: (p) => { try { return sync("fs.stat", { path: p }).isDir; } catch { return false; } },
+      realpath: (p) => { try { return sync("fs.realpath", { path: p }).path; } catch { return p; } },
+      mtime: (p) => { try { return sync("fs.stat", { path: p }).mtime; } catch { return 0; } },
+      stripTypes: (code) => {
+        try { return sync("svc.invoke", { service: "swc", method: "transform", payload: { code } }).result.code; }
+        catch { return code; }
+      },
+    };
+  }
+
+  async function runMainEsm(source, filename) {
+    // Make the CJS require reachable to ESM builtin facades.
+    globalThis.__nodert_require = requireModule;
+    const loader = createEsmLoader(esmLoaderHost());
+    if (source != null && filename === "[eval]") {
+      await loader.evalModule(source, "/[eval].mjs");
+    } else if (init.source != null && init.entryPath == null) {
+      await loader.evalModule(source, "/[eval].mjs");
+    } else {
+      await loader.run(filename);
+    }
+  }
+
   function initUpstreamInternals() {
     // debuglog: bootstrap/node.js calls initializeDebugEnv(NODE_DEBUG).
     try { requireModule("internal/util/debuglog").initializeDebugEnv(proc.env.NODE_DEBUG ?? ""); } catch {}

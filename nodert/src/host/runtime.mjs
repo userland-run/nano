@@ -81,6 +81,7 @@ async function runNode(kernel, opts) {
     protocolVersion: kernel.protocol.major,
     source: source ?? null,
     entryPath: entryPath ?? null,
+    inputType: opts.inputType ?? null,
     stdio: { isTTY: [false, false, false] },
   };
 

@@ -157,6 +157,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert wasm tier"
     fi
+    # M2 ESM blob-URL loader (§9.2)
+    if node "$NODERT_DIR/test/esm.mjs" 2>/dev/null; then
+        ok "nodert ESM loader (import/export/TLA/dynamic/cycles/TS via SWC)"
+    else
+        fail "nodert ESM loader"
+    fi
 else
     skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"
 fi

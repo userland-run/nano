@@ -67,4 +67,19 @@ async function workerContext() {
   });
 }
 
-export { isNode, spawnWorker, workerContext };
+// Create a JS module URL for `source` that host import() can evaluate. The
+// browser uses blob: URLs (flat, short references); Node has no
+// URL.createObjectURL, so it uses data: URLs (imports must be inlined
+// bottom-up by the caller). Returns { url, revoke }.
+function createModuleUrl(source) {
+  if (!isNode && typeof URL !== "undefined" && URL.createObjectURL) {
+    const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+    return { url, revoke: () => URL.revokeObjectURL(url) };
+  }
+  const url = "data:text/javascript;charset=utf-8," + encodeURIComponent(source);
+  return { url, revoke: () => {} };
+}
+
+const supportsBlobUrls = () => !isNode && typeof URL !== "undefined" && !!URL.createObjectURL;
+
+export { isNode, spawnWorker, workerContext, createModuleUrl, supportsBlobUrls };
