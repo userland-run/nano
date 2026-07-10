@@ -15,6 +15,17 @@ Format: `id | area | nodert behavior | reference behavior | rationale | spec | t
 | DIV-FS-M0 | `fs` | nodert bus-backed fs module | upstream `lib/fs.js` | M0 covers sync+promises+callbacks; upstream fs.js + streams in M1 | §8.5 |
 | DIV-INSPECT-PROMISE | `util.inspect` of promises/proxies | shows `[object]`/degraded | full introspection | `getPromiseDetails`/`getProxyDetails` are not implementable on the host engine | §8.4 |
 | DIV-SQLITE-DUCKDB | `node:sqlite` | backed by DuckDB-wasm + sqlite core extension | real embedded SQLite | User decision; dialect/error-code differences vs embedded SQLite | §8.8 |
+| DIV-URL-M0 | `require("url")` | host WHATWG URL/URLSearchParams + lean helpers | upstream `lib/url.js` | upstream url needs the ada `url` binding (M2); host URL is WHATWG-standard | §8.4 |
+| DIV-RSPACK | `rspack` service | ERR_NODERT_UNSUPPORTED | native bundler | No browser-wasm build of Rspack exists; use the VM or esbuild-wasm | §13 |
+
+## Upstream modules running VERBATIM (P2 — no reimplementation)
+
+These vendored `lib/*.js` modules execute byte-identical on the host engine over
+the nodert bindings (verified in `test/upstream.mjs`): **events** (EventEmitter),
+**querystring**, **punycode**, **string_decoder** (native binding, multibyte-safe),
+**assert**, **path**. This list grows each milestone as more bindings land; the
+lean nodert shims (Buffer/console/fs/url above) are replaced by their upstream
+counterparts as their dependency closures (streams, ada) come online in M1/M2.
 
 ## Notes
 

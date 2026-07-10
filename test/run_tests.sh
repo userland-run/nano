@@ -139,6 +139,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert cross-tier spawn"
     fi
+    # Upstream lib/*.js run verbatim (P2 fidelity)
+    if node "$NODERT_DIR/test/upstream.mjs" 2>/dev/null; then
+        ok "nodert upstream-verbatim (events/qs/punycode/string_decoder/assert/path)"
+    else
+        fail "nodert upstream-verbatim"
+    fi
 else
     skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"
 fi

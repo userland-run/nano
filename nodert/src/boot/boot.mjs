@@ -328,6 +328,30 @@ async function boot(ctx) {
       case "zlib": case "node:zlib": return () => makeZlib();
       case "node:sqlite": case "sqlite": return () => makeSqlite();
       case "child_process": case "node:child_process": return () => makeChildProcess();
+      // url: the upstream module needs the ada `url` binding (M2). The host
+      // URL/URLSearchParams are WHATWG-standard and present in the worker, so
+      // expose them plus the file-URL helpers. DIV-URL-M0.
+      case "url": case "node:url": return () => ({
+        URL: globalThis.URL, URLSearchParams: globalThis.URLSearchParams,
+        fileURLToPath: (u) => { const s = String(u).replace(/^file:\/\//, ""); return decodeURIComponent(s) || "/"; },
+        pathToFileURL: (p) => new globalThis.URL("file://" + (p.startsWith("/") ? p : "/" + p)),
+        parse: (s) => { try { const u = new globalThis.URL(s); return { href: u.href, protocol: u.protocol, host: u.host, hostname: u.hostname, port: u.port, pathname: u.pathname, search: u.search, hash: u.hash, query: u.search.slice(1) }; } catch { return { href: s, pathname: s }; } },
+        format: (u) => (u instanceof globalThis.URL ? u.href : String(u)),
+        domainToASCII: (d) => d, domainToUnicode: (d) => d,
+      });
+      // The bootstrap spine is not a requirable module (it declares
+      // internalBinding and would clash with the wrapper param). Upstream
+      // modules require it only for BuiltinModule metadata — a minimal shim.
+      case "internal/bootstrap/realm": return () => ({
+        BuiltinModule: {
+          map: new Map(),
+          exists: (id) => hasModule(id),
+          normalizeRequirableId: (id) => id.replace(/^node:/, ""),
+          canBeRequiredByUsers: () => true,
+          canBeRequiredWithoutScheme: () => true,
+          getSchemeOnlyModuleNames: () => [],
+        },
+      });
       default: return null;
     }
   }

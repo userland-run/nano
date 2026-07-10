@@ -57,11 +57,7 @@ function createBindings(ctx) {
     encoding_binding: () => makeEncodingBinding(),
     util: () => makeUtilBinding(privateSymbols),
     types: () => makeTypesBinding(),
-    string_decoder: () => ({
-      // internal/string_decoder.js provides the JS; the binding only supplies
-      // the kNativeDecoder symbol + a Buffer helper it uses on flush.
-      encodings: ["ascii", "utf8", "utf16le", "ucs2", "base64", "base64url", "latin1", "binary", "hex"],
-    }),
+    string_decoder: () => makeStringDecoderBinding(),
     icu: () => ({
       getStringWidth: (s) => String(s).length,
       icuErrName: () => "",
@@ -287,6 +283,69 @@ function makeUtilBinding(privateSymbols) {
     sleep: () => {},
     toUSVString: (s) => s.toWellFormed?.() ?? s,
   };
+}
+
+// Native string_decoder binding: the state Buffer holds up to 4 pending bytes
+// of an incomplete multibyte char plus bookkeeping. Field offsets are supplied
+// to the upstream module, so nodert owns the layout. UTF-8 correct (the common
+// case); latin1/ascii are trivial; utf16le buffers on odd byte counts.
+function makeStringDecoderBinding() {
+  const F = { kIncompleteChars: 0, kIncompleteEnd: 4, kMissingBytes: 4, kBufferedBytes: 5, kEncodingField: 6, kSize: 7 };
+  const ENCODINGS = ["utf8", "ucs2", "utf16le", "latin1", "base64", "base64url", "ascii", "hex", "binary"];
+  const dec = new TextDecoder("utf-8");
+
+  const utf8SeqLen = (byte) => byte < 0x80 ? 1 : byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 0;
+
+  return {
+    kSize: F.kSize,
+    kIncompleteCharactersStart: F.kIncompleteChars,
+    kIncompleteCharactersEnd: F.kIncompleteEnd,
+    kMissingBytes: F.kMissingBytes,
+    kBufferedBytes: F.kBufferedBytes,
+    kEncodingField: F.kEncodingField,
+    encodings: ENCODINGS,
+    decode(state, buf) {
+      const enc = ENCODINGS[state[F.kEncodingField]] ?? "utf8";
+      if (enc === "latin1" || enc === "binary" || enc === "ascii") {
+        let s = ""; for (const b of buf) s += String.fromCharCode(enc === "ascii" ? b & 0x7f : b); return s;
+      }
+      if (enc === "utf16le" || enc === "ucs2") {
+        const buffered = state[F.kBufferedBytes];
+        let all = buffered ? concat(state.subarray(F.kIncompleteChars, F.kIncompleteChars + buffered), buf) : buf;
+        const complete = all.length - (all.length % 2);
+        let s = ""; for (let i = 0; i + 1 < complete; i += 2) s += String.fromCharCode(all[i] | (all[i + 1] << 8));
+        const rem = all.length - complete;
+        state[F.kBufferedBytes] = rem; if (rem) state[F.kIncompleteChars] = all[complete];
+        return s;
+      }
+      // utf8
+      const buffered = state[F.kBufferedBytes];
+      let all = buffered ? concat(state.subarray(F.kIncompleteChars, F.kIncompleteChars + buffered), buf) : buf;
+      // How many trailing bytes are an incomplete sequence?
+      let incomplete = 0;
+      for (let i = all.length - 1; i >= 0 && i >= all.length - 4; i--) {
+        const need = utf8SeqLen(all[i]);
+        if (need === 0) continue; // continuation byte
+        if (i + need > all.length) incomplete = all.length - i;
+        break;
+      }
+      const completeLen = all.length - incomplete;
+      const out = dec.decode(all.subarray(0, completeLen));
+      state[F.kBufferedBytes] = incomplete;
+      for (let i = 0; i < incomplete; i++) state[F.kIncompleteChars + i] = all[completeLen + i];
+      return out;
+    },
+    flush(state) {
+      const buffered = state[F.kBufferedBytes];
+      state[F.kBufferedBytes] = 0; state[F.kMissingBytes] = 0;
+      if (!buffered) return "";
+      const enc = ENCODINGS[state[F.kEncodingField]] ?? "utf8";
+      const bytes = state.subarray(F.kIncompleteChars, F.kIncompleteChars + buffered);
+      if (enc === "utf16le" || enc === "ucs2") return "";
+      return dec.decode(bytes); // replacement char for a dangling utf8 sequence
+    },
+  };
+  function concat(a, b) { const out = new Uint8Array(a.length + b.length); out.set(a); out.set(b, a.length); return out; }
 }
 
 function makeTypesBinding() {
