@@ -31,18 +31,23 @@ function buildModule(spec) {
   const typeSec = vec(spec.types.map((t) => [0x60, ...vec(t.params.map((p) => [p])), ...vec(t.results.map((r) => [r]))]));
   bytes.push(...section(1, typeSec));
 
-  // import section (2)
-  if (spec.imports.length) {
-    const importSec = vec(spec.imports.map((i) => [...str(i.module), ...str(i.name), KIND_FUNC, ...uleb(i.type)]));
-    bytes.push(...section(2, importSec));
+  // import section (2) — funcs, plus an optional shared memory import.
+  if (spec.imports.length || spec.importMemory) {
+    const importItems = spec.imports.map((i) => [...str(i.module), ...str(i.name), KIND_FUNC, ...uleb(i.type)]);
+    if (spec.importMemory) {
+      const m = spec.importMemory;
+      // limits flags: 0x03 = has-max + shared
+      importItems.push([...str(m.module ?? "env"), ...str(m.name ?? "memory"), KIND_MEM, 0x03, ...uleb(m.min), ...uleb(m.max)]);
+    }
+    bytes.push(...section(2, vec(importItems)));
   }
 
   // function section (3)
   const funcSec = vec(spec.funcs.map((f) => uleb(f.type)));
   bytes.push(...section(3, funcSec));
 
-  // memory section (5)
-  bytes.push(...section(5, vec([[0x00, ...uleb(spec.memory.min)]])));
+  // memory section (5) — only when the module OWNS its memory (not imported).
+  if (spec.memory) bytes.push(...section(5, vec([[0x00, ...uleb(spec.memory.min)]])));
 
   // export section (7)
   const exportSec = vec(spec.exports.map((e) => [...str(e.name), e.kind, ...uleb(e.index)]));
@@ -165,4 +170,49 @@ function readFileModule(relPath) {
   });
 }
 
-export { helloModule, exitModule, readFileModule, buildModule };
+// wasip1-threads module (minimal, exercises X4): imports a SHARED memory +
+// wasi_thread_spawn. _start spawns one thread and spin-waits (atomic load) on a
+// flag at addr 0; the thread (wasi_thread_start) atomically stores 1 to that
+// flag. Real parallelism via the shared SAB is required for the spin to end.
+// The process exits with the flag value → exit code 1 proves the thread ran and
+// the write was visible across workers.
+function threadsModule() {
+  const CALL = 0x10, DROP = 0x1a, LOOP = 0x03, BR_IF = 0x0d, BR = 0x0c, END = 0x0b, BLOCK = 0x02, I32_CONST = 0x41;
+  const ATOMIC_LOAD = [0xfe, 0x10]; const ATOMIC_STORE = [0xfe, 0x17]; const MEMARG = [0x02, 0x00]; // align 2, offset 0
+  return buildModule({
+    types: [
+      { params: [I32], results: [I32] },   // 0: thread-spawn (arg)->tid
+      { params: [I32], results: [] },       // 1: proc_exit(code)
+      { params: [], results: [] },          // 2: _start
+      { params: [I32, I32], results: [] },  // 3: wasi_thread_start(tid, arg)
+    ],
+    importMemory: { module: "env", name: "memory", min: 1, max: 1 },
+    imports: [
+      { module: "wasi_snapshot_preview1", name: "thread-spawn", type: 0 }, // func 0
+      { module: "wasi_snapshot_preview1", name: "proc_exit", type: 1 },    // func 1
+    ],
+    funcs: [
+      // _start (func 2)
+      { type: 2, body: [
+        I32_CONST, 0x00, CALL, ...uleb(0), DROP,     // wasi_thread_spawn(0)
+        BLOCK, 0x40,
+          LOOP, 0x40,
+            I32_CONST, 0x00, ...ATOMIC_LOAD, ...MEMARG,  // atomic.load(0)
+            BR_IF, 0x01,                                 // != 0 → exit block
+            BR, 0x00,                                    // else spin
+          END,
+        END,
+        I32_CONST, 0x00, ...ATOMIC_LOAD, ...MEMARG,  // load flag value
+        CALL, ...uleb(1),                            // proc_exit(flag)
+      ] },
+      // wasi_thread_start(tid, arg) (func 3): atomic.store(0, 1)
+      { type: 3, body: [ I32_CONST, 0x00, I32_CONST, 0x01, ...ATOMIC_STORE, ...MEMARG ] },
+    ],
+    exports: [
+      { name: "_start", kind: 0, index: 2 },
+      { name: "wasi_thread_start", kind: 0, index: 3 },
+    ],
+  });
+}
+
+export { helloModule, exitModule, readFileModule, threadsModule, buildModule };

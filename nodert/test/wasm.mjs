@@ -11,11 +11,12 @@
 
 import { Kernel, registerBuiltinServices } from "../../kernel/index.mjs";
 import { normalizeCaps } from "../../kernel/caps/caps.mjs";
-import { runWasm } from "../src/host/wasm-runtime.mjs";
+import { runWasm, moduleCacheStats } from "../src/host/wasm-runtime.mjs";
+import { inspectWasm } from "../src/wasm/inspect.mjs";
 import { registerWasmDelegate } from "../src/host/wasm-delegate.mjs";
 import { runNode } from "../src/host/runtime.mjs";
 import { registerNodertDelegate } from "../src/host/delegate.mjs";
-import { helloModule, exitModule, readFileModule } from "./wasm-fixtures.mjs";
+import { helloModule, exitModule, readFileModule, threadsModule } from "./wasm-fixtures.mjs";
 
 let passed = 0, failed = 0, current = "";
 function assert(c, m) { if (!c) { console.error(`  FAIL: ${current} - ${m}`); failed++; return false; } return true; }
@@ -89,5 +90,48 @@ await test("wasm on PATH: routed via proc.spawn (kind:wasm)", async () => {
   assertEqual(r.stdout, "node saw: greetings from PATH\n", "node → wasm cross-tier spawn");
 });
 
-console.log(`\n=== nodert wasm tier (W-1): ${passed} passed, ${failed} failed ===`);
+// --- W-2: inspect, module cache, syscall counters ---
+
+await test("wasm inspect: imports/exports/memory/wasi/threads (static)", async () => {
+  const info = inspectWasm(helloModule("x\n"));
+  assertEqual(info.wasiVersion, "wasip1", "wasip1 detected");
+  assertEqual(info.threads, false, "no threads");
+  assert(info.imports.some((i) => i.name === "fd_write"), "fd_write import");
+  assert(info.exports.some((e) => e.name === "_start"), "_start export");
+  assert(info.memory && info.memory.min >= 1, "memory limits parsed");
+  assert(!info.hasStart, "no start section (uses _start export)");
+});
+
+await test("module cache: second launch reuses the compiled Module (X5)", async () => {
+  const bytes = helloModule("cache me\n");
+  const k1 = await newKernel();
+  const r1 = await runWasm(k1, { wasmBytes: bytes, argv: ["h.wasm"], moduleKey: "cache-test", timeoutMs: 15000 });
+  const k2 = await newKernel();
+  const r2 = await runWasm(k2, { wasmBytes: bytes, argv: ["h.wasm"], moduleKey: "cache-test", timeoutMs: 15000 });
+  assert(r1.cached === false, "first launch compiles");
+  assert(r2.cached === true, "second launch is cached");
+  assertEqual(r1.stdout, "cache me\n", "output unaffected");
+});
+
+await test("syscall counters (M3 running-instance stats)", async () => {
+  const k = await newKernel();
+  const r = await runWasm(k, { wasmBytes: helloModule("counted\n"), argv: ["h.wasm"], timeoutMs: 15000 });
+  assert(r.stats && r.stats.syscalls >= 1, `syscall count ${r.stats?.syscalls}`);
+  assertEqual(r.stats.counts.fd_write, 1, "one fd_write");
+  assert(r.stats.memoryPages >= 1, "memory page count");
+});
+
+await test("wasip1-threads: wasi_thread_spawn + shared memory (X4)", async () => {
+  const info = inspectWasm(threadsModule());
+  assert(info.threads, "inspect reports threads");
+  assert(info.threadsSpawn, "inspect sees thread-spawn import");
+  const k = await newKernel();
+  const r = await runWasm(k, { wasmBytes: threadsModule(), argv: ["threads.wasm"], timeoutMs: 15000 });
+  // The sibling thread (own worker) atomic-stored 1 to the shared SAB; the main
+  // spin-waited (atomic load) and exited with the flag value.
+  assertEqual(r.exitCode, 1, "cross-worker shared-memory write observed");
+  assertEqual(r.stats.threads, 1, "one thread spawned");
+});
+
+console.log(`\n=== nodert wasm tier (W-1+W-2): ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);
