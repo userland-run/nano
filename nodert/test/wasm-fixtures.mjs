@@ -170,6 +170,45 @@ function readFileModule(relPath) {
   });
 }
 
+/**
+ * stdinEcho: read up to 256 bytes from fd 0 (stdin), then write a fixed prefix
+ * followed by those bytes to fd 1 (stdout). Proves a per-invoke WASI FILTER —
+ * the shape the WASI service runner drives (request → stdin → wasm → stdout →
+ * response). The prefix proves the wasm actually ran (output = const + input).
+ */
+function stdinEchoModule(prefix = "WASI:") {
+  const iovOff = 0, nreadOff = 8, nwrittenOff = 12, bufOff = 64, prefixOff = 300;
+  const prefixBytes = [...enc.encode(prefix)];
+  const setIov = (buf, lenExpr) => [
+    I32_CONST, ...sleb(iovOff), I32_CONST, ...sleb(buf), I32_STORE, 0x02, 0x00,
+    I32_CONST, ...sleb(iovOff + 4), ...lenExpr, I32_STORE, 0x02, 0x00,
+  ];
+  return buildModule({
+    types: [
+      { params: [I32, I32, I32, I32], results: [I32] }, // 0: fd_write / fd_read
+      { params: [], results: [] },                       // 1: _start
+    ],
+    imports: [
+      { module: "wasi_snapshot_preview1", name: "fd_write", type: 0 }, // func 0
+      { module: "wasi_snapshot_preview1", name: "fd_read", type: 0 },  // func 1
+    ],
+    funcs: [{ type: 1, body: [
+      // read stdin into bufOff (len 256)
+      ...setIov(bufOff, [I32_CONST, ...sleb(256)]),
+      I32_CONST, 0x00, I32_CONST, ...sleb(iovOff), I32_CONST, 0x01, I32_CONST, ...sleb(nreadOff), CALL, ...uleb(1), DROP,
+      // write the prefix
+      ...setIov(prefixOff, [I32_CONST, ...sleb(prefixBytes.length)]),
+      I32_CONST, 0x01, I32_CONST, ...sleb(iovOff), I32_CONST, 0x01, I32_CONST, ...sleb(nwrittenOff), CALL, ...uleb(0), DROP,
+      // write the bytes read (len = load nreadOff)
+      ...setIov(bufOff, [I32_CONST, ...sleb(nreadOff), I32_LOAD, 0x02, 0x00]),
+      I32_CONST, 0x01, I32_CONST, ...sleb(iovOff), I32_CONST, 0x01, I32_CONST, ...sleb(nwrittenOff), CALL, ...uleb(0), DROP,
+    ] }],
+    memory: { min: 1 },
+    exports: [{ name: "memory", kind: KIND_MEM, index: 0 }, { name: "_start", kind: KIND_FUNC, index: 2 }],
+    data: [{ offset: prefixOff, bytes: prefixBytes }],
+  });
+}
+
 // wasip1-threads module (minimal, exercises X4): imports a SHARED memory +
 // wasi_thread_spawn. _start spawns one thread and spin-waits (atomic load) on a
 // flag at addr 0; the thread (wasi_thread_start) atomically stores 1 to that
@@ -215,4 +254,4 @@ function threadsModule() {
   });
 }
 
-export { helloModule, exitModule, readFileModule, threadsModule, buildModule };
+export { helloModule, exitModule, readFileModule, threadsModule, stdinEchoModule, buildModule };

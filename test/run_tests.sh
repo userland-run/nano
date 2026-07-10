@@ -175,6 +175,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert wasm tier"
     fi
+    # WASM tier W-3: WASI service runner (wasm module as a svc.* Kernel Service)
+    if node "$NODERT_DIR/test/wasi-service.mjs" 2>/dev/null; then
+        ok "nodert WASI service runner (wasm-service over svc.* bus)"
+    else
+        fail "nodert WASI service runner"
+    fi
     # M2 ESM blob-URL loader (§9.2)
     if node "$NODERT_DIR/test/esm.mjs" 2>/dev/null; then
         ok "nodert ESM loader (import/export/TLA/dynamic/cycles/TS via SWC)"

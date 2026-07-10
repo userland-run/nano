@@ -39,6 +39,14 @@ async function runWasm(kernel, opts) {
   const stdout = opts._stdout ?? kernel.pipes.create();
   const stderr = opts._stderr ?? kernel.pipes.create();
 
+  // Feed a request payload to fd 0 for a per-invoke filter (the WASI service
+  // runner): write the bytes and close the write end so fd_read sees EOF.
+  if (opts.stdinBytes != null && !opts._stdin) {
+    const b = typeof opts.stdinBytes === "string" ? new TextEncoder().encode(opts.stdinBytes) : opts.stdinBytes;
+    stdin.write(b);
+    stdin.closeWrite();
+  }
+
   const proc = opts._reuseProc ?? kernel.registerProcess({
     kind: "wasm", argv, cwd, env: { ...env }, caps, ppid,
     stdio: [stdin.id, stdout.id, stderr.id],
