@@ -43,10 +43,12 @@ async function runNode(kernel, opts) {
 
   const chan = kernel.allocChannel(proc.pid);
 
-  // The worker reads the node-lib bundle + fixtures from disk under Node. A
-  // browser worker can't, so the HOST loads them (cached) and passes the bytes
-  // in init (K9-browser). `opts.lib` lets a caller inject a pre-loaded bundle.
-  const lib = opts.lib ?? (isNode ? null : await loadLibBundle({ fetch: opts.fetch }));
+  // The host loads the node-lib bundle + fixtures ONCE (cached, SAB-backed) and
+  // passes them in init — required in the browser (no fs/brotli), and a win
+  // under Node too: every worker shares the bundle zero-copy and skips its own
+  // disk-read + brotli-decompress (~9ms/spawn). `opts.lib` injects a pre-loaded
+  // bundle; `opts.noHostLib` forces the worker's own disk path (Node only).
+  const lib = opts.lib ?? (opts.noHostLib && isNode ? null : await loadLibBundle({ fetch: opts.fetch }));
 
   let outBuf = "";
   let errBuf = "";

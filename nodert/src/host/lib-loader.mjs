@@ -35,8 +35,23 @@ let cached = null;
 async function loadLibBundle(opts = {}) {
   if (cached && !opts.force) return cached;
   const result = isNode && !opts.forceBrowser ? await loadFromDisk() : await loadByFetch(opts.fetch ?? globalThis.fetch);
+  // Back the decompressed bytes with a SharedArrayBuffer so every worker spawn
+  // shares them ZERO-COPY (no re-clone) and — the win — skips its own
+  // disk-read + brotli-decompress (~9ms/spawn under Node). The bundle is
+  // immutable, so sharing is safe. Requires COOP/COEP, which nodert needs
+  // anyway; falls back to the plain bytes if SAB is unavailable.
+  result.libBytes = toShared(result.libBytes);
   if (!opts.force) cached = result;
   return result;
+}
+
+function toShared(u8) {
+  if (typeof SharedArrayBuffer === "undefined") return u8;
+  if (u8.buffer instanceof SharedArrayBuffer) return u8;
+  const sab = new SharedArrayBuffer(u8.length);
+  const view = new Uint8Array(sab);
+  view.set(u8);
+  return view;
 }
 
 async function loadFromDisk() {

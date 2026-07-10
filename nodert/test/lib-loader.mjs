@@ -48,6 +48,11 @@ await test("Node disk branch returns index + decompressed bytes + fixtures", asy
   for (const k of ["options", "config", "constants", "errno"]) assert(fixtures[k] && typeof fixtures[k] === "object", `fixture ${k}`);
 });
 
+await test("bundle bytes are SharedArrayBuffer-backed (zero-copy per spawn)", async () => {
+  const { libBytes } = await loadLibBundle({ force: true });
+  assert(libBytes.buffer instanceof SharedArrayBuffer, "libBytes shares a SAB — workers skip re-decompress + re-clone");
+});
+
 await test("browser branch (gzip + fetch) inflates to the SAME bytes as the .br disk path", async () => {
   const disk = await loadLibBundle({ force: true }); // Node/brotli
   const browser = await loadLibBundle({ force: true, forceBrowser: true, fetch: diskFetch }); // gzip/DecompressionStream
