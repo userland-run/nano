@@ -5,6 +5,8 @@
 // kernel/index.mjs — public entry for the Kernel (spec UL-SPEC/nodert §4).
 
 export { Kernel } from "./kernel.mjs";
+export { FetchBridge, NET_BUFFER_MAX } from "./net/fetch-bridge.mjs";
+export { PortTable } from "./net/ports.mjs";
 export { ERRNO, ERRNO_NAMES, KernelError } from "./errno.mjs";
 export {
   PROTOCOL_MAJOR,

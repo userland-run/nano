@@ -22,6 +22,9 @@ class SyscallBusHub {
     this._nextWatchId = 1;
     /** @type {Map<number, (ev: object, transfers?: any[]) => void>} pid → event sink */
     this._eventSinks = new Map();
+    /** @type {Map<number, { pid: number, st: object }>} fetch streamId → owner+stream */
+    this._netStreams = new Map();
+    this._nextStreamId = 1;
     this._handlers = buildHandlers(this);
   }
 
@@ -45,6 +48,13 @@ class SyscallBusHub {
         this._watches.delete(watchId);
       }
     }
+    for (const [streamId, e] of this._netStreams) {
+      if (e.pid === pid) {
+        this.kernel.fetchBridge.cancelStream(e.st);
+        this._netStreams.delete(streamId);
+      }
+    }
+    this.kernel.ports?.closeAllFor(pid);
   }
 
   /**
@@ -115,6 +125,44 @@ function buildHandlers(hub) {
     if (!w || w.pid !== p.pid) throw new KernelError(ERRNO.EINVAL, undefined, "unknown watch");
     vfs().watch.unwatch(w.registryId);
     hub._watches.delete(a.watchId);
+    return {};
+  });
+
+  // --- net.* (K6: listen registration + host-fetch; socket data flow is M1) ---
+  h.set(OP["net.listen"], (p, a) => ({
+    port: hub.kernel.ports.listen(p.pid, a.port ?? 0, a.acceptor ?? { kind: p.kind }),
+  }));
+  h.set(OP["net.close_listener"], (p, a) => (hub.kernel.ports.close(p.pid, a.port), {}));
+  h.set(OP["net.fetch_open"], async (p, a) => {
+    const st = await hub.kernel.fetchBridge.open(a);
+    const streamId = hub._nextStreamId++;
+    hub._netStreams.set(streamId, { pid: p.pid, st });
+    return { streamId };
+  });
+  h.set(OP["net.fetch_read"], async (p, a) => {
+    const e = hub._netStreams.get(a.streamId);
+    if (!e || e.pid !== p.pid) throw new KernelError(ERRNO.EBADF, undefined, "unknown stream");
+    const dest = new Uint8Array(Math.min(a.len ?? 65536, 1 << 20));
+    for (;;) {
+      const r = hub.kernel.fetchBridge.readFromStream(e.st, dest);
+      if (r.copied > 0) return { bytes: r.copied, data: dest.buffer.slice(0, r.copied), eof: false };
+      if (r.eof) {
+        hub._netStreams.delete(a.streamId);
+        return { bytes: 0, eof: true };
+      }
+      if (r.error) {
+        hub._netStreams.delete(a.streamId);
+        throw new KernelError(ERRNO.EIO, undefined, String(r.error?.message ?? r.error));
+      }
+      await hub.kernel.fetchBridge.parkStream(e.st);
+    }
+  });
+  h.set(OP["net.fetch_abort"], (p, a) => {
+    const e = hub._netStreams.get(a.streamId);
+    if (e && e.pid === p.pid) {
+      hub.kernel.fetchBridge.cancelStream(e.st);
+      hub._netStreams.delete(a.streamId);
+    }
     return {};
   });
 

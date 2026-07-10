@@ -19,6 +19,8 @@ import { SyscallBusHub } from "./bus/hub.mjs";
 import { PortChannel } from "./bus/port-channel.mjs";
 import { SabChannel, SYNC_HEADER, SYNC_WINDOW } from "./bus/sab-channel.mjs";
 import { KernelVfs } from "./vfs/vfs.mjs";
+import { PortTable } from "./net/ports.mjs";
+import { FetchBridge } from "./net/fetch-bridge.mjs";
 import { ProcessTable } from "./proc/table.mjs";
 import * as caps from "./caps/caps.mjs";
 import * as profiles from "./caps/profiles.mjs";
@@ -36,8 +38,8 @@ class Kernel {
     this.hub = new SyscallBusHub(this);
     /** @type {Map<number, PortChannel>} pid → kernel-side channel */
     this._channels = new Map();
-    this.ports = null; // K6: kernel/net/ports.mjs
-    this.fetchBridge = null; // K6: kernel/net/fetch-bridge.mjs
+    this.ports = new PortTable();
+    this.fetchBridge = new FetchBridge();
     this.signals = null; // K7: kernel/proc/signals.mjs
     this.services = null; // registry for Kernel Services (SWC, DuckDB, …)
   }
