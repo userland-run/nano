@@ -157,6 +157,13 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert cross-tier spawn"
     fi
+    # Real-tool proof: the actual TypeScript compiler on the host engine.
+    # Self-skips if a typescript checkout isn't reachable (heaviest nodert phase).
+    if node "$NODERT_DIR/test/tsc.mjs" 2>/dev/null; then
+        ok "nodert real-tool: tsc (version + compile + type-check on the host engine)"
+    else
+        fail "nodert real-tool: tsc"
+    fi
     # Upstream lib/*.js run verbatim (P2 fidelity)
     if node "$NODERT_DIR/test/upstream.mjs" 2>/dev/null; then
         ok "nodert upstream-verbatim (events/qs/punycode/string_decoder/assert/path/streams/util/console)"

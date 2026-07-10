@@ -134,6 +134,57 @@ function makeFsModule({ sync, busAsync, Buffer, EventEmitter }) {
   const chmodSync = (path, mode) => sync("fs.chmod", { path: String(path), mode });
   const copyFileSync = (src, dest) => writeFileSync(dest, readFileSync(src));
 
+  // --- fd-based sync ops (open/read/write/close/fstat/ftruncate/fsync) ---
+  // Real tools (tsc, esbuild) write output through an fd, not writeFileSync.
+  // Backed by the Kernel fs.* fd ops; the shim tracks the current offset per fd
+  // (the bus ops take an explicit position) and the path for fstat.
+  const openFds = new Map(); // fd -> { path, flags, pos }
+  const openSync = (path, flags = "r", mode = 0o666) => {
+    const p = String(path);
+    const fl = typeof flags === "number" ? flags : flagToInt(flags);
+    const fd = sync("fs.open", { path: p, flags: fl, mode }).fd;
+    let pos = 0;
+    if (fl & O_APPEND) { try { pos = sync("fs.stat", { path: p }).size ?? 0; } catch { pos = 0; } }
+    openFds.set(fd, { path: p, flags: fl, pos });
+    return fd;
+  };
+  const closeSync = (fd) => { sync("fs.close", { fd }); openFds.delete(fd); };
+  const writeSync = (fd, data, a, b, c) => {
+    const e = openFds.get(fd);
+    let bytes, position;
+    if (typeof data === "string") {
+      // writeSync(fd, string[, position[, encoding]])
+      bytes = enc.encode(data);
+      position = typeof a === "number" ? a : null;
+    } else {
+      // writeSync(fd, buffer[, offset[, length[, position]]])
+      const u8 = data instanceof Uint8Array ? data : new Uint8Array(data.buffer ?? data);
+      const offset = typeof a === "number" ? a : 0;
+      const length = typeof b === "number" ? b : u8.length - offset;
+      bytes = u8.subarray(offset, offset + length);
+      position = typeof c === "number" ? c : null;
+    }
+    const pos = position != null ? position : (e ? e.pos : 0);
+    let written = 0;
+    while (written < bytes.length) { const r = sync("fs.write", { fd, data: bytes.subarray(written), pos: pos + written }); if (!r.bytes) break; written += r.bytes; }
+    if (position == null && e) e.pos += written;
+    return written;
+  };
+  const readSync = (fd, buffer, offset = 0, length, position = null) => {
+    const e = openFds.get(fd);
+    const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer.buffer ?? buffer);
+    const len = typeof length === "number" ? length : u8.length - offset;
+    const pos = position != null ? position : (e ? e.pos : 0);
+    const r = sync("fs.read", { fd, len, pos });
+    if (r.bytes) u8.set(new Uint8Array(r.data), offset);
+    if (position == null && e) e.pos += r.bytes;
+    return r.bytes;
+  };
+  const fstatSync = (fd) => { const e = openFds.get(fd); return makeStats(sync("fs.stat", { path: e ? e.path : "/" })); };
+  const ftruncateSync = (fd, len = 0) => { const e = openFds.get(fd); if (e) sync("fs.truncate", { path: e.path, length: len }); };
+  const fsyncSync = () => {};
+  const fdatasyncSync = () => {};
+
   // Callback forms delegate to the sync ops on nextTick (M0 — real async I/O
   // over the async plane is M1). Faithful enough for module resolution + tests.
   const cb = (fn) => (...args) => {
@@ -166,6 +217,9 @@ function makeFsModule({ sync, busAsync, Buffer, EventEmitter }) {
     readFileSync, writeFileSync, appendFileSync, existsSync, statSync, lstatSync,
     mkdirSync, rmdirSync, rmSync, unlinkSync, renameSync, readdirSync, realpathSync,
     readlinkSync, symlinkSync, linkSync, chmodSync, copyFileSync,
+    openSync, closeSync, writeSync, readSync, fstatSync, ftruncateSync, fsyncSync, fdatasyncSync,
+    open: cb(openSync), close: cb(closeSync), read: cb(readSync), write: cb(writeSync),
+    fstat: cb(fstatSync), ftruncate: cb(ftruncateSync), fsync: cb(fsyncSync),
     readFile: cb(readFileSync), writeFile: cb(writeFileSync), appendFile: cb(appendFileSync),
     exists: (p, callback) => queueMicrotask(() => callback(existsSync(p))),
     stat: cb(statSync), lstat: cb(lstatSync), mkdir: cb(mkdirSync), rmdir: cb(rmdirSync),
