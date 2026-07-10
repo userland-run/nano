@@ -133,6 +133,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert differential"
     fi
+    # Event-loop ordering harness (§16.2): phase/callback interleave, byte-exact vs oracle
+    if node "$NODERT_DIR/test/ordering.mjs" 2>/dev/null; then
+        ok "nodert ordering harness (event-loop phases vs host-node oracle)"
+    else
+        fail "nodert ordering harness"
+    fi
     # Cross-tier spawn (nodert → nodert child_process, §12)
     if node "$NODERT_DIR/test/cross-tier.mjs" 2>/dev/null; then
         ok "nodert cross-tier spawn (child_process)"
