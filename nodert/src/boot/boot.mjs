@@ -1,0 +1,412 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
+// nodert/src/boot/boot.mjs — the nodert boot orchestrator (spec §8.2). This is
+// the nodert-owned "loader shim" (allowed below/around internalBinding, P2).
+// It builds primordials from the vendored per_context scripts verbatim, wires
+// the internalBinding registry, brings up process/Buffer/console/timers/fs,
+// and runs the user program on the host engine over the Syscall Bus.
+//
+// M0 scope: process identity, Buffer, console, timers, fs (sync+promises),
+// CJS require of upstream pure modules (path, punycode, querystring, events,
+// string_decoder) + a bus-backed fs. Streams + upstream fs.js/console are M1.
+
+import { ensureInit, sourceOf, hasModule, builtinIds } from "./lib-bundle.mjs";
+import { createBindings } from "../bindings/index.mjs";
+import { EventLoop } from "../uv/loop.mjs";
+import { makeBuffer } from "./buffer.mjs";
+import { makeConsole } from "./console.mjs";
+import { makeFsModule } from "./fs.mjs";
+
+// Upstream lib modules we run VERBATIM in M0 (pure or near-pure — their
+// dependency closure is satisfied by the bindings + primordials).
+const REAL_UPSTREAM = new Set([
+  "path", "punycode", "querystring", "events", "string_decoder",
+  "internal/util/types", "internal/errors",
+]);
+
+/**
+ * @param {{ init: object, sync: (op: string, args?: object) => object,
+ *           async: import("../../../kernel/bus/client.mjs").BusClient,
+ *           fixtures: object }} ctx
+ */
+async function boot(ctx) {
+  const { init, sync, fixtures } = ctx;
+  await ensureInit(init);
+
+  // 1. primordials from per_context (verbatim, R2).
+  const primordials = { __proto__: null };
+  const privateSymbols = new Proxy({ __proto__: null }, {
+    get(t, p) { if (typeof p !== "string") return undefined; if (!(p in t)) t[p] = Symbol(p); return t[p]; },
+  });
+  for (const id of ["internal/per_context/primordials", "internal/per_context/domexception", "internal/per_context/messageport"]) {
+    const src = sourceOf(id);
+    if (!src) continue;
+    try { new Function("exports", "primordials", "privateSymbols", src)({}, primordials, privateSymbols); }
+    catch { /* messageport/domexception may reference host globals — non-fatal in M0 */ }
+  }
+
+  // 2. host state feeding the process_methods/timers bindings + the loop.
+  const loop = new EventLoop({ now: () => performance.now() });
+  let exitCode = 0;
+  let exited = false;
+  const hostState = {
+    pid: init.pid,
+    tickInfo: new Uint8Array(2),
+    immediateInfo: new Uint32Array(3),
+    timeoutInfo: new Int32Array(1),
+    uvNow: () => Math.floor(performance.now()),
+    hrtimeBigInt: () => BigInt(Math.round(performance.now() * 1e6)),
+    cwd: () => process.cwd(),
+    chdir: (d) => { proc.cwd = d; try { sync("proc.chdir", { path: d }); } catch {} },
+    env: () => proc.env,
+    kill: () => 0,
+    exit: (code) => doExit(code ?? 0),
+    scheduleTimer: () => {}, toggleTimerRef: () => {}, toggleImmediateRef: () => {},
+  };
+
+  const internalBinding = createBindings({ fixtures, syncCall: sync, privateSymbols, hostState });
+
+  // 3. CJS loader over the bundle (upstream) + nodert shims.
+  const moduleCache = new Map();
+  const shimCache = new Map();
+  globalThis.__nodert_require = requireModule; // used by util.defineLazyProperties
+
+  function requireModule(id) {
+    const norm = id.replace(/^node:/, "");
+    if (shimCache.has(norm)) return shimCache.get(norm);
+    if (moduleCache.has(norm)) return moduleCache.get(norm).exports;
+
+    // nodert-provided modules (the M0 bring-up set).
+    const shim = shimFactory(norm);
+    if (shim) { const ex = shim(); shimCache.set(norm, ex); return ex; }
+
+    // upstream lib modules run verbatim.
+    if (REAL_UPSTREAM.has(norm) && hasModule(norm)) {
+      return compileUpstream(norm);
+    }
+    // Fall back to the bundle for anything else pure enough to load.
+    if (hasModule(norm)) return compileUpstream(norm);
+    throw makeError("MODULE_NOT_FOUND", `Cannot find module '${id}'`);
+  }
+
+  function compileUpstream(norm) {
+    const src = sourceOf(norm);
+    const mod = { exports: {}, id: norm, loaded: false };
+    moduleCache.set(norm, mod);
+    const fn = new Function(
+      "exports", "require", "module", "process", "internalBinding", "primordials",
+      `${src}\n//# sourceURL=node:${norm}`
+    );
+    fn.call(mod.exports, mod.exports, requireModule, mod, process, internalBinding, primordials);
+    mod.loaded = true;
+    return mod.exports;
+  }
+
+  // 4. Buffer + process (identity from fixtures/spec §8.3).
+  const Buffer = makeBuffer(internalBinding);
+  globalThis.Buffer = Buffer;
+
+  const proc = makeProcess();
+  globalThis.process = proc;
+
+  // Minimal process.stdout/stderr writers (M0 — real tty/Writable streams in
+  // M1). Enough for `process.stdout.write(...)` and `.isTTY`.
+  proc.stdout = makeStdioWriter(writeStdout, init.stdio?.isTTY?.[1]);
+  proc.stderr = makeStdioWriter(writeStderr, init.stdio?.isTTY?.[2]);
+  proc.stdin = { isTTY: !!init.stdio?.isTTY?.[0], read: () => null, on: () => proc.stdin, resume: () => {}, pause: () => {}, setEncoding: () => proc.stdin };
+
+  const consoleObj = makeConsole({ write: writeStdout, writeErr: writeStderr, Buffer });
+  globalThis.console = consoleObj;
+
+  // Timers wired to the loop.
+  installTimers();
+
+  // Exit-promise plumbing (declared before the run so a synchronous program
+  // that exits during runMain still resolves).
+  let resolveExit;
+  const exitP = new Promise((r) => { resolveExit = r; });
+  loop._onExit = (code) => { try { sync("proc.exit", { code }); } catch {} resolveExit(code); };
+
+  // 5. run the entry program.
+  loop.onUncaught = (e) => {
+    writeStderr(formatUncaught(e));
+    doExit(1);
+  };
+  if (typeof addEventListener === "function") {
+    addEventListener?.("unhandledrejection", (ev) => { writeStderr(formatUncaught(ev.reason)); doExit(1); });
+  }
+
+  try {
+    const entrySource = init.source ?? (init.entryPath ? sync_readFile(init.entryPath) : "");
+    runMain(entrySource, init.entryPath ?? "[eval]");
+  } catch (e) {
+    writeStderr(formatUncaught(e));
+    doExit(1);
+    return waitExit();
+  }
+  loop.start();
+  return waitExit();
+
+  // ---- helpers ----
+  function makeProcess() {
+    const emitter = {};
+    const listeners = new Map();
+    const p = {
+      version: init.nodeLibVersion ?? "v25.4.0",
+      versions: { node: (init.nodeLibVersion ?? "v25.4.0").slice(1), v8: "0.0", uv: "1.0", nodert: "0.0.1" },
+      platform: "linux", // spec §8.3, DIV-001 (VM is riscv64)
+      arch: "x64",
+      argv: ["node", ...(init.argv?.slice(1) ?? [])],
+      argv0: "node",
+      execArgv: [],
+      execPath: "/usr/bin/node",
+      pid: init.pid,
+      ppid: 0,
+      env: { ...init.env },
+      cwd: init.cwd ?? "/",
+      exitCode: undefined,
+      _cwd: init.cwd ?? "/",
+      cwd() { return p._cwd; },
+      chdir(d) { p._cwd = d; hostState.chdir(d); },
+      nextTick: (cb, ...a) => loop.nextTick(cb, ...a),
+      hrtime: makeHrtime(),
+      exit(code) { doExit(code ?? p.exitCode ?? 0); },
+      on(ev, fn) { (listeners.get(ev) ?? listeners.set(ev, []).get(ev)).push(fn); return p; },
+      once(ev, fn) { const w = (...a) => { p.off(ev, w); fn(...a); }; return p.on(ev, w); },
+      off(ev, fn) { const l = listeners.get(ev); if (l) { const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); } return p; },
+      removeListener(ev, fn) { return p.off(ev, fn); },
+      emit(ev, ...a) { const l = listeners.get(ev); if (l) for (const fn of [...l]) fn(...a); return !!l?.length; },
+      listeners: (ev) => [...(listeners.get(ev) ?? [])],
+      _listeners: listeners,
+      binding: (n) => internalBinding(n),
+      _rawDebug: (...a) => writeStderr(a.join(" ") + "\n"),
+      emitWarning: () => {},
+      stdout: null, stderr: null, stdin: null,
+      config: { target_defaults: {}, variables: {} },
+      features: { inspector: false, cached_builtins: false },
+      release: { name: "node" },
+      allowedNodeEnvironmentFlags: new Set(),
+      title: "node",
+      moduleLoadList: [],
+      report: { getReport: () => "{}" },
+    };
+    return p;
+  }
+
+  function makeHrtime() {
+    const origin = performance.now();
+    const hr = (prev) => {
+      const nowNs = BigInt(Math.round((performance.now() - 0) * 1e6));
+      const sec = nowNs / 1000000000n;
+      const nsec = nowNs % 1000000000n;
+      if (prev) {
+        let s = sec - BigInt(prev[0]); let n = nsec - BigInt(prev[1]);
+        if (n < 0n) { s -= 1n; n += 1000000000n; }
+        return [Number(s), Number(n)];
+      }
+      return [Number(sec), Number(nsec)];
+    };
+    hr.bigint = () => BigInt(Math.round(performance.now() * 1e6));
+    return hr;
+  }
+
+  function installTimers() {
+    globalThis.setTimeout = (cb, ms, ...a) => wrapTimer(loop.setTimer(a.length ? () => cb(...a) : cb, ms || 0, false));
+    globalThis.setInterval = (cb, ms, ...a) => wrapTimer(loop.setTimer(a.length ? () => cb(...a) : cb, ms || 0, true));
+    globalThis.clearTimeout = (t) => t?.__timer && loop.clearTimer(t.__timer);
+    globalThis.clearInterval = (t) => t?.__timer && loop.clearTimer(t.__timer);
+    globalThis.setImmediate = (cb, ...a) => wrapImmediate(loop.setImmediate(a.length ? () => cb(...a) : cb));
+    globalThis.clearImmediate = (t) => t?.__imm && loop.clearImmediate(t.__imm);
+    globalThis.queueMicrotask = globalThis.queueMicrotask ?? ((cb) => Promise.resolve().then(cb));
+  }
+  function wrapTimer(timer) {
+    const h = { __timer: timer, ref() { loop.refTimer(timer); return h; }, unref() { loop.unrefTimer(timer); return h; }, hasRef: () => timer.ref, refresh() { timer.due = loop.now() + timer.ms; return h; }, [Symbol.toPrimitive]: () => timer.__id ?? (timer.__id = ++wrapTimer._n) };
+    return h;
+  }
+  wrapTimer._n = 0;
+  function wrapImmediate(imm) {
+    return { __imm: imm, ref() { return this; }, unref() { loop.clearImmediate; return this; }, hasRef: () => imm.ref };
+  }
+
+  function runMain(source, filename) {
+    const mod = { exports: {}, id: ".", filename, loaded: false };
+    const dirname = filename.includes("/") ? filename.slice(0, filename.lastIndexOf("/")) : ".";
+    const fn = new Function(
+      "exports", "require", "module", "__filename", "__dirname", "process", "Buffer", "console",
+      `${source}\n//# sourceURL=${filename}`
+    );
+    fn.call(mod.exports, mod.exports, requireModule, mod, filename, dirname, proc, Buffer, consoleObj);
+  }
+
+  function makeStdioWriter(write, isTTY) {
+    const w = {
+      isTTY: !!isTTY,
+      writable: true,
+      write(chunk, encOrCb, cb) {
+        const s = typeof chunk === "string" ? chunk : (globalThis.Buffer?.isBuffer?.(chunk) ? chunk.toString() : new TextDecoder().decode(chunk));
+        write(s);
+        const callback = typeof encOrCb === "function" ? encOrCb : cb;
+        if (callback) queueMicrotask(callback);
+        return true;
+      },
+      end(chunk) { if (chunk != null) w.write(chunk); return w; },
+      on() { return w; }, once() { return w; }, emit() { return false; },
+      cork() {}, uncork() {}, setDefaultEncoding() { return w; },
+      columns: isTTY ? 80 : undefined, rows: isTTY ? 24 : undefined,
+    };
+    return w;
+  }
+
+  function writeStdout(str) {
+    const bytes = new TextEncoder().encode(str);
+    sync("proc.stdio_write", { fd: 1, data: bytes });
+  }
+  function writeStderr(str) {
+    const bytes = new TextEncoder().encode(str);
+    try { sync("proc.stdio_write", { fd: 2, data: bytes }); } catch {}
+  }
+  function sync_readFile(path) {
+    const fd = sync("fs.open", { path, flags: 0 }).fd;
+    try {
+      const st = sync("fs.stat", { path });
+      const r = sync("fs.read", { fd, len: st.size, pos: 0 });
+      return new TextDecoder().decode(new Uint8Array(r.data));
+    } finally { sync("fs.close", { fd }); }
+  }
+
+  function doExit(code) {
+    if (exited) return;
+    exited = true;
+    exitCode = code | 0;
+    try { proc.emit("exit", exitCode); } catch {}
+    loop.stop(exitCode);
+  }
+
+  function waitExit() {
+    return exitP;
+  }
+
+  function makeError(code, message) {
+    const e = new Error(message); e.code = code; return e;
+  }
+  function formatUncaught(e) {
+    if (e && e.stack) return `${e.stack}\n`;
+    return `Uncaught ${String(e)}\n`;
+  }
+
+  // nodert-provided module shims (the M0 bring-up set). Hoisted function so
+  // requireModule can reach it before the closure vars below are declared;
+  // the factories only run at require-time, after everything is initialized.
+  function shimFactory(norm) {
+    switch (norm) {
+      case "fs": return () => makeFsModule({ internalBinding, sync, Buffer });
+      case "os": return () => makeOs();
+      case "buffer": return () => ({ Buffer, kMaxLength: 4294967296, kStringMaxLength: (1 << 29) - 24, constants: { MAX_LENGTH: 4294967296, MAX_STRING_LENGTH: (1 << 29) - 24 }, atob: (s) => globalThis.atob(s), btoa: (s) => globalThis.btoa(s), Blob: globalThis.Blob });
+      case "util": return () => makeUtil();
+      case "assert": return () => makeAssert();
+      case "process": return () => proc;
+      default: return null;
+    }
+  }
+
+  function makeOs() {
+    return {
+      platform: () => "linux", arch: () => "x64", type: () => "Linux", release: () => "0.0.0",
+      hostname: () => "nodert", tmpdir: () => "/tmp", homedir: () => proc.env.HOME ?? "/root",
+      EOL: "\n", cpus: () => Array.from({ length: navigator?.hardwareConcurrency ?? 4 }, () => ({ model: "nodert", speed: 0, times: {} })),
+      totalmem: () => 1 << 30, freemem: () => 1 << 29, uptime: () => performance.now() / 1000,
+      endianness: () => "LE", loadavg: () => [0, 0, 0], networkInterfaces: () => ({}),
+      userInfo: () => ({ uid: 0, gid: 0, username: "root", homedir: "/root", shell: "/bin/sh" }),
+      constants: { signals: {}, errno: {} },
+    };
+  }
+  function makeUtil() {
+    const inspect = (v, opts) => leanInspect(v);
+    const u = {
+      inspect,
+      format: (...args) => leanFormat(args),
+      formatWithOptions: (opts, ...args) => leanFormat(args),
+      inherits: (ctor, superCtor) => { ctor.super_ = superCtor; Object.setPrototypeOf(ctor.prototype, superCtor.prototype); },
+      promisify: (fn) => (...args) => new Promise((res, rej) => fn(...args, (err, v) => err ? rej(err) : res(v))),
+      callbackify: (fn) => (...args) => { const cb = args.pop(); fn(...args).then((v) => cb(null, v), cb); },
+      deprecate: (fn) => fn,
+      types: makeTypesModule(),
+      TextEncoder, TextDecoder,
+      isDeepStrictEqual: (a, b) => JSON.stringify(a) === JSON.stringify(b),
+      debuglog: () => (() => {}),
+    };
+    inspect.custom = Symbol.for("nodejs.util.inspect.custom");
+    return u;
+  }
+  function makeTypesModule() {
+    const t = internalBinding("types");
+    return { ...t };
+  }
+  function makeAssert() {
+    const assert = (v, msg) => { if (!v) throw new AssertionError(msg ?? "assertion failed"); };
+    class AssertionError extends Error { constructor(m) { super(m); this.name = "AssertionError"; this.code = "ERR_ASSERTION"; } }
+    assert.ok = assert;
+    assert.equal = (a, b, m) => { if (a != b) throw new AssertionError(m ?? `${a} == ${b}`); };
+    assert.strictEqual = (a, b, m) => { if (!Object.is(a, b)) throw new AssertionError(m ?? `${leanInspect(a)} === ${leanInspect(b)}`); };
+    assert.deepStrictEqual = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new AssertionError(m ?? "deepStrictEqual"); };
+    assert.notStrictEqual = (a, b, m) => { if (Object.is(a, b)) throw new AssertionError(m ?? "notStrictEqual"); };
+    assert.throws = (fn, m) => { try { fn(); } catch { return; } throw new AssertionError(m ?? "missing expected exception"); };
+    assert.fail = (m) => { throw new AssertionError(m ?? "Failed"); };
+    assert.AssertionError = AssertionError;
+    return assert;
+  }
+}
+
+// ---- lean inspect/format shared by console + util (M0; upstream in M1) ----
+function leanInspect(v, seen = new Set(), depth = 0) {
+  if (typeof v === "string") return depth === 0 ? v : `'${v}'`;
+  if (typeof v === "bigint") return `${v}n`;
+  if (typeof v === "function") return `[Function: ${v.name || "anonymous"}]`;
+  if (typeof v === "symbol") return v.toString();
+  if (v === null) return "null";
+  if (v === undefined) return "undefined";
+  if (typeof v !== "object") return String(v);
+  if (seen.has(v)) return "[Circular *1]";
+  if (v instanceof Error) return v.stack ?? String(v);
+  seen.add(v);
+  try {
+    if (Array.isArray(v)) return `[ ${v.map((x) => leanInspect(x, seen, depth + 1)).join(", ")} ]`;
+    if (v instanceof Map) return `Map(${v.size}) { ${[...v].map(([k, val]) => `${leanInspect(k, seen, depth + 1)} => ${leanInspect(val, seen, depth + 1)}`).join(", ")} }`;
+    if (v instanceof Set) return `Set(${v.size}) { ${[...v].map((x) => leanInspect(x, seen, depth + 1)).join(", ")} }`;
+    if (ArrayBuffer.isView(v)) return `${v.constructor.name}(${v.length}) [ ${[...v].join(", ")} ]`;
+    const entries = Object.entries(v).map(([k, val]) => `${/^[A-Za-z_$][\w$]*$/.test(k) ? k : `'${k}'`}: ${leanInspect(val, seen, depth + 1)}`);
+    const ctor = v.constructor && v.constructor.name !== "Object" ? v.constructor.name + " " : "";
+    return entries.length ? `${ctor}{ ${entries.join(", ")} }` : `${ctor}{}`;
+  } finally { seen.delete(v); }
+}
+
+function leanFormat(args) {
+  if (args.length === 0) return "";
+  let i = 0;
+  let out = "";
+  if (typeof args[0] === "string" && /%[sdifjoOc%]/.test(args[0])) {
+    i = 1;
+    out = args[0].replace(/%[sdifjoOc%]/g, (m) => {
+      if (m === "%%") return "%";
+      if (i >= args.length) return m;
+      const a = args[i++];
+      switch (m) {
+        case "%s": return typeof a === "bigint" ? a + "n" : typeof a === "object" && a !== null ? leanInspect(a) : String(a);
+        case "%d": case "%i": return typeof a === "bigint" ? a + "n" : String(parseInt(a, 10));
+        case "%f": return String(parseFloat(a));
+        case "%j": return JSON.stringify(a);
+        case "%o": case "%O": return leanInspect(a);
+        case "%c": return "";
+        default: return m;
+      }
+    });
+  }
+  for (; i < args.length; i++) {
+    out += (out ? " " : "") + (typeof args[i] === "string" ? args[i] : leanInspect(args[i]));
+  }
+  return out;
+}
+
+export { boot, leanInspect, leanFormat };

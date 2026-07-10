@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+// Copyright (C) 2026 And The Next GmbH - https://userland.run
+// Part of NanoVM; dual-licensed - see LICENSE.md.
+
+// nodert/src/boot/fs.mjs — a bus-backed `fs` module (M0). Covers the sync +
+// promise + simple callback surface the M0 corpus and module resolution use.
+// Upstream lib/fs.js runs verbatim in M1 (needs the full fs binding + streams).
+// All I/O flows through the sync Syscall Bus plane. Divergence: DIV-FS-M0.
+
+const O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0x40, O_TRUNC = 0x200, O_APPEND = 0x400, O_EXCL = 0x80;
+
+function makeFsModule({ sync, Buffer }) {
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+
+  const flagToInt = (flag) => {
+    if (typeof flag === "number") return flag;
+    switch (flag) {
+      case "r": return O_RDONLY;
+      case "r+": return O_RDWR;
+      case "w": return O_WRONLY | O_CREAT | O_TRUNC;
+      case "wx": return O_WRONLY | O_CREAT | O_TRUNC | O_EXCL;
+      case "w+": return O_RDWR | O_CREAT | O_TRUNC;
+      case "a": return O_WRONLY | O_CREAT | O_APPEND;
+      case "a+": return O_RDWR | O_CREAT | O_APPEND;
+      default: return O_RDONLY;
+    }
+  };
+
+  const makeStats = (o) => ({
+    dev: 1, ino: o.ino, mode: o.mode, nlink: o.nlink, uid: 0, gid: 0, rdev: 0,
+    size: o.size, blksize: 4096, blocks: Math.ceil(o.size / 512),
+    atimeMs: o.mtime * 1000, mtimeMs: o.mtime * 1000, ctimeMs: o.mtime * 1000, birthtimeMs: o.mtime * 1000,
+    atime: new Date(o.mtime * 1000), mtime: new Date(o.mtime * 1000), ctime: new Date(o.mtime * 1000), birthtime: new Date(o.mtime * 1000),
+    isFile: () => o.isFile, isDirectory: () => o.isDir, isSymbolicLink: () => o.isSymlink,
+    isBlockDevice: () => false, isCharacterDevice: () => false, isFIFO: () => false, isSocket: () => false,
+  });
+
+  const readFileSync = (path, options) => {
+    const encoding = typeof options === "string" ? options : options?.encoding;
+    const fd = sync("fs.open", { path: String(path), flags: O_RDONLY }).fd;
+    try {
+      const st = sync("fs.stat", { path: String(path) });
+      const out = new Uint8Array(st.size);
+      let pos = 0;
+      while (pos < st.size) {
+        const r = sync("fs.read", { fd, len: st.size - pos, pos });
+        if (r.bytes === 0) break;
+        out.set(new Uint8Array(r.data), pos);
+        pos += r.bytes;
+      }
+      return encoding ? dec.decode(out) : Buffer.from(out.buffer);
+    } finally { sync("fs.close", { fd }); }
+  };
+
+  const writeFileSync = (path, data, options) => {
+    const flags = flagToInt(typeof options === "object" ? options?.flag : "w");
+    const bytes = typeof data === "string" ? enc.encode(data) : (data instanceof Uint8Array ? data : new Uint8Array(data));
+    const fd = sync("fs.open", { path: String(path), flags, mode: 0o644 }).fd;
+    try {
+      let pos = 0;
+      while (pos < bytes.length) { const r = sync("fs.write", { fd, data: bytes.subarray(pos), pos }); pos += r.bytes; if (r.bytes === 0) break; }
+    } finally { sync("fs.close", { fd }); }
+  };
+
+  const appendFileSync = (path, data, options) =>
+    writeFileSync(path, data, { flag: "a", ...(typeof options === "object" ? options : {}) });
+
+  const existsSync = (path) => { try { sync("fs.access", { path: String(path) }); return true; } catch { return false; } };
+  const statSync = (path) => makeStats(sync("fs.stat", { path: String(path) }));
+  const lstatSync = (path) => makeStats(sync("fs.lstat", { path: String(path) }));
+  const mkdirSync = (path, options) => {
+    const recursive = options?.recursive;
+    const p = String(path);
+    if (recursive) {
+      const parts = p.split("/").filter(Boolean);
+      let cur = "";
+      for (const part of parts) { cur += "/" + part; try { sync("fs.mkdir", { path: cur, mode: options?.mode ?? 0o777 }); } catch (e) { if (e.code !== "EEXIST") throw e; } }
+      return p;
+    }
+    sync("fs.mkdir", { path: p, mode: options?.mode ?? 0o777 });
+  };
+  const rmdirSync = (path) => sync("fs.unlink", { path: String(path), flags: 0x200 });
+  const unlinkSync = (path) => sync("fs.unlink", { path: String(path) });
+  const rmSync = (path, options) => { try { const st = statSync(path); if (st.isDirectory()) { for (const e of readdirSync(path)) rmSync(String(path) + "/" + e, options); rmdirSync(path); } else unlinkSync(path); } catch (e) { if (!options?.force) throw e; } };
+  const renameSync = (a, b) => sync("fs.rename", { path: String(a), path2: String(b) });
+  const readdirSync = (path, options) => {
+    const names = sync("fs.readdir", { path: String(path) }).names;
+    if (options?.withFileTypes) return names.map((n) => ({ name: n, isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false }));
+    return names;
+  };
+  const realpathSync = (path) => sync("fs.realpath", { path: String(path) }).path;
+  const readlinkSync = (path) => sync("fs.readlink", { path: String(path) }).target;
+  const symlinkSync = (target, path) => sync("fs.symlink", { target: String(target), path: String(path) });
+  const linkSync = (a, b) => sync("fs.link", { path: String(a), path2: String(b) });
+  const chmodSync = (path, mode) => sync("fs.chmod", { path: String(path), mode });
+  const copyFileSync = (src, dest) => writeFileSync(dest, readFileSync(src));
+
+  // Callback forms delegate to the sync ops on nextTick (M0 — real async I/O
+  // over the async plane is M1). Faithful enough for module resolution + tests.
+  const cb = (fn) => (...args) => {
+    const callback = args.pop();
+    queueMicrotask(() => { try { const v = fn(...args); callback(null, v); } catch (e) { callback(e); } });
+  };
+
+  const promises = {
+    readFile: async (p, o) => readFileSync(p, o),
+    writeFile: async (p, d, o) => writeFileSync(p, d, o),
+    appendFile: async (p, d, o) => appendFileSync(p, d, o),
+    mkdir: async (p, o) => mkdirSync(p, o),
+    rmdir: async (p) => rmdirSync(p),
+    rm: async (p, o) => rmSync(p, o),
+    unlink: async (p) => unlinkSync(p),
+    rename: async (a, b) => renameSync(a, b),
+    readdir: async (p, o) => readdirSync(p, o),
+    stat: async (p) => statSync(p),
+    lstat: async (p) => lstatSync(p),
+    realpath: async (p) => realpathSync(p),
+    readlink: async (p) => readlinkSync(p),
+    symlink: async (t, p) => symlinkSync(t, p),
+    link: async (a, b) => linkSync(a, b),
+    chmod: async (p, m) => chmodSync(p, m),
+    copyFile: async (s, d) => copyFileSync(s, d),
+    access: async (p) => { sync("fs.access", { path: String(p) }); },
+  };
+
+  return {
+    readFileSync, writeFileSync, appendFileSync, existsSync, statSync, lstatSync,
+    mkdirSync, rmdirSync, rmSync, unlinkSync, renameSync, readdirSync, realpathSync,
+    readlinkSync, symlinkSync, linkSync, chmodSync, copyFileSync,
+    readFile: cb(readFileSync), writeFile: cb(writeFileSync), appendFile: cb(appendFileSync),
+    exists: (p, callback) => queueMicrotask(() => callback(existsSync(p))),
+    stat: cb(statSync), lstat: cb(lstatSync), mkdir: cb(mkdirSync), rmdir: cb(rmdirSync),
+    rm: cb(rmSync), unlink: cb(unlinkSync), rename: cb(renameSync), readdir: cb(readdirSync),
+    realpath: cb(realpathSync), readlink: cb(readlinkSync), symlink: cb(symlinkSync),
+    link: cb(linkSync), chmod: cb(chmodSync), copyFile: cb(copyFileSync),
+    access: (p, mode, callback) => { const c = callback ?? mode; queueMicrotask(() => { try { sync("fs.access", { path: String(p) }); c(null); } catch (e) { c(e); } }); },
+    promises,
+    constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND, O_EXCL },
+  };
+}
+
+export { makeFsModule };

@@ -61,6 +61,11 @@ const OP = {
   "proc.pipe": code(NS.proc, 0x07),
   "proc.dup": code(NS.proc, 0x08),
   "proc.list": code(NS.proc, 0x09),
+  "proc.stdio_write": code(NS.proc, 0x0a),
+  "proc.stdio_read": code(NS.proc, 0x0b),
+  "proc.pipe_write": code(NS.proc, 0x0c),
+  "proc.pipe_read": code(NS.proc, 0x0d),
+  "proc.pipe_close": code(NS.proc, 0x0e),
 
   // net.*
   "net.listen": code(NS.net, 0x01),

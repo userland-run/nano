@@ -55,6 +55,7 @@ class SyscallBusHub {
       }
     }
     this.kernel.ports?.closeAllFor(pid);
+    this.kernel.services?.closeAllFor(pid);
   }
 
   /**
@@ -183,6 +184,51 @@ function buildHandlers(hub) {
   h.set(OP["proc.waitpid"], async (p, a) => hub.kernel.proc.waitpid(a.pid, p.pid));
   h.set(OP["proc.kill"], (p, a) => (hub.kernel.signals.kill(a.pid, a.signal ?? "SIGTERM"), {}));
   h.set(OP["proc.pipe"], () => ({ pipeId: hub.kernel.pipes.create().id }));
+
+  // stdio: fd 0/1/2 → the process's stdio pipe ids (wired at spawn).
+  h.set(OP["proc.stdio_write"], (p, a) => {
+    const pipeId = p.stdio?.[a.fd];
+    if (typeof pipeId !== "number") throw new KernelError(ERRNO.EBADF, undefined, `stdio ${a.fd} not a pipe`);
+    const pipe = hub.kernel.pipes.get(pipeId);
+    if (!pipe) throw new KernelError(ERRNO.EBADF, undefined, "stdio pipe gone");
+    const bytes = new Uint8Array(a.data);
+    pipe.write(bytes);
+    return { bytes: bytes.length };
+  });
+  h.set(OP["proc.stdio_read"], async (p, a) => {
+    const pipeId = p.stdio?.[a.fd];
+    if (typeof pipeId !== "number") throw new KernelError(ERRNO.EBADF, undefined, `stdio ${a.fd} not a pipe`);
+    const pipe = hub.kernel.pipes.get(pipeId);
+    if (!pipe) throw new KernelError(ERRNO.EBADF, undefined, "stdio pipe gone");
+    for (;;) {
+      const r = pipe.read(a.len ?? 65536);
+      if (r === "eof") return { bytes: 0, eof: true };
+      if (r) return { bytes: r.length, data: r.buffer, eof: false };
+      await pipe.waitReadable();
+    }
+  });
+  h.set(OP["proc.pipe_write"], (p, a) => {
+    const pipe = hub.kernel.pipes.get(a.pipeId);
+    if (!pipe) throw new KernelError(ERRNO.EBADF, undefined, "pipe gone");
+    const bytes = new Uint8Array(a.data);
+    pipe.write(bytes);
+    return { bytes: bytes.length };
+  });
+  h.set(OP["proc.pipe_read"], async (p, a) => {
+    const pipe = hub.kernel.pipes.get(a.pipeId);
+    if (!pipe) throw new KernelError(ERRNO.EBADF, undefined, "pipe gone");
+    for (;;) {
+      const r = pipe.read(a.len ?? 65536);
+      if (r === "eof") return { bytes: 0, eof: true };
+      if (r) return { bytes: r.length, data: r.buffer, eof: false };
+      await pipe.waitReadable();
+    }
+  });
+  h.set(OP["proc.pipe_close"], (p, a) => {
+    const pipe = hub.kernel.pipes.get(a.pipeId);
+    if (pipe) pipe.closeWrite();
+    return {};
+  });
   h.set(OP["proc.spawn"], async (p, a) => {
     // The tier comes from the routing table, not the caller — re-check the
     // spawn capability against the RESOLVED tier (the generic checkCap saw
@@ -201,6 +247,21 @@ function buildHandlers(hub) {
       caps: a.caps,
       stdio: a.stdio,
     });
+  });
+
+  // --- svc.* (spec §13) ---
+  h.set(OP["svc.list"], () => ({ services: hub.kernel.services?.list() ?? [] }));
+  h.set(OP["svc.invoke"], async (p, a) => {
+    if (!hub.kernel.services) throw new KernelError(ERRNO.ENOSYS, undefined, "no service registry");
+    return { result: await hub.kernel.services.invoke(a.service, a.method, a.payload) };
+  });
+  h.set(OP["svc.open_session"], (p, a) => {
+    if (!hub.kernel.services) throw new KernelError(ERRNO.ENOSYS, undefined, "no service registry");
+    return { sessionId: hub.kernel.services.openSession(a.service, a.config, p.pid) };
+  });
+  h.set(OP["svc.close_session"], (p, a) => {
+    hub.kernel.services?.closeSession(a.sessionId, p.pid);
+    return {};
   });
 
   // --- env.* ---

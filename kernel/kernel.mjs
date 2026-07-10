@@ -25,6 +25,7 @@ import { ProcessTable } from "./proc/table.mjs";
 import { PipeRegistry } from "./proc/pipes.mjs";
 import { SignalRouter } from "./proc/signals.mjs";
 import { SpawnRouter } from "./proc/router.mjs";
+import { ServiceRegistry } from "./services/registry.mjs";
 import * as caps from "./caps/caps.mjs";
 import * as profiles from "./caps/profiles.mjs";
 
@@ -46,7 +47,7 @@ class Kernel {
     this.pipes = new PipeRegistry();
     this.signals = new SignalRouter(this);
     this.router = new SpawnRouter(opts.routing);
-    this.services = null; // registry for Kernel Services (SWC, DuckDB, …)
+    this.services = new ServiceRegistry();
   }
 
   /**
