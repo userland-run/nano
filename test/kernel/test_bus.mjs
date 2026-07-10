@@ -138,8 +138,8 @@ await test("KernelError crosses the wire intact (ENOENT + cap denial)", async ()
 
 await test("unknown opcode → ENOSYS; env scoped to the process", async () => {
   const { client, proc } = await boot();
-  await client.call("net.connect_loopback", { port: 80 }).then(
-    () => assert(false, "loopback data flow lands in M1"),
+  await client.call("net.accept", { port: 80 }).then(
+    () => assert(false, "net.accept not implemented"),
     (e) => assertEqual(e.errno, ERRNO.ENOSYS, "ENOSYS")
   );
   await client.call("env.set", { key: "FOO", value: "bar" });

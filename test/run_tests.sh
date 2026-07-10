@@ -141,9 +141,15 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     fi
     # Upstream lib/*.js run verbatim (P2 fidelity)
     if node "$NODERT_DIR/test/upstream.mjs" 2>/dev/null; then
-        ok "nodert upstream-verbatim (events/qs/punycode/string_decoder/assert/path)"
+        ok "nodert upstream-verbatim (events/qs/punycode/string_decoder/assert/path/streams/util/console)"
     else
         fail "nodert upstream-verbatim"
+    fi
+    # M1 net loopback + http server/client (§11)
+    if node "$NODERT_DIR/test/net-http.mjs" 2>/dev/null; then
+        ok "nodert net+http (loopback, server/client, ServeBridge reachable)"
+    else
+        fail "nodert net+http"
     fi
 else
     skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"

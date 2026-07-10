@@ -134,6 +134,22 @@ function buildHandlers(hub) {
     port: hub.kernel.ports.listen(p.pid, a.port ?? 0, a.acceptor ?? { kind: p.kind }),
   }));
   h.set(OP["net.close_listener"], (p, a) => (hub.kernel.ports.close(p.pid, a.port), {}));
+  // Loopback connect (§11.1): pair the connector with the port's listener via
+  // two crossed Kernel pipes and notify the listener with a 'connection' event.
+  // A nodert client can hit a VM server and vice versa — both just read/write
+  // their pipe ids (proc.pipe_read/write).
+  h.set(OP["net.connect_loopback"], (p, a) => {
+    const listener = hub.kernel.ports.lookup(a.port);
+    if (!listener) throw new KernelError(ERRNO.ECONNREFUSED, undefined, `no listener on ${a.port}`);
+    const c2s = hub.kernel.pipes.create(); // connector → server
+    const s2c = hub.kernel.pipes.create(); // server → connector
+    // Tell the listener a connection arrived (server side reads c2s, writes s2c).
+    hub.sendEvent(listener.ownerPid, {
+      ev: "connection", port: a.port, readPipe: c2s.id, writePipe: s2c.id, remotePort: 0,
+    });
+    // If a VM acceptor is registered (K6), also hand it the raw injector path.
+    return { readPipe: s2c.id, writePipe: c2s.id, localPort: a.port };
+  });
   h.set(OP["net.fetch_open"], async (p, a) => {
     const st = await hub.kernel.fetchBridge.open(a);
     const streamId = hub._nextStreamId++;

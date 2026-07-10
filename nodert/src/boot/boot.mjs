@@ -19,6 +19,8 @@ import { makeBuffer } from "./buffer.mjs";
 import { makeConsole } from "./console.mjs";
 import { makeFsModule } from "./fs.mjs";
 import { makeCrypto } from "./crypto.mjs";
+import { makeNet } from "./net.mjs";
+import { makeHttp } from "./http.mjs";
 
 // Upstream lib modules we run VERBATIM in M0 (pure or near-pure — their
 // dependency closure is satisfied by the bindings + primordials).
@@ -392,6 +394,8 @@ async function boot(ctx) {
       case "node:sqlite": case "sqlite": return () => makeSqlite();
       case "child_process": case "node:child_process": return () => makeChildProcess();
       case "crypto": case "node:crypto": return () => makeCrypto(Buffer);
+      case "net": case "node:net": return () => makeNet({ sync, busAsync, Buffer, EventEmitter: requireModule("events"), setImmediate: globalThis.setImmediate });
+      case "http": case "node:http": return () => makeHttp({ net: requireModule("net"), EventEmitter: requireModule("events"), Buffer });
       // url: the upstream module needs the ada `url` binding (M2). The host
       // URL/URLSearchParams are WHATWG-standard and present in the worker, so
       // expose them plus the file-URL helpers. DIV-URL-M0.
