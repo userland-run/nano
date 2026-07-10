@@ -17,6 +17,7 @@
 import { PROTOCOL_MAJOR, PROTOCOL_MINOR } from "./bus/opcodes.mjs";
 import { SyscallBusHub } from "./bus/hub.mjs";
 import { PortChannel } from "./bus/port-channel.mjs";
+import { SabChannel, SYNC_HEADER, SYNC_WINDOW } from "./bus/sab-channel.mjs";
 import { KernelVfs } from "./vfs/vfs.mjs";
 import { ProcessTable } from "./proc/table.mjs";
 import * as caps from "./caps/caps.mjs";
@@ -60,21 +61,26 @@ class Kernel {
    * `{pid, token, port}` to its BusClient. The kernel side stays attached
    * here. (The sync SAB half of the channel lands in K5.)
    */
-  allocChannel(pid) {
+  allocChannel(pid, opts = {}) {
     const proc = this.proc.get(pid);
     if (!proc) throw new Error(`allocChannel: unknown pid ${pid}`);
     const token = randomToken();
     const { port1, port2 } = new MessageChannel();
-    const channel = new PortChannel(this.hub, proc, port1, token);
-    this._channels.set(pid, channel);
-    return { pid, token, port: port2 };
+    const portChannel = new PortChannel(this.hub, proc, port1, token);
+    // Sync plane: one SAB per process, serviced without blocking (§4.2),
+    // gated on the async-plane hello so unauthenticated clients can't call.
+    const sab = new SharedArrayBuffer(SYNC_HEADER + (opts.window ?? SYNC_WINDOW));
+    const sabChannel = new SabChannel(this.hub, proc, sab, () => portChannel._helloDone);
+    this._channels.set(pid, { portChannel, sabChannel });
+    return { pid, token, port: port2, sab };
   }
 
-  /** Tear down a process's channel (exit/kill path). */
+  /** Tear down a process's channels (exit/kill path). */
   releaseChannel(pid) {
     const channel = this._channels.get(pid);
     if (channel) {
-      channel.close();
+      channel.portChannel.close();
+      channel.sabChannel.close();
       this._channels.delete(pid);
     }
     this.hub.releaseProcess(pid);
