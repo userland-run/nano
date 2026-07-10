@@ -175,6 +175,17 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert cross-tier chain"
     fi
+    # The REAL §12.3 showcase: live NanoVM (BusyBox) as the vm tier + nodert +
+    # shared VFS. Needs wasm/nano.wasm + images/busybox (skips otherwise).
+    if [ -f "$PROJECT_ROOT/images/busybox" ]; then
+        if node "$NODERT_DIR/test/vm-cross-tier.mjs" 2>/dev/null; then
+            ok "nodert ↔ real BusyBox cross-tier (§12.3 acceptance, shared VFS)"
+        else
+            fail "nodert ↔ real BusyBox cross-tier"
+        fi
+    else
+        skip "real-VM cross-tier" "images/busybox not present"
+    fi
 else
     skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"
 fi

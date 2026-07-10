@@ -26,7 +26,7 @@ Format: `id | area | nodert behavior | reference behavior | rationale | spec | t
 | DIV-ESM-CYCLE | ESM circular imports | multi-node SCC concatenated into one module (shared scope) | separate module records with live bindings | The blob-URL model can't cycle across URLs; concatenation resolves the cycle intra-module — top-level name collisions across cycle members are the caller's responsibility | §9.2 |
 | DIV-ESM-DATAURL | ESM module URLs (Node) | data: URLs (headless) | blob: URLs (browser) | Node has no URL.createObjectURL; the browser uses flat blob: URLs. Behavior identical; deep graphs are larger under data: | §9.2 |
 | DIV-WT-JSON | worker_threads messaging | JSON-framed over Kernel pipes | V8 structured serialize + SAB transfer | M2; covers plain-data messages. Full structuredClone/SAB transfer is a refinement | §10.3 |
-| DIV-SH-LEAN | the "vm" shell delegate (headless) | lean POSIX-ish sh (sequencing, builtins, spawn) | real BusyBox `sh` | M3 headless stand-in with IDENTICAL cross-tier routing; the live NanoVM BusyBox is the "vm" delegate in the terminal/SDK | §12.3 |
+| DIV-SH-LEAN | the "vm" shell delegate (headless, portable) | lean POSIX-ish sh (sequencing, builtins, spawn) | real BusyBox `sh` | M3 headless stand-in with IDENTICAL cross-tier routing. RESOLVED where a live NanoVM is available: vm-delegate.mjs runs REAL BusyBox as a cross-tier shell (busybox applets in the emulator, `node …` in nodert) over the shared VFS — the true §12.3 path | §12.3 |
 
 ## Upstream modules running VERBATIM (P2 — no reimplementation)
 

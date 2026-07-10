@@ -129,4 +129,4 @@ function shQuote(s) { return /[\s"']/.test(s) ? `'${s.replace(/'/g, "'\\''")}'` 
 function basename(p) { return String(p).slice(String(p).lastIndexOf("/") + 1); }
 function join(a, b) { if (b.startsWith("/")) return b; return (a.endsWith("/") ? a : a + "/") + b; }
 
-export { registerShellDelegate };
+export { registerShellDelegate, splitStatements, tokenize, expand, basename, BUILTINS, runBuiltin };
