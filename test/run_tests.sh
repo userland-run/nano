@@ -133,6 +133,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert differential"
     fi
+    # Cross-tier spawn (nodert → nodert child_process, §12)
+    if node "$NODERT_DIR/test/cross-tier.mjs" 2>/dev/null; then
+        ok "nodert cross-tier spawn (child_process)"
+    else
+        fail "nodert cross-tier spawn"
+    fi
 else
     skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"
 fi

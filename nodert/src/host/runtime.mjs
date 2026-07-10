@@ -24,12 +24,13 @@ const workerEntry = new URL("../boot/worker-entry.mjs", import.meta.url).href;
 async function runNode(kernel, opts) {
   const { argv, source, entryPath, env = {}, cwd = "/", caps, ppid = 1 } = opts;
 
-  // Kernel pipes for the child's stdio; the host drains stdout/stderr.
-  const stdin = kernel.pipes.create();
-  const stdout = kernel.pipes.create();
-  const stderr = kernel.pipes.create();
+  // Reuse a pre-registered process + pipes (async child_process.spawn path),
+  // or create fresh ones (the common case).
+  const stdin = opts._stdin ?? kernel.pipes.create();
+  const stdout = opts._stdout ?? kernel.pipes.create();
+  const stderr = opts._stderr ?? kernel.pipes.create();
 
-  const proc = kernel.registerProcess({
+  const proc = opts._reuseProc ?? kernel.registerProcess({
     kind: "node",
     argv,
     cwd,
@@ -44,8 +45,9 @@ async function runNode(kernel, opts) {
   let outBuf = "";
   let errBuf = "";
   const dec = new TextDecoder();
+  const drainDone = [];
   const drain = (pipe, onData, append) => {
-    (async () => {
+    drainDone.push((async () => {
       for (;;) {
         const r = pipe.read(1 << 16);
         if (r === "eof") break;
@@ -56,10 +58,15 @@ async function runNode(kernel, opts) {
           await pipe.waitReadable();
         }
       }
-    })();
+    })());
   };
-  drain(stdout, opts.onStdout, (s) => { outBuf += s; });
-  drain(stderr, opts.onStderr, (s) => { errBuf += s; });
+  // When the child's pipes are consumed by a parent guest (async spawn), the
+  // host must not also drain them — it would steal the bytes.
+  const hostDrains = !opts._noDrain && !opts._reuseProc;
+  if (hostDrains) {
+    drain(stdout, opts.onStdout, (s) => { outBuf += s; });
+    drain(stderr, opts.onStderr, (s) => { errBuf += s; });
+  }
 
   const init = {
     pid: chan.pid,
@@ -101,8 +108,21 @@ async function runNode(kernel, opts) {
   });
 
   worker.terminate();
-  kernel.proc.exit(proc.pid, exit.exitCode, exit.signal);
-  kernel.releaseChannel(proc.pid);
+  // The worker posts "exit" only after its final synchronous stdio_write, but
+  // those bytes may still be queued in the Kernel pipe. Close the write ends so
+  // the drain loops see EOF, then await them so no output is lost.
+  if (hostDrains) {
+    stdout.closeWrite();
+    stderr.closeWrite();
+    await Promise.all(drainDone);
+  }
+  // When reusing a caller-owned process, the caller owns exit/pipe lifecycle.
+  if (!opts._reuseProc) {
+    kernel.proc.exit(proc.pid, exit.exitCode, exit.signal);
+    kernel.releaseChannel(proc.pid);
+  } else {
+    kernel.releaseChannel(proc.pid);
+  }
 
   return {
     exitCode: exit.exitCode,

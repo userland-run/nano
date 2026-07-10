@@ -32,7 +32,7 @@ const REAL_UPSTREAM = new Set([
  *           fixtures: object }} ctx
  */
 async function boot(ctx) {
-  const { init, sync, fixtures } = ctx;
+  const { init, sync, async: busAsync, fixtures } = ctx;
   await ensureInit(init);
 
   // 1. primordials from per_context (verbatim, R2).
@@ -327,6 +327,7 @@ async function boot(ctx) {
       case "process": return () => proc;
       case "zlib": case "node:zlib": return () => makeZlib();
       case "node:sqlite": case "sqlite": return () => makeSqlite();
+      case "child_process": case "node:child_process": return () => makeChildProcess();
       default: return null;
     }
   }
@@ -368,6 +369,91 @@ async function boot(ctx) {
       close() { if (this._open) { sync("svc.close_session", { sessionId: this._session }); this._open = false; } }
     }
     return { DatabaseSync };
+  }
+
+  // child_process over proc.spawn + Kernel pipes (spec §12). execSync/spawnSync
+  // block the parent on the sync plane while the Kernel runs the child (§12.2);
+  // spawn is async. Cross-tier: argv[0]==="node" routes to a fresh nodert
+  // worker; "sh"/busybox routes to the VM (once its delegate is registered).
+  function makeChildProcess() {
+    const normArgs = (cmd, args) => (Array.isArray(args) ? [cmd, ...args] : [cmd]);
+    const spawnSync = (cmd, args, options = {}) => {
+      const opts = Array.isArray(args) ? options : (args ?? {});
+      const argv = Array.isArray(args) ? [cmd, ...args] : [cmd];
+      const r = sync("proc.spawn", {
+        argv, cwd: opts.cwd ?? proc.cwd(), env: opts.env ?? proc.env,
+        wait: true, timeoutMs: opts.timeout,
+      });
+      const res = r.result ?? r;
+      const enc = (s) => (opts.encoding && opts.encoding !== "buffer" ? s : Buffer.from(s));
+      return {
+        pid: res.pid ?? 0, status: res.exitCode ?? 0, signal: res.signal ?? null,
+        stdout: enc(res.stdout ?? ""), stderr: enc(res.stderr ?? ""),
+        output: [null, enc(res.stdout ?? ""), enc(res.stderr ?? "")],
+      };
+    };
+    const execSync = (command, options = {}) => {
+      // Route the whole command line through `sh -c` (the VM), matching Node.
+      const r = spawnSync("sh", ["-c", command], options);
+      if (r.status !== 0) {
+        const e = new Error(`Command failed: ${command}\n${r.stderr}`);
+        e.status = r.status; e.stdout = r.stdout; e.stderr = r.stderr;
+        throw e;
+      }
+      return options.encoding && options.encoding !== "buffer" ? r.stdout.toString() : r.stdout;
+    };
+    const execFileSync = (file, args, options) => {
+      const r = spawnSync(file, Array.isArray(args) ? args : [], Array.isArray(args) ? options : args);
+      if (r.status !== 0) { const e = new Error(`Command failed: ${file}`); e.status = r.status; e.stderr = r.stderr; throw e; }
+      return options?.encoding && options.encoding !== "buffer" ? r.stdout.toString() : r.stdout;
+    };
+    const spawn = (cmd, args, options = {}) => {
+      const opts = Array.isArray(args) ? options : (args ?? {});
+      const argv = Array.isArray(args) ? [cmd, ...args] : [cmd];
+      const r = sync("proc.spawn", { argv, cwd: opts.cwd ?? proc.cwd(), env: opts.env ?? proc.env, wait: false });
+      const res = r.result ?? r;
+      return makeChildHandle(res);
+    };
+    return {
+      spawnSync, execSync, execFileSync, spawn,
+      exec: (command, options, callback) => {
+        const cb = typeof options === "function" ? options : callback;
+        queueMicrotask(() => { try { const out = execSync(command, typeof options === "object" ? options : {}); cb?.(null, out.toString(), ""); } catch (e) { cb?.(e, e.stdout?.toString() ?? "", e.stderr ?? ""); } });
+        return makeChildHandle({ pid: 0 });
+      },
+      fork: (modulePath, args = [], options = {}) => spawn("node", [modulePath, ...args], options),
+    };
+  }
+
+  function makeChildHandle(res) {
+    const listeners = new Map();
+    const emit = (ev, ...a) => (listeners.get(ev) ?? []).forEach((fn) => fn(...a));
+    const readable = (pipeId) => ({
+      on(ev, fn) { if (ev === "data" && pipeId != null) drainPipe(pipeId, (b) => fn(Buffer.from(b))); return this; },
+      pipe(dest) { if (pipeId != null) drainPipe(pipeId, (b) => dest.write?.(Buffer.from(b))); return dest; },
+      setEncoding() { return this; },
+    });
+    const child = {
+      pid: res.pid ?? 0,
+      stdout: readable(res.stdout), stderr: readable(res.stderr),
+      stdin: { write: (d) => { if (res.stdin != null) sync("proc.pipe_write", { pipeId: res.stdin, data: typeof d === "string" ? new TextEncoder().encode(d) : d }); }, end: () => { if (res.stdin != null) sync("proc.pipe_close", { pipeId: res.stdin }); } },
+      on(ev, fn) { (listeners.get(ev) ?? listeners.set(ev, []).get(ev)).push(fn); return child; },
+      once(ev, fn) { const w = (...a) => { fn(...a); }; return child.on(ev, w); },
+      kill: (sig) => { if (res.pid) sync("proc.kill", { pid: res.pid, signal: sig ?? "SIGTERM" }); },
+    };
+    // Bridge child-exit events (async plane) to 'exit'/'close'.
+    busAsync?.onEvent?.((msg) => { if (msg.ev === "child-exit" && msg.pid === res.pid) { emit("exit", msg.exitCode, msg.signal); emit("close", msg.exitCode, msg.signal); } });
+    return child;
+  }
+
+  function drainPipe(pipeId, onData) {
+    (async () => {
+      for (;;) {
+        const r = sync("proc.pipe_read", { pipeId });
+        if (r.eof) break;
+        if (r.bytes > 0) onData(new Uint8Array(r.data));
+      }
+    })();
   }
 
   function makeOs() {

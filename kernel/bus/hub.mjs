@@ -246,6 +246,8 @@ function buildHandlers(hub) {
       env: a.env ?? p.env,
       caps: a.caps,
       stdio: a.stdio,
+      wait: !!a.wait, // execSync/spawnSync: run to completion, capture output (§12.2)
+      timeoutMs: a.timeoutMs,
     });
   });
 
