@@ -53,6 +53,22 @@ class KernelVfs {
     return this._mounts.find((m) => m.prefix === "/").backend;
   }
 
+  /**
+   * Swap the root mem backend (snapshot restore path): rewires the watch
+   * hook and invalidates kernel fds that pointed into the old backend.
+   * @param {MemFS} memfs
+   */
+  replaceRootMem(memfs) {
+    const mount = this._mounts.find((m) => m.prefix === "/");
+    const old = mount.backend;
+    mount.backend = memfs;
+    memfs.onMutate = (path, kind) => this.watch.emit(path, kind);
+    if (old) old.onMutate = null;
+    for (const [fd, e] of this._fds) {
+      if (e.mount.prefix === "/") this._fds.delete(fd);
+    }
+  }
+
   /** @returns {{ prefix: string, backend: MemFS, kind: string, rel: string }} */
   resolveMount(path) {
     for (const m of this._mounts) {
