@@ -163,6 +163,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert ESM loader"
     fi
+    # M2 worker_threads + fs.watch (§10.3, §6.1)
+    if node "$NODERT_DIR/test/worker-watch.mjs" 2>/dev/null; then
+        ok "nodert worker_threads + fs.watch"
+    else
+        fail "nodert worker_threads + fs.watch"
+    fi
 else
     skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"
 fi

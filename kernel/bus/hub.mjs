@@ -264,6 +264,10 @@ function buildHandlers(hub) {
       stdio: a.stdio,
       wait: !!a.wait, // execSync/spawnSync: run to completion, capture output (§12.2)
       timeoutMs: a.timeoutMs,
+      // worker_threads / child_process.fork extras.
+      ipc: !!a.ipc,
+      isWorker: !!a.isWorker,
+      workerData: a.workerData,
     });
   });
 

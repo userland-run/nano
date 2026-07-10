@@ -23,7 +23,8 @@ function makeNet({ sync, busAsync, Buffer, EventEmitter, setImmediate }) {
       this.remoteAddress = "127.0.0.1";
       this.remotePort = pipes?.remotePort ?? 0;
       this.localPort = pipes?.localPort ?? 0;
-      if (this._readPipe != null) this._startReading();
+      this._refed = false;
+      if (this._readPipe != null) { globalThis.__nodert_ref?.(); this._refed = true; this._startReading(); }
     }
     setEncoding(enc) { this._encoding = enc; return this; }
     setNoDelay() { return this; }
@@ -36,7 +37,7 @@ function makeNet({ sync, busAsync, Buffer, EventEmitter, setImmediate }) {
         for (;;) {
           if (this.destroyed) break;
           const r = await busAsync.call("proc.pipe_read", { pipeId: this._readPipe });
-          if (r.eof) { this.readable = false; this.emit("end"); this.emit("close", false); break; }
+          if (r.eof) { this.readable = false; this._unref(); this.emit("end"); this.emit("close", false); break; }
           if (r.bytes > 0) {
             const buf = Buffer.from(r.data);
             this.emit("data", this._encoding ? buf.toString(this._encoding) : buf);
@@ -63,9 +64,10 @@ function makeNet({ sync, busAsync, Buffer, EventEmitter, setImmediate }) {
       if (callback) queueMicrotask(callback);
       return this;
     }
+    _unref() { if (this._refed) { this._refed = false; globalThis.__nodert_unref?.(); } }
     destroy(err) {
       if (this.destroyed) return this;
-      this.destroyed = true; this.readable = false; this.writable = false;
+      this.destroyed = true; this.readable = false; this.writable = false; this._unref();
       if (this._writePipe != null) { try { sync("proc.pipe_close", { pipeId: this._writePipe }); } catch {} }
       if (err) this.emit("error", err);
       this.emit("close", !!err);
@@ -90,6 +92,7 @@ function makeNet({ sync, busAsync, Buffer, EventEmitter, setImmediate }) {
       const p = typeof port === "object" ? port.port : port;
       const r = sync("net.listen", { port: p ?? 0 });
       this._port = r.port;
+      globalThis.__nodert_ref?.(); this._refed = true;
       // Each 'connection' event from the Kernel becomes a server Socket.
       this._unsub = busAsync.onEvent((msg) => {
         if (msg.ev === "connection" && msg.port === this._port) {
@@ -102,6 +105,7 @@ function makeNet({ sync, busAsync, Buffer, EventEmitter, setImmediate }) {
     }
     address() { return { address: "127.0.0.1", port: this._port, family: "IPv4" }; }
     close(cb) {
+      if (this._refed) { this._refed = false; globalThis.__nodert_unref?.(); }
       if (this._port != null) { try { sync("net.close_listener", { port: this._port }); } catch {} }
       this._unsub?.();
       this.emit("close");

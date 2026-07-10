@@ -40,6 +40,13 @@ function registerNodertDelegate(kernel, opts = {}) {
     const stdinPipe = kernel.pipes.create();
     const stdoutPipe = kernel.pipes.create();
     const stderrPipe = kernel.pipes.create();
+    // IPC channel (child_process.fork / worker_threads): a crossed pipe pair.
+    let ipc = null;
+    if (req.ipc) {
+      const parentToChild = kernel.pipes.create();
+      const childToParent = kernel.pipes.create();
+      ipc = { parentWrite: parentToChild.id, parentRead: childToParent.id, childWrite: childToParent.id, childRead: parentToChild.id };
+    }
     const child = kernel.registerProcess({
       kind: "node", argv: ["node", ...nodeArgs.args], cwd, env, caps,
       ppid: parent?.pid ?? 1, stdio: [stdinPipe.id, stdoutPipe.id, stderrPipe.id],
@@ -49,11 +56,13 @@ function registerNodertDelegate(kernel, opts = {}) {
       argv: ["node", ...nodeArgs.args], source: nodeArgs.evalCode, entryPath: nodeArgs.entryPath,
       cwd, env, caps, ppid: parent?.pid ?? 1, timeoutMs: req.timeoutMs ?? 60000,
       _reuseProc: child, _stdout: stdoutPipe, _stderr: stderrPipe, _stdin: stdinPipe,
+      workerData: req.workerData, isWorker: req.isWorker,
+      ipcRead: ipc?.childRead, ipcWrite: ipc?.childWrite,
     }).then((r) => {
       stdoutPipe.closeWrite(); stderrPipe.closeWrite();
       kernel.proc.exit(child.pid, r.exitCode, r.signal);
     });
-    return { pid: child.pid, stdin: stdinPipe.id, stdout: stdoutPipe.id, stderr: stderrPipe.id };
+    return { pid: child.pid, stdin: stdinPipe.id, stdout: stdoutPipe.id, stderr: stderrPipe.id, ipcWrite: ipc?.parentWrite, ipcRead: ipc?.parentRead };
   });
 }
 

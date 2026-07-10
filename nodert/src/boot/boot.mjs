@@ -22,6 +22,7 @@ import { makeCrypto } from "./crypto.mjs";
 import { makeNet } from "./net.mjs";
 import { makeHttp } from "./http.mjs";
 import { createEsmLoader } from "../loader/esm.mjs";
+import { makeWorkerThreads } from "./worker_threads.mjs";
 
 // Upstream lib modules we run VERBATIM in M0 (pure or near-pure — their
 // dependency closure is satisfied by the bindings + primordials).
@@ -143,6 +144,11 @@ async function boot(ctx) {
 
   // Timers wired to the loop.
   installTimers();
+
+  // Loop-handle ref API for long-lived async readers (sockets, worker ports,
+  // watchers) so they keep the process alive like a libuv handle (§10.4).
+  globalThis.__nodert_ref = () => loop.refHandle();
+  globalThis.__nodert_unref = () => loop.unrefHandle();
 
   // Exit-promise plumbing (declared before the run so a synchronous program
   // that exits during runMain still resolves).
@@ -428,7 +434,7 @@ async function boot(ctx) {
   // the factories only run at require-time, after everything is initialized.
   function shimFactory(norm) {
     switch (norm) {
-      case "fs": return () => makeFsModule({ internalBinding, sync, Buffer });
+      case "fs": return () => makeFsModule({ internalBinding, sync, busAsync, Buffer, EventEmitter: requireModule("events") });
       case "os": return () => makeOs();
       case "buffer": return () => ({ Buffer, kMaxLength: 4294967296, kStringMaxLength: (1 << 29) - 24, constants: { MAX_LENGTH: 4294967296, MAX_STRING_LENGTH: (1 << 29) - 24 }, atob: (s) => globalThis.atob(s), btoa: (s) => globalThis.btoa(s), Blob: globalThis.Blob });
       // util: prefer upstream lib/util.js (inspect/format now run verbatim);
@@ -442,6 +448,7 @@ async function boot(ctx) {
       case "crypto": case "node:crypto": return () => makeCrypto(Buffer);
       case "net": case "node:net": return () => makeNet({ sync, busAsync, Buffer, EventEmitter: requireModule("events"), setImmediate: globalThis.setImmediate });
       case "http": case "node:http": return () => makeHttp({ net: requireModule("net"), EventEmitter: requireModule("events"), Buffer });
+      case "worker_threads": case "node:worker_threads": return () => makeWorkerThreads({ sync, busAsync, Buffer, EventEmitter: requireModule("events"), init });
       // url: the upstream module needs the ada `url` binding (M2). The host
       // URL/URLSearchParams are WHATWG-standard and present in the worker, so
       // expose them plus the file-URL helpers. DIV-URL-M0.

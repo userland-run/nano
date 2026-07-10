@@ -9,9 +9,47 @@
 
 const O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0x40, O_TRUNC = 0x200, O_APPEND = 0x400, O_EXCL = 0x80;
 
-function makeFsModule({ sync, Buffer }) {
+function makeFsModule({ sync, busAsync, Buffer, EventEmitter }) {
   const enc = new TextEncoder();
   const dec = new TextDecoder();
+
+  // fs.watch over the Kernel watch events (async plane). Returns an FSWatcher
+  // (EventEmitter) emitting ('rename'|'change', filename). Coalescing happens
+  // in the Kernel WatchRegistry (spec §6.1).
+  const Emitter = EventEmitter;
+  function watch(path, options, listener) {
+    if (typeof options === "function") { listener = options; options = {}; }
+    const w = new (Emitter || Object)();
+    if (!Emitter) { w._l = []; w.on = (ev, fn) => (w._l.push([ev, fn]), w); w.emit = (ev, ...a) => w._l.forEach(([e, fn]) => e === ev && fn(...a)); w.close = () => {}; }
+    if (listener) w.on("change", listener);
+    let watchId = null, unsub = null, closed = false;
+    if (busAsync) {
+      globalThis.__nodert_ref?.(); // an FSWatcher keeps the loop alive (§10.4)
+      busAsync.call("fs.watch", { path: String(path) }).then((r) => { watchId = r.watchId; }).catch((e) => w.emit("error", e));
+      unsub = busAsync.onEvent((msg) => {
+        if (msg.ev === "watch") {
+          if (watchId != null && msg.watchId !== watchId) return;
+          w.emit("change", msg.kind, msg.filename);
+        }
+      });
+    }
+    w.close = () => { if (closed) return; closed = true; globalThis.__nodert_unref?.(); unsub?.(); if (watchId != null && busAsync) busAsync.call("fs.unwatch", { watchId }).catch(() => {}); };
+    return w;
+  }
+  function watchFile(path, options, listener) {
+    // Poll-based watchFile over stat (M2 lean). Returns a no-op stopper via unwatchFile.
+    const cb = typeof options === "function" ? options : listener;
+    let prev = null;
+    const timer = globalThis.setInterval(() => {
+      let cur; try { cur = statSync(path); } catch { cur = { mtimeMs: 0, size: 0 }; }
+      if (prev && (prev.mtimeMs !== cur.mtimeMs || prev.size !== cur.size)) cb?.(cur, prev);
+      prev = cur;
+    }, (typeof options === "object" ? options.interval : 0) || 100);
+    if (timer.unref) timer.unref();
+    watchFile._timers = watchFile._timers || new Map();
+    watchFile._timers.set(String(path), timer);
+  }
+  function unwatchFile(path) { const t = watchFile._timers?.get(String(path)); if (t) globalThis.clearInterval(t); }
 
   const flagToInt = (flag) => {
     if (typeof flag === "number") return flag;
@@ -135,6 +173,7 @@ function makeFsModule({ sync, Buffer }) {
     realpath: cb(realpathSync), readlink: cb(readlinkSync), symlink: cb(symlinkSync),
     link: cb(linkSync), chmod: cb(chmodSync), copyFile: cb(copyFileSync),
     access: (p, mode, callback) => { const c = callback ?? mode; queueMicrotask(() => { try { sync("fs.access", { path: String(p) }); c(null); } catch (e) { c(e); } }); },
+    watch, watchFile, unwatchFile,
     promises,
     constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND, O_EXCL },
   };

@@ -82,6 +82,11 @@ async function runNode(kernel, opts) {
     source: source ?? null,
     entryPath: entryPath ?? null,
     inputType: opts.inputType ?? null,
+    // worker_threads / fork: workerData + IPC pipe ids for the child.
+    workerData: opts.workerData ?? null,
+    isWorker: !!opts.isWorker,
+    ipcRead: opts.ipcRead ?? null,
+    ipcWrite: opts.ipcWrite ?? null,
     stdio: { isTTY: [false, false, false] },
   };
 
