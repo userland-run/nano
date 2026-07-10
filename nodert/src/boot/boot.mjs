@@ -18,6 +18,7 @@ import { EventLoop } from "../uv/loop.mjs";
 import { makeBuffer } from "./buffer.mjs";
 import { makeConsole } from "./console.mjs";
 import { makeFsModule } from "./fs.mjs";
+import { makeCrypto } from "./crypto.mjs";
 
 // Upstream lib modules we run VERBATIM in M0 (pure or near-pure — their
 // dependency closure is satisfied by the bindings + primordials).
@@ -390,6 +391,7 @@ async function boot(ctx) {
       case "zlib": case "node:zlib": return () => makeZlib();
       case "node:sqlite": case "sqlite": return () => makeSqlite();
       case "child_process": case "node:child_process": return () => makeChildProcess();
+      case "crypto": case "node:crypto": return () => makeCrypto(Buffer);
       // url: the upstream module needs the ada `url` binding (M2). The host
       // URL/URLSearchParams are WHATWG-standard and present in the worker, so
       // expose them plus the file-URL helpers. DIV-URL-M0.

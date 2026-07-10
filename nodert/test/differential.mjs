@@ -57,6 +57,13 @@ const CORPUS = [
   { name: "fs-read", src: `console.log(require("fs").readFileSync("/seed.txt", "utf8").trim())`, seed: { "/seed.txt": "seeded\n" } },
   { name: "fs-write-read", src: `const fs=require("fs"); fs.writeFileSync("/tmp/o.txt","data"); console.log(fs.readFileSync("/tmp/o.txt","utf8"))`, seedDirs: ["/tmp"] },
   { name: "fs-readdir", src: `const fs=require("fs"); console.log(fs.readdirSync("/d").sort().join(","))`, seed: { "/d/a": "", "/d/b": "" } },
+  // crypto (M1) — hash/hmac outputs byte-checked against the oracle
+  { name: "crypto-sha256", pure: true, src: `console.log(require("crypto").createHash("sha256").update("hello world").digest("hex"))` },
+  { name: "crypto-sha1", pure: true, src: `console.log(require("crypto").createHash("sha1").update("The quick brown fox").digest("hex"))` },
+  { name: "crypto-hmac", pure: true, src: `console.log(require("crypto").createHmac("sha256","secret").update("message").digest("hex"))` },
+  { name: "crypto-base64-digest", pure: true, src: `console.log(require("crypto").createHash("sha256").update("abc").digest("base64"))` },
+  // streams (M1)
+  { name: "stream-transform", pure: true, src: `const {Readable,Transform}=require("stream"); const up=new Transform({transform(c,e,cb){cb(null,c.toString().toUpperCase())}}); let o=""; up.on("data",d=>o+=d); up.on("end",()=>console.log(o)); Readable.from(["ab","cd"]).pipe(up)` },
 ];
 
 async function runOnNodert(entry) {
