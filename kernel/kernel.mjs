@@ -15,6 +15,8 @@
 // K4/K5 bus, K6 net, K7 pipes/signals/router).
 
 import { PROTOCOL_MAJOR, PROTOCOL_MINOR } from "./bus/opcodes.mjs";
+import { SyscallBusHub } from "./bus/hub.mjs";
+import { PortChannel } from "./bus/port-channel.mjs";
 import { KernelVfs } from "./vfs/vfs.mjs";
 import { ProcessTable } from "./proc/table.mjs";
 import * as caps from "./caps/caps.mjs";
@@ -30,7 +32,9 @@ class Kernel {
     this.proc = new ProcessTable(opts.caps);
     this.caps = caps;
     this.profiles = profiles;
-    this.hub = null; // K4/K5: kernel/bus/hub.mjs
+    this.hub = new SyscallBusHub(this);
+    /** @type {Map<number, PortChannel>} pid → kernel-side channel */
+    this._channels = new Map();
     this.ports = null; // K6: kernel/net/ports.mjs
     this.fetchBridge = null; // K6: kernel/net/fetch-bridge.mjs
     this.signals = null; // K7: kernel/proc/signals.mjs
@@ -49,6 +53,38 @@ class Kernel {
       (spec.kind === "boa" ? this.profiles.boaDefault() : this.profiles.trustedDev());
     return this.proc.register({ ...spec, caps });
   }
+
+  /**
+   * Allocate a Syscall Bus channel for a process (spec §5.1). Returns the
+   * client's half: transfer `port` into the process's Worker and hand
+   * `{pid, token, port}` to its BusClient. The kernel side stays attached
+   * here. (The sync SAB half of the channel lands in K5.)
+   */
+  allocChannel(pid) {
+    const proc = this.proc.get(pid);
+    if (!proc) throw new Error(`allocChannel: unknown pid ${pid}`);
+    const token = randomToken();
+    const { port1, port2 } = new MessageChannel();
+    const channel = new PortChannel(this.hub, proc, port1, token);
+    this._channels.set(pid, channel);
+    return { pid, token, port: port2 };
+  }
+
+  /** Tear down a process's channel (exit/kill path). */
+  releaseChannel(pid) {
+    const channel = this._channels.get(pid);
+    if (channel) {
+      channel.close();
+      this._channels.delete(pid);
+    }
+    this.hub.releaseProcess(pid);
+  }
+}
+
+function randomToken() {
+  const buf = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(buf);
+  return [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 export { Kernel };
