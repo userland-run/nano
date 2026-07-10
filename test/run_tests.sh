@@ -100,6 +100,22 @@ fi
 echo ""
 
 # ============================================================
+# Phase 2c: Kernel unit tests (pure JS, no WASM needed)
+# ============================================================
+
+echo "--- Kernel Unit Tests ---"
+for kt in "$SCRIPT_DIR"/kernel/test_*.mjs; do
+    [ -f "$kt" ] || continue
+    kt_name="kernel/$(basename "$kt" .mjs)"
+    if node "$kt" 2>/dev/null; then
+        ok "$kt_name"
+    else
+        fail "$kt_name"
+    fi
+done
+echo ""
+
+# ============================================================
 # Phase 3: ELF execution tests
 # ============================================================
 
