@@ -139,6 +139,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert ordering harness"
     fi
+    # Engine selector (§14): vm/nodert/auto policy + ERR_NODERT_UNSUPPORTED fallback + pins
+    if node "$NODERT_DIR/test/engine.mjs" 2>/dev/null; then
+        ok "nodert engine selector (vm/nodert/auto, fallback, routing pins)"
+    else
+        fail "nodert engine selector"
+    fi
     # Cross-tier spawn (nodert → nodert child_process, §12)
     if node "$NODERT_DIR/test/cross-tier.mjs" 2>/dev/null; then
         ok "nodert cross-tier spawn (child_process)"
