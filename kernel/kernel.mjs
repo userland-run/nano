@@ -15,6 +15,7 @@
 // K4/K5 bus, K6 net, K7 pipes/signals/router).
 
 import { PROTOCOL_MAJOR, PROTOCOL_MINOR } from "./bus/opcodes.mjs";
+import { KernelVfs } from "./vfs/vfs.mjs";
 
 class Kernel {
   /** @param {import("./types.d.mts").KernelOptions} [opts] */
@@ -22,8 +23,7 @@ class Kernel {
     this.opts = opts;
     this.protocol = { major: PROTOCOL_MAJOR, minor: PROTOCOL_MINOR };
 
-    // Subsystems — wired in later phases; null until their phase lands.
-    this.vfs = null; // K2: kernel/vfs/vfs.mjs
+    this.vfs = new KernelVfs(opts.mounts);
     this.proc = null; // K3: kernel/proc/table.mjs
     this.caps = null; // K3: kernel/caps/caps.mjs
     this.hub = null; // K4/K5: kernel/bus/hub.mjs

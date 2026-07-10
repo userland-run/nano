@@ -62,6 +62,21 @@ class MemFS {
     this.root.parent = this.root;
     this.openFiles = new Map(); // hostFd -> { node, flags, dirEntries? }
     this.nextHostFd = 100;
+    // Nullable mutation hook installed by KernelVfs: (path, kind) with kind
+    // "rename" (create/delete/move) or "change" (content/metadata) — the
+    // fs.watch event vocabulary. MemFS itself stays dependency-free.
+    this.onMutate = null;
+  }
+
+  _notify(path, kind) {
+    if (this.onMutate) this.onMutate(path, kind);
+  }
+
+  /** Canonical path of a live node (hardlinks report their primary name). */
+  _pathOf(node) {
+    if (node === this.root) return "/";
+    const parent = this._parentPath(node);
+    return parent === "/" ? "/" + node.name : parent + "/" + node.name;
   }
 
   // --- Path resolution ---
@@ -119,6 +134,7 @@ class MemFS {
       node.data = new Uint8Array(0);
       node.size = 0;
       dir.children.set(name, node);
+      this._notify(this._pathOf(node), "rename");
     }
 
     if (node.isDir) {
@@ -132,6 +148,7 @@ class MemFS {
       node.data = new Uint8Array(0);
       node.size = 0;
       node.mtime = Math.floor(Date.now() / 1000);
+      this._notify(this._pathOf(node), "change");
     }
 
     const hostFd = this.nextHostFd++;
@@ -172,6 +189,7 @@ class MemFS {
     e.node.data.set(src, offset);
     e.node.size = Math.max(e.node.size, end);
     e.node.mtime = Math.floor(Date.now() / 1000);
+    this._notify(this._pathOf(e.node), "change");
     return count;
   }
 
@@ -344,6 +362,7 @@ class MemFS {
     newDir.children = new Map();
     newDir.nlink = 2;
     dir.children.set(name, newDir);
+    this._notify(this._pathOf(newDir), "rename");
     return 0;
   }
 
@@ -367,6 +386,7 @@ class MemFS {
       if (node.nlink > 0) node.nlink--;
     }
     dir.children.delete(name);
+    this._notify(path, "rename");
     return 0;
   }
 
@@ -397,6 +417,8 @@ class MemFS {
     node.name = newName;
     node.parent = newDir;
     newDir.children.set(newName, node);
+    this._notify(oldpath, "rename");
+    this._notify(newpath, "rename");
     return 0;
   }
 
@@ -404,6 +426,64 @@ class MemFS {
     const e = this.openFiles.get(hostFd);
     if (!e) return EBADF;
     return e.node.size;
+  }
+
+  // --- Object-returning variants for Syscall Bus clients (spec §5) ---
+  // The wasmMem-writing methods above are the frozen VM contract; bus
+  // clients (nodert) marshal through plain objects/Uint8Arrays instead.
+
+  /** Plain stat object, or negative errno. */
+  statObj(path, followSymlinks = true) {
+    const node = this.resolve(path, followSymlinks);
+    if (!node) return ENOENT;
+    return {
+      ino: node.ino,
+      mode: node.mode,
+      nlink: node.nlink,
+      size: node.size,
+      mtime: node.mtime != null ? node.mtime : Math.floor(Date.now() / 1000),
+      isDir: node.isDir,
+      isFile: node.isFile,
+      isSymlink: node.isSymlink,
+    };
+  }
+
+  /** Read up to len bytes at file position pos into dest[destOff..]. */
+  readInto(hostFd, dest, destOff, len, pos) {
+    const e = this.openFiles.get(hostFd);
+    if (!e) return EBADF;
+    if (!e.node.isFile) return EISDIR;
+    const data = e.node.data || new Uint8Array(0);
+    if (pos >= data.length) return 0; // EOF
+    const avail = Math.min(len, data.length - pos);
+    dest.set(data.subarray(pos, pos + avail), destOff);
+    return avail;
+  }
+
+  /** Write src bytes at file position pos; grows the file as needed. */
+  writeFrom(hostFd, src, pos) {
+    const e = this.openFiles.get(hostFd);
+    if (!e) return EBADF;
+    if (!e.node.isFile) return EISDIR;
+    const end = pos + src.length;
+    if (!e.node.data || end > e.node.data.length) {
+      const newBuf = new Uint8Array(end);
+      if (e.node.data) newBuf.set(e.node.data);
+      e.node.data = newBuf;
+    }
+    e.node.data.set(src, pos);
+    e.node.size = Math.max(e.node.size, end);
+    e.node.mtime = Math.floor(Date.now() / 1000);
+    this._notify(this._pathOf(e.node), "change");
+    return src.length;
+  }
+
+  /** Directory entry names (no "."/".."), or negative errno. */
+  readdirNames(path) {
+    const node = this.resolve(path);
+    if (!node) return ENOENT;
+    if (!node.isDir) return ENOTDIR;
+    return [...node.children.keys()];
   }
 
   // --- Hardlinks / metadata ops (Kernel extraction, spec §6.1) ---
@@ -424,6 +504,7 @@ class MemFS {
     if (dir.children.has(name)) return EEXIST;
     dir.children.set(name, node);
     node.nlink++;
+    this._notify(newPath, "rename");
     return 0;
   }
 
@@ -440,6 +521,7 @@ class MemFS {
     const node = this.resolve(path);
     if (!node) return ENOENT;
     node.mode = (node.mode & ~0o7777) | (mode & 0o7777);
+    this._notify(path, "change");
     return 0;
   }
 
@@ -448,6 +530,7 @@ class MemFS {
     const node = this.resolve(path);
     if (!node) return ENOENT;
     node.mtime = mtimeSec;
+    this._notify(path, "change");
     return 0;
   }
 
@@ -461,6 +544,7 @@ class MemFS {
     }
     node.size = length;
     node.mtime = Math.floor(Date.now() / 1000);
+    this._notify(this._pathOf(node), "change");
     return 0;
   }
 
@@ -679,6 +763,7 @@ class MemFS {
     node.data = new Uint8Array(data);
     node.size = data.length;
     dir.children.set(name, node);
+    this._notify(path, "rename");
     return node;
   }
 
@@ -724,6 +809,7 @@ class MemFS {
     node.target = target;
     node.size = target.length;
     dir.children.set(name, node);
+    this._notify(path, "rename");
     return node;
   }
 }
