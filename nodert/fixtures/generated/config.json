@@ -1,0 +1,24 @@
+{
+ "meta": {
+  "version": "v25.4.0",
+  "platform": "linux",
+  "arch": "riscv64",
+  "dumpArgv": [
+   "--expose-internals",
+   "-e"
+  ]
+ },
+ "config": {
+  "isDebugBuild": false,
+  "openSSLIsBoringSSL": false,
+  "hasOpenSSL": true,
+  "fipsMode": true,
+  "hasIntl": true,
+  "hasTracing": true,
+  "hasNodeOptions": true,
+  "hasInspector": false,
+  "noBrowserGlobals": false,
+  "bits": 64,
+  "getDefaultLocale": "[function]"
+ }
+}
