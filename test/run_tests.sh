@@ -145,6 +145,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert engine selector"
     fi
+    # K9-browser: host loads the node-lib bundle (disk/brotli + gzip/fetch) → boot from bytes
+    if node "$NODERT_DIR/test/lib-loader.mjs" 2>/dev/null; then
+        ok "nodert lib-loader (browser bundle-in-init: gzip == brotli, boot from bytes)"
+    else
+        fail "nodert lib-loader"
+    fi
     # Cross-tier spawn (nodert → nodert child_process, §12)
     if node "$NODERT_DIR/test/cross-tier.mjs" 2>/dev/null; then
         ok "nodert cross-tier spawn (child_process)"

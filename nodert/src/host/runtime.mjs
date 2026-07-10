@@ -8,7 +8,8 @@
 // stdout/stderr and the exit code. This is what the SDK's nano.node({engine:
 // "nodert"}) calls under the hood (spec §14).
 
-import { spawnWorker } from "../platform.mjs";
+import { spawnWorker, isNode } from "../platform.mjs";
+import { loadLibBundle } from "./lib-loader.mjs";
 
 const workerEntry = new URL("../boot/worker-entry.mjs", import.meta.url).href;
 
@@ -41,6 +42,11 @@ async function runNode(kernel, opts) {
   });
 
   const chan = kernel.allocChannel(proc.pid);
+
+  // The worker reads the node-lib bundle + fixtures from disk under Node. A
+  // browser worker can't, so the HOST loads them (cached) and passes the bytes
+  // in init (K9-browser). `opts.lib` lets a caller inject a pre-loaded bundle.
+  const lib = opts.lib ?? (isNode ? null : await loadLibBundle({ fetch: opts.fetch }));
 
   let outBuf = "";
   let errBuf = "";
@@ -79,6 +85,10 @@ async function runNode(kernel, opts) {
     cwd,
     nodeLibVersion: "v25.4.0",
     protocolVersion: kernel.protocol.major,
+    // Browser: host-provided bundle + fixtures (Node: null → worker reads disk).
+    libIndex: lib?.libIndex ?? null,
+    libBytes: lib?.libBytes ?? null,
+    fixtures: lib?.fixtures ?? null,
     source: source ?? null,
     entryPath: entryPath ?? null,
     inputType: opts.inputType ?? null,
