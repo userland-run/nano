@@ -116,6 +116,29 @@ done
 echo ""
 
 # ============================================================
+# Phase 2d: nodert host-engine tier (worker + Kernel bus; no VM needed)
+# ============================================================
+
+echo "--- nodert Tier (host engine) ---"
+NODERT_DIR="$PROJECT_ROOT/nodert"
+if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
+    if node "$NODERT_DIR/test/smoke.mjs" 2>/dev/null; then
+        ok "nodert smoke (14 programs run on the host engine)"
+    else
+        fail "nodert smoke"
+    fi
+    # Differential vs host Node (pure-JS fidelity); --vm mode is @heavy (needs images/node)
+    if node "$NODERT_DIR/test/differential.mjs" 2>/dev/null; then
+        ok "nodert differential (vs host-node oracle)"
+    else
+        fail "nodert differential"
+    fi
+else
+    skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"
+fi
+echo ""
+
+# ============================================================
 # Phase 3: ELF execution tests
 # ============================================================
 
