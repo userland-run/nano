@@ -146,10 +146,28 @@ async function boot(ctx) {
     doExit(1);
     return waitExit();
   }
+  // Drain the nextTick queue SYNCHRONOUSLY before yielding, so nextTicks
+  // registered by the main script run before any promise microtask (Node's
+  // nextTick > microtask priority, §10.1).
+  loop._drainTicks();
   loop.start();
   return waitExit();
 
   // ---- helpers ----
+  function computeArgv() {
+    // Match Node's argv rules: `-e <code>` → ["node"] (the code is not in
+    // argv); a script file → ["node", <path>, ...extraArgs].
+    const a = init.argv ?? ["node"];
+    const eIdx = a.indexOf("-e");
+    if (init.source != null || eIdx >= 0) {
+      // eval mode: keep only args AFTER the code (a[eIdx+2] onward).
+      const rest = eIdx >= 0 ? a.slice(eIdx + 2) : [];
+      return ["node", ...rest];
+    }
+    if (init.entryPath) return ["node", init.entryPath, ...a.slice(a.indexOf(init.entryPath) + 1 || a.length)];
+    return ["node", ...a.slice(1)];
+  }
+
   function makeProcess() {
     const emitter = {};
     const listeners = new Map();
@@ -158,7 +176,7 @@ async function boot(ctx) {
       versions: { node: (init.nodeLibVersion ?? "v25.4.0").slice(1), v8: "0.0", uv: "1.0", nodert: "0.0.1" },
       platform: "linux", // spec §8.3, DIV-001 (VM is riscv64)
       arch: "x64",
-      argv: ["node", ...(init.argv?.slice(1) ?? [])],
+      argv: computeArgv(),
       argv0: "node",
       execArgv: [],
       execPath: "/usr/bin/node",
@@ -307,8 +325,49 @@ async function boot(ctx) {
       case "util": return () => makeUtil();
       case "assert": return () => makeAssert();
       case "process": return () => proc;
+      case "zlib": case "node:zlib": return () => makeZlib();
+      case "node:sqlite": case "sqlite": return () => makeSqlite();
       default: return null;
     }
+  }
+
+  // node:zlib mapped onto the zlib Kernel Service (spec §8.8). M0: the *Sync
+  // methods over the bus; streaming variants land in M1.
+  function makeZlib() {
+    const call = (method, buf) => {
+      const data = typeof buf === "string" ? new TextEncoder().encode(buf) : (buf instanceof Uint8Array ? buf : new Uint8Array(buf));
+      // Binary at top-level `data` — the sync plane's transferable blob slot;
+      // the binary result comes back in `data` too.
+      const r = sync("svc.invoke", { service: "zlib", method, data: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) });
+      return Buffer.from(r.data ?? r.result);
+    };
+    const mk = (m) => (buf) => call(m, buf);
+    return {
+      gzipSync: mk("gzip"), gunzipSync: mk("gunzip"),
+      deflateSync: mk("deflate"), inflateSync: mk("inflate"),
+      deflateRawSync: mk("deflateRaw"), inflateRawSync: mk("inflateRaw"),
+      brotliCompressSync: mk("brotliCompress"), brotliDecompressSync: mk("brotliDecompress"),
+      constants: {},
+    };
+  }
+
+  // node:sqlite mapped onto the DuckDB Kernel Service + sqlite core extension.
+  // Dialect/error differences are DIV-SQLITE-DUCKDB.
+  function makeSqlite() {
+    class DatabaseSync {
+      constructor(path) { this._session = sync("svc.open_session", { service: "duckdb", config: { path: path ?? ":memory:" } }).sessionId; this._open = true; }
+      exec(sql) { sync("svc.invoke", { service: "duckdb", sessionId: this._session, method: "exec", payload: { sql } }); }
+      prepare(sql) {
+        const session = this._session;
+        return {
+          all: (...params) => sync("svc.invoke", { service: "duckdb", sessionId: session, method: "query", payload: { sql, params } }).result.rows,
+          get: (...params) => sync("svc.invoke", { service: "duckdb", sessionId: session, method: "query", payload: { sql, params } }).result.rows[0] ?? undefined,
+          run: (...params) => { sync("svc.invoke", { service: "duckdb", sessionId: session, method: "exec", payload: { sql, params } }); return { changes: 0, lastInsertRowid: 0 }; },
+        };
+      }
+      close() { if (this._open) { sync("svc.close_session", { sessionId: this._session }); this._open = false; } }
+    }
+    return { DatabaseSync };
   }
 
   function makeOs() {

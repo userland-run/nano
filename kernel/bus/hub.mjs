@@ -253,7 +253,17 @@ function buildHandlers(hub) {
   h.set(OP["svc.list"], () => ({ services: hub.kernel.services?.list() ?? [] }));
   h.set(OP["svc.invoke"], async (p, a) => {
     if (!hub.kernel.services) throw new KernelError(ERRNO.ENOSYS, undefined, "no service registry");
-    return { result: await hub.kernel.services.invoke(a.service, a.method, a.payload) };
+    // Binary rides at top-level `data` on the sync plane (one blob slot); merge
+    // it into the service payload so callers can pass { payload, data }.
+    const payload = a.data !== undefined ? { ...(a.payload ?? {}), data: a.data } : a.payload;
+    // A sessionId routes to the stateful session (spec §13); otherwise one-shot.
+    const result = a.sessionId != null
+      ? await hub.kernel.services.sessionCall(a.sessionId, a.method, payload, p.pid)
+      : await hub.kernel.services.invoke(a.service, a.method, payload);
+    // A binary result rides the transferable/blob `data` slot; JSON results
+    // ride `result`. (zlib returns bytes; duckdb/swc return objects.)
+    if (result instanceof ArrayBuffer) return { data: result };
+    return { result };
   });
   h.set(OP["svc.open_session"], (p, a) => {
     if (!hub.kernel.services) throw new KernelError(ERRNO.ENOSYS, undefined, "no service registry");

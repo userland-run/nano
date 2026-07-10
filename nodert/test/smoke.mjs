@@ -6,13 +6,14 @@
 // Smoke test: run scripts on the nodert tier (host engine) via the Kernel and
 // a worker_threads worker. Not the differential suite — just "does it run".
 
-import { Kernel } from "../../kernel/index.mjs";
+import { Kernel, registerBuiltinServices } from "../../kernel/index.mjs";
 import { runNode } from "../src/host/runtime.mjs";
 
 let passed = 0, failed = 0;
 
 async function run(name, source, expectStdout, expectExit = 0) {
   const kernel = new Kernel();
+  await registerBuiltinServices(kernel);
   // Seed a file the fs tests read.
   kernel.vfs.rootMem.createFile("/work/hello.txt", "file contents\n");
   kernel.vfs.mkdir?.("/tmp", 0o777);
@@ -44,6 +45,8 @@ await run("fs.readFileSync", `const fs = require("fs"); process.stdout.write(fs.
 await run("fs write+read+stat", `const fs=require("fs"); fs.writeFileSync("/tmp/a.txt","xyz"); console.log(fs.readFileSync("/tmp/a.txt","utf8"), fs.statSync("/tmp/a.txt").size)`, "xyz 3\n");
 await run("path module (upstream verbatim)", `const path=require("path"); console.log(path.join("/a/b", "../c"), path.basename("/x/y.js"), path.extname("f.txt"))`, "/a/c y.js .txt\n");
 await run("fs.promises", `const fs=require("fs").promises; (async()=>{await fs.writeFile("/tmp/p.txt","P"); console.log(await fs.readFile("/tmp/p.txt","utf8"))})()`, "P\n");
+await run("zlib service round-trip", `const z=require("zlib"); const gz=z.gzipSync("hello service "); console.log(z.gunzipSync(gz).toString())`, "hello service \n");
+await run("node:sqlite via DuckDB", `const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync(":memory:"); db.exec("CREATE TABLE t (id, v)"); db.exec("INSERT INTO t (id, v) VALUES (1, 'one'), (2, 'two')"); const rows=db.prepare("SELECT v FROM t WHERE id > 1 ORDER BY id").all(); console.log(rows.map(r=>r.v).join(","))`, "two\n");
 
 console.log(`\n=== nodert smoke: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);
