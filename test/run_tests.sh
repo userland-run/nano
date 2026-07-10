@@ -169,6 +169,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert worker_threads + fs.watch"
     fi
+    # M3 cross-tier chain (node → sh → node; npm lifecycle showcase §12.3)
+    if node "$NODERT_DIR/test/cross-tier-chain.mjs" 2>/dev/null; then
+        ok "nodert cross-tier chain (npm run build → sh → node)"
+    else
+        fail "nodert cross-tier chain"
+    fi
 else
     skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"
 fi

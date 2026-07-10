@@ -23,6 +23,10 @@ function registerNodertDelegate(kernel, opts = {}) {
   return kernel.router.registerDelegate("node", async (req) => {
     const { parent, argv, cwd, env, caps, wait, stdio } = req;
     const nodeArgs = argvToNode(argv);
+    // Resolve a relative entry path against the spawn cwd (node build.js).
+    if (nodeArgs.entryPath && !nodeArgs.entryPath.startsWith("/")) {
+      nodeArgs.entryPath = joinPath(cwd ?? "/", nodeArgs.entryPath);
+    }
 
     if (wait) {
       // execSync/spawnSync: run to completion, return captured output.
@@ -64,6 +68,13 @@ function registerNodertDelegate(kernel, opts = {}) {
     });
     return { pid: child.pid, stdin: stdinPipe.id, stdout: stdoutPipe.id, stderr: stderrPipe.id, ipcWrite: ipc?.parentWrite, ipcRead: ipc?.parentRead };
   });
+}
+
+function joinPath(a, b) {
+  if (b.startsWith("/")) return b;
+  const parts = (a + "/" + b).split("/"); const out = [];
+  for (const s of parts) { if (s === "" || s === ".") continue; if (s === "..") out.pop(); else out.push(s); }
+  return "/" + out.join("/");
 }
 
 // Interpret argv the way the child expects: ["node", "-e", code, ...args] or
