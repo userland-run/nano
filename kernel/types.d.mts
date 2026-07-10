@@ -3,7 +3,7 @@
 // and by nano/nodert (TypeScript) as the single source of interface truth.
 
 /** Process kinds (§7.1). */
-export type ProcessKind = "vm-init" | "vm" | "node" | "boa" | "service";
+export type ProcessKind = "vm-init" | "vm" | "node" | "boa" | "service" | "wasm";
 
 export type ProcessState = "running" | "zombie" | "reaped";
 

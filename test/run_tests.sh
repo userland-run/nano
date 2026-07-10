@@ -151,6 +151,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert net+http"
     fi
+    # WASM tier W-1: wasip1 apps as Kernel processes (UL-SPEC/wasm-tier)
+    if node "$NODERT_DIR/test/wasm.mjs" 2>/dev/null; then
+        ok "nodert wasm tier (wasip1 apps, structural preopens, node→wasm spawn)"
+    else
+        fail "nodert wasm tier"
+    fi
 else
     skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"
 fi

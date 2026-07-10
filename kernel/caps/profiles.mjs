@@ -11,7 +11,7 @@ function trustedDev() {
   return {
     fs: { mode: "readwrite" },
     net: { fetchHosts: "all", listen: true, loopbackConnect: true },
-    spawn: { node: true, vm: true, boa: true },
+    spawn: { node: true, vm: true, boa: true, wasm: true },
     services: ["*"],
     env: "inherit",
     stdio: "inherit",
@@ -23,7 +23,7 @@ function boaDefault() {
   return {
     fs: { mode: "none" },
     net: { fetchHosts: "none", listen: false, loopbackConnect: false },
-    spawn: { node: false, vm: false, boa: false },
+    spawn: { node: false, vm: false, boa: false, wasm: false },
     services: [],
     env: "none",
     stdio: "pipe",

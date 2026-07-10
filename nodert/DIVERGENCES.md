@@ -17,6 +17,12 @@ Format: `id | area | nodert behavior | reference behavior | rationale | spec | t
 | DIV-SQLITE-DUCKDB | `node:sqlite` | backed by DuckDB-wasm + sqlite core extension | real embedded SQLite | User decision; dialect/error-code differences vs embedded SQLite | §8.8 |
 | DIV-URL-M0 | `require("url")` | host WHATWG URL/URLSearchParams + lean helpers | upstream `lib/url.js` | upstream url needs the ada `url` binding (M2); host URL is WHATWG-standard | §8.4 |
 | DIV-RSPACK | `rspack` service | ERR_NODERT_UNSUPPORTED | native bundler | No browser-wasm build of Rspack exists; use the VM or esbuild-wasm | §13 |
+| DIV-NET-M0 | `net` | nodert loopback sockets (Kernel pipes) | upstream lib/net.js (tcp_wrap) | M1; loopback-only, upstream net.js needs tcp_wrap/LibuvStreamWrap | §11 |
+| DIV-HTTP-M0 | `http` | lean HTTP/1.1 over net | upstream lib/http.js (llhttp) | M1; Content-Length bodies, no chunked-request parsing yet | §11 |
+| DIV-CRYPTO-M0 | `crypto` | sha256/sha1 + hmac + random | full node:crypto (BoringSSL) | M1 subset; legacy ciphers/DH/scrypt need BoringSSL-wasm | §8.8 |
+| WASM-TERM | wasip1 apps | no termios / raw-mode TUI | native TTY | wasip1 has no termios; line-oriented tools only | wasm-tier T3 |
+| WASM-SIGNAL | wasip1 apps | kill always terminates | signal delivery | wasip1 has no signals; SIGTERM/SIGKILL both teardown | wasm-tier T4 |
+| WASM-SOCK | wasip1 apps | sock_* → ENOTSUP | sockets | wasip1 has no sockets outside wasi-http (W-3) | wasm-tier P3 |
 
 ## Upstream modules running VERBATIM (P2 — no reimplementation)
 

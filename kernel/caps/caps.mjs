@@ -77,7 +77,7 @@ function capsSubsetViolation(child, parent) {
   if (!fetchHostsCover(parent.net.fetchHosts, child.net.fetchHosts)) return "net.fetchHosts";
   if (!listenCovers(parent.net.listen, child.net.listen)) return "net.listen";
   if (child.net.loopbackConnect && !parent.net.loopbackConnect) return "net.loopbackConnect";
-  for (const tier of ["node", "vm", "boa"]) {
+  for (const tier of ["node", "vm", "boa", "wasm"]) {
     if (child.spawn[tier] && !parent.spawn[tier]) return `spawn.${tier}`;
   }
   if (!servicesCover(parent.services, child.services)) return "services";
