@@ -13,6 +13,7 @@
  */
 
 import { MemFS } from "./memfs.mjs";
+import { Kernel, FetchBridge } from "../kernel/index.mjs";
 
 // ============================================================
 // VM struct constants (must match src/types.rs)
@@ -43,6 +44,14 @@ const STATUS_FS_PENDING     = 6;
 const STATUS_EPOLL_BLOCKED  = 7;
 const STATUS_RUNNING        = 18;
 
+// Safety heartbeat (ms) for parking an idle listening server whose epoll_pwait
+// asked for an INFINITE wait (no near libuv timer). We wake instantly on an
+// injected connection (see injectConnection); this bound is only a backstop so
+// GC / missed wakes still get a turn. Finite waits honor the guest's own
+// timeout instead. Small enough to feel responsive, large enough to keep an
+// otherwise-idle `serve` near 0% CPU.
+const SERVER_IDLE_HEARTBEAT_MS = 1000;
+
 // Syscall numbers (RISC-V Linux)
 const SYS_GETCWD     = 17;
 const SYS_CLONE      = 220;
@@ -59,7 +68,9 @@ const SYS_READ       = 63;
 const SYS_WRITE      = 64;
 const SYS_PPOLL      = 73;
 const SYS_PREAD64    = 67;
+const SYS_PWRITE64   = 68;
 const SYS_PREADV     = 69;
+const SYS_PWRITEV    = 70;
 const SYS_READLINKAT = 78;
 const SYS_NEWFSTATAT = 79;
 const SYS_FSTAT      = 80;
@@ -182,8 +193,16 @@ class NanoVM {
     this._ramPtr = X.vm_ram_ptr(this._vmPtr);
     this._ramSize = X.vm_ram_size(this._vmPtr);
 
-    // Initialize MemFS with standard directories and files
-    this._memfs = new MemFS();
+    // The Kernel owns all cross-process state (spec §4); the VM is its
+    // first client. Absent opts.kernel, a private Kernel keeps the
+    // historical single-VM embedding working unchanged.
+    this._kernel = opts.kernel || new Kernel();
+    this._memfs = this._kernel.vfs.rootMem;
+    this._process = this._kernel.registerProcess({
+      kind: "vm-init",
+      argv: ["nanovm"],
+      cwd: "/root",
+    });
     this._seedFS();
 
     // Load bundled ELFs if available (decompresses gzipped data)
@@ -207,6 +226,8 @@ class NanoVM {
     // Virtual server — bridges SW HTTP requests into VM sockets
     this._pendingConnections = []; // { connId, resolve, responseChunks }
     this._virtualServer = new VirtualServer(this);
+    this._serverWake = null;         // resolver for a run loop parked on an idle server
+    this._serverWakePending = false; // a connection arrived while not parked → don't sleep next time
 
     // Pre-warm WASM JIT: run a trivial busybox command so the browser's
     // optimizing compiler (TurboFan) starts compiling exec() in the background.
@@ -596,6 +617,7 @@ class NanoVM {
     }
     this._stdinEof = false; // new input cancels a prior EOF
     if (this._stdinWake) this._stdinWake(); // wake a run loop parked on idle stdin
+    if (this._serverWake) this._serverWake(); // …or one parked on an idle server
   }
 
   /**
@@ -767,6 +789,11 @@ class NanoVM {
   }
 
   destroy() {
+    if (this._kernel && this._process) {
+      this._kernel.proc.exit(this._process.pid, 0);
+    }
+    this._kernel = null;
+    this._process = null;
     this._memfs = null;
     this._exports = null;
     this._memory = null;
@@ -774,6 +801,8 @@ class NanoVM {
     this._nodeElf = null;
     this._pendingConnections = [];
     this._virtualServer = null;
+    this._serverWake = null;
+    this._serverWakePending = false;
   }
 
   // ============================================================
@@ -832,12 +861,24 @@ class NanoVM {
     const lowEnd = Math.min(Math.max(brkCurrent, mmapNext), this._ramSize);
     const sp = Number(dv.getBigUint64(v + 16, true));
     const stackStart = Math.max(lowEnd, (sp - 65536) & ~0xFFF);
+    // Signal handler tables live in Rust statics (not the Vm struct / guest RAM),
+    // so capture them separately — a forked child's execve() resets them and would
+    // otherwise wipe the PARENT shell's handlers (e.g. its interactive SIGINT
+    // handler, so Ctrl-C at the next prompt would kill the shell instead of the
+    // input line).
+    let sigState = null, sigAddr = 0;
+    if (this._exports.vm_signals_dump) {
+      sigAddr = this._exports.vm_signals_dump();
+      sigState = new Uint8Array(this._memory.buffer, sigAddr, 2 * 64 * 8).slice();
+    }
     return {
       vmStruct: new Uint8Array(this._memory.buffer, v, VM_STRUCT_SIZE).slice(),
       lowRAM: new Uint8Array(this._memory.buffer, this._ramPtr, lowEnd).slice(),
       stackRAM: new Uint8Array(this._memory.buffer, this._ramPtr + stackStart, this._ramSize - stackStart).slice(),
       lowEnd,
       stackStart,
+      sigState,
+      sigAddr,
     };
   }
 
@@ -856,6 +897,12 @@ class NanoVM {
       mem.fill(0, this._ramPtr + snap.lowEnd, this._ramPtr + snap.stackStart);
     }
     if (snap.stackRAM.length) mem.set(snap.stackRAM, this._ramPtr + snap.stackStart);
+    // Restore the parent's signal handler tables (see _forkSnapshot) so the child's
+    // execve() reset can't leave the shell with a default (fatal) SIGINT.
+    if (snap.sigState && this._exports.vm_signals_load) {
+      new Uint8Array(this._memory.buffer, snap.sigAddr, snap.sigState.length).set(snap.sigState);
+      this._exports.vm_signals_load();
+    }
   }
 
   snapshot() {
@@ -887,7 +934,28 @@ class NanoVM {
     // Serialize MemFS
     const memfs = this._memfs.serialize();
 
-    return { vmStruct, lowRAM, lowEnd, stackRAM, stackStart, memfs };
+    // Capture the in-memory socket table (listening/connected sockets, accept
+    // queues, recv rings). restoreAndRun()'s reset zeroes it, so without this a
+    // warm-restored server (e.g. `opencode serve`) loses the sockets it bound
+    // before the snapshot and its event loop watches dead fds.
+    const X = this._exports;
+    const sockets = X.vm_sockets_ptr
+      ? new Uint8Array(this._memory.buffer, X.vm_sockets_ptr(), X.vm_sockets_size()).slice()
+      : null;
+    // Event-loop statics (epoll interest list, eventfd/timerfd tables + counters)
+    // are also zeroed by the restore reset — a warm server needs them so its
+    // libuv loop keeps watching its fds. dump() copies them into a scratch buffer.
+    const evloop = X.vm_evloop_dump
+      ? new Uint8Array(this._memory.buffer, X.vm_evloop_dump(), X.vm_evloop_size()).slice()
+      : null;
+    // Decoded-block cache — restoring it (vs re-decoding cold) is the dominant
+    // warm-restore speedup (host RAM memcpy is only ~250ms; a cold block cache
+    // costs ~15s re-decoding a warm server's code).
+    const blocks = X.vm_blocks_ptr
+      ? new Uint8Array(this._memory.buffer, X.vm_blocks_ptr(), X.vm_blocks_size()).slice()
+      : null;
+
+    return { vmStruct, lowRAM, lowEnd, stackRAM, stackStart, memfs, sockets, evloop, blocks };
   }
 
   /**
@@ -909,7 +977,6 @@ class NanoVM {
     const X = this._exports;
     const v = this._vmPtr;
     const mem = new Uint8Array(this._memory.buffer);
-
     // 1. Reset block cache + syscall statics
     if (X.vm_snapshot_restore_reset) {
       X.vm_snapshot_restore_reset();
@@ -917,6 +984,22 @@ class NanoVM {
       // Fallback: reset separately
       if (X.vm_reset_blocks) X.vm_reset_blocks();
       if (X.vm_reset_statics) X.vm_reset_statics();
+    }
+
+    // 1b. Restore the socket table + event-loop statics AFTER the reset zeroed
+    // them, so a warm-restored server keeps its bound sockets AND its libuv loop
+    // keeps watching them (epoll interest list / eventfd / timerfd). vm_evloop_dump
+    // returns the (stable) scratch address; we overwrite it with the saved bytes
+    // and load() copies them back into the statics.
+    if (snap.sockets && X.vm_sockets_ptr) {
+      mem.set(snap.sockets, X.vm_sockets_ptr());
+    }
+    if (snap.evloop && X.vm_evloop_dump) {
+      mem.set(snap.evloop, X.vm_evloop_dump());
+      X.vm_evloop_load();
+    }
+    if (snap.blocks && X.vm_blocks_ptr) {
+      mem.set(snap.blocks, X.vm_blocks_ptr());
     }
 
     // 2. Restore VM struct
@@ -935,8 +1018,9 @@ class NanoVM {
       mem.set(snap.stackRAM, this._ramPtr + snap.stackStart);
     }
 
-    // 6. Rebuild MemFS from snapshot
+    // 6. Rebuild MemFS from snapshot (and repoint the Kernel root mount)
     this._memfs = MemFS.deserialize(snap.memfs);
+    this._kernel.vfs.replaceRootMem(this._memfs);
 
     // 6b. Inject extra user files (e.g. from OPFS)
     if (opts.extraFiles) {
@@ -1005,6 +1089,66 @@ class NanoVM {
     const result = await this._runLoop(maxSteps);
     if (!result.snapshotReady) throw new Error("App did not reach the snapshot sentinel within budget");
     return this.snapshot();
+  }
+
+  /**
+   * Snapshot a long-running server WHEN IT IS READY, not at a guest sentinel.
+   * Starts the ELF, then drives a host-side readiness probe (injectConnection of
+   * `readyRequest` on `readyPort`) until it returns HTTP `readyStatus`. The probe
+   * also warms the request path, so capturing at that point yields a snapshot that
+   * restores to an immediately-serviceable server (routes registered + handler +
+   * block cache warm) — the fast-restore recipe. Use this for servers whose
+   * readiness can't be reported from a guest launcher (the guest can't loopback to
+   * its own listening socket the way the host injectConnection can).
+   * @param {object} opts - elf|elfPath, argv, env, maxSteps, readyPort,
+   *   readyRequest (raw HTTP), readyStatus=200, readyTimeoutMs=180000.
+   * @returns {Promise<object>} snapshot for restoreAndRun().
+   */
+  async snapshotAppReady(opts = {}) {
+    const { elf, elfPath, argv, env = [], maxSteps = 80_000_000_000,
+      readyPort, readyRequest, readyStatus = 200, readyTimeoutMs = 180_000 } = opts;
+    const appElf = elf || (elfPath ? this._readElfFromVfs(elfPath) : null);
+    if (!appElf) throw new Error(`snapshotAppReady: no ELF (${elfPath || "pass elf or elfPath"})`);
+    if (!argv || !argv.length) throw new Error("snapshotAppReady: argv required");
+    if (!readyPort || !readyRequest) throw new Error("snapshotAppReady: readyPort + readyRequest required");
+
+    this._stdout = "";
+    this._onStdout = null;
+    this._resetProcessState();
+    this._resetVM();
+    const mem = new Uint8Array(this._memory.buffer);
+    mem.set(appElf, this._ramPtr);
+    const X = this._exports;
+    if (X.vm_load_elf(this._vmPtr, 0, appElf.length) !== 0) throw new Error("vm_load_elf failed");
+    this._setupArgv(argv, env);
+
+    // Start the app; the run loop pumps while we probe readiness from the host.
+    let done = false;
+    void this._runLoop(maxSteps).then(() => { done = true; }).catch(() => { done = true; });
+    const t0 = Date.now();
+    while (Date.now() - t0 < readyTimeoutMs && !done) {
+      await new Promise((r) => setTimeout(r, 200));
+      let status = 0;
+      try {
+        const bytes = await Promise.race([
+          this._virtualServer.injectConnection(readyPort, readyRequest),
+          new Promise((r) => setTimeout(() => r(null), 1500)),
+        ]);
+        if (bytes) {
+          const txt = typeof bytes === "string" ? bytes : new TextDecoder().decode(Uint8Array.from(Object.values(bytes)));
+          status = parseInt((txt.match(/HTTP\/1\.1 (\d+)/) || [])[1] || "0", 10);
+        }
+      } catch { /* server not up yet */ }
+      if (status === readyStatus) {
+        // Ready + warm. Let the loop settle to idle, then capture.
+        await new Promise((r) => setTimeout(r, 300));
+        const snap = this.snapshot();
+        this.cancelRun();
+        return snap;
+      }
+    }
+    this.cancelRun();
+    throw new Error(`snapshotAppReady: not ready on :${readyPort} within ${readyTimeoutMs}ms`);
   }
 
   /**
@@ -1122,6 +1266,7 @@ class NanoVM {
     this._lastYieldPc = null; // adaptive-yield progress tracker (see _adaptiveYield)
     this._serverMode = false; // set once a guest server is listening (see get serving)
     this._servingPort = null;
+    if (this._kernel && this._process) this._kernel.ports.closeAllFor(this._process.pid);
     const myRunId = ++this._runId;
 
     for (let iter = 0; iter < maxIter; iter++) {
@@ -1187,7 +1332,18 @@ class NanoVM {
       if (status === STATUS_EPOLL_BLOCKED) {
         serverMode = true;
         this._serverMode = true; // a guest server is listening (footer indicator)
-        await this._adaptiveYield(X);
+        this._pollConnections();
+        // Truly park the run loop until a connection is injected, the guest's
+        // epoll_pwait timeout (libuv's next-timer deadline) elapses, or stdin
+        // arrives — instead of re-entering the event loop every macrotask. The
+        // old _adaptiveYield poll pinned an idle `opencode serve` (and any HTTP
+        // server) at 100% CPU: its per-loop libuv work keeps advancing the PC, so
+        // the "idle" heuristic never triggered and it used the unthrottled
+        // MessageChannel yield. vm_epoll_timeout_ms() is the guest's requested
+        // timeout in ms (-1 = infinite); fall back to the idle heartbeat on older
+        // wasm without the export.
+        const timeoutMs = X.vm_epoll_timeout_ms ? X.vm_epoll_timeout_ms() : -1;
+        await this._parkServer(timeoutMs);
         this._pollConnections();
         const dv = new DataView(this._memory.buffer);
         dv.setBigInt64(this._vmPtr + 80, BigInt(-4), true); // a0 = -EINTR
@@ -1209,7 +1365,10 @@ class NanoVM {
         const m =
           /(?:listening|running|started)[^\d]{0,14}(\d{2,5})/i.exec(tail) ||
           /:(\d{2,5})\b/.exec(tail);
-        if (m) this._servingPort = parseInt(m[1], 10);
+        if (m) {
+          this._servingPort = parseInt(m[1], 10);
+          this._registerVmPort(this._servingPort);
+        }
       }
       if (serverMode) iter--;
 
@@ -1581,6 +1740,32 @@ class NanoVM {
     const argv = this._readGuestStrArray(argvPtr);
     const envp = this._readGuestStrArray(envpPtr);
 
+    // Kernel routing seam (spec §14.2): consult the spawn routing table
+    // BEFORE the VM-side resolution. When a non-vm tier delegate is
+    // registered (nodert M1+), the spawn leaves the emulator here with
+    // stdio bridged through Kernel pipes; until then route() always says
+    // "vm" and this block is a strict no-op.
+    if (this._kernel) {
+      const route = this._kernel.router.route(argv.length ? argv : [execPath]);
+      if (route.tier !== "vm" && this._kernel.router.delegateFor(route.tier)) {
+        const delegate = this._kernel.router.delegateFor(route.tier);
+        delegate({
+          parent: this._process,
+          argv: argv.length ? argv : [execPath],
+          env: Object.fromEntries(envp.map((e) => {
+            const i = e.indexOf("=");
+            return i > 0 ? [e.slice(0, i), e.slice(i + 1)] : [e, ""];
+          })),
+          cwd: this._readCwd(),
+          fromExecve: true,
+        });
+        // The guest's exec'ing task ends; the delegate owns the child.
+        this._setA0(dv, 0);
+        dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+        return;
+      }
+    }
+
     // Resolve the target in the guest VFS (following symlinks).
     const target = this._memfs.resolve(execPath, true);
     if (!target || !target.isFile) {
@@ -1648,9 +1833,33 @@ class NanoVM {
    * Worker the bridge retries through when a direct fetch is CORS-blocked;
    * `disabled` turns the /dev/__net__ device off (open returns EACCES).
    */
+  // Register a sniffed guest listener in the Kernel port table (spec §11.4)
+  // so the ServeBridge can resolve the owning injector uniformly. Best-effort:
+  // a stale sniff must never break the serve path.
+  _registerVmPort(port) {
+    if (!this._kernel || !port) return;
+    try {
+      if (!this._kernel.ports.lookup(port)) {
+        this._kernel.ports.listen(this._process ? this._process.pid : 1, port, {
+          kind: "vm",
+          inject: (rawHTTP) => this.virtualServer.injectConnection(port, rawHTTP),
+        });
+      }
+    } catch { /* EADDRINUSE from a stale sniff — injection still works */ }
+  }
+
   setNetwork({ corsProxyUrl = null, disabled = false } = {}) {
-    this._corsProxyUrl = corsProxyUrl;
     this._netDisabled = !!disabled;
+    this._netBridge.configure({ corsProxyUrl, disabled });
+  }
+
+  // The outbound bridge lives in the Kernel (kernel/net/fetch-bridge.mjs) so
+  // the VM path and nodert's net.fetch_* share one implementation. A bare
+  // NanoVM (unit tests construct without _init) gets a private instance.
+  get _netBridge() {
+    if (this._kernel) return this._kernel.fetchBridge;
+    if (!this.__localNetBridge) this.__localNetBridge = new FetchBridge();
+    return this.__localNetBridge;
   }
 
   /**
@@ -1664,7 +1873,7 @@ class NanoVM {
    * Pass `null` to unregister.
    */
   setLlmBridge(handler) {
-    this._llmBridge = handler || null;
+    this._netBridge.setLlmBridge(handler);
   }
 
   // Concatenate the accumulated request bytes, do the host fetch, and expose
@@ -1680,117 +1889,31 @@ class NanoVM {
   }
 
   async _doNetFetch(reqBytes) {
-    // Parse "METHOD URL\nHeader: v\n...\n\nbody".
-    const text = new TextDecoder().decode(reqBytes);
-    const sep = text.indexOf("\n\n");
-    const head = sep >= 0 ? text.slice(0, sep) : text;
-    const body = sep >= 0 ? text.slice(sep + 2) : "";
-    const lines = head.split("\n").map((l) => l.replace(/\r$/, "")).filter(Boolean);
-    const first = (lines.shift() || "GET ").trim().split(/\s+/);
-    const method = (first[0] || "GET").toUpperCase();
-    const url = first[1];
-    const headers = {};
-    for (const l of lines) { const i = l.indexOf(":"); if (i > 0) headers[l.slice(0, i).trim()] = l.slice(i + 1).trim(); }
-    if (!url) return this._bufferedNetStream(this._httpResp(400, "Bad Request", {}, "nano-net: missing URL"));
-    try {
-      // Internal origin: route to the in-page LLM bridge instead of fetch().
-      let host = "";
-      try { host = new URL(url).hostname; } catch { /* non-URL → let fetch fail */ }
-      if (host === "nanoinfer.internal") {
-        if (!this._llmBridge) {
-          return this._bufferedNetStream(this._httpResp(502, "Bad Gateway", {}, "nano-net: no LLM bridge registered"));
-        }
-        const r = await this._llmBridge({ method, url, headers, body });
-        return await this._llmResultToStream(r);
-      }
-      const opts = { method, headers };
-      if (method !== "GET" && method !== "HEAD" && body) opts.body = body;
-      let resp;
-      try {
-        resp = await fetch(url, opts);
-      } catch (e) {
-        // Direct fetch blocked (CORS/network) → retry via the Tier-1.5 proxy if
-        // set. This only ever runs before the first response byte exists, so
-        // the retry can never interleave with streamed output.
-        if (this._corsProxyUrl) {
-          const u = this._corsProxyUrl + (this._corsProxyUrl.includes("?") ? "&" : "?") + "apiurl=" + encodeURIComponent(url);
-          resp = await fetch(u, opts);
-        } else throw e;
-      }
-      return await this._respToNetStream(resp);
-    } catch (e) {
-      return this._bufferedNetStream(this._httpResp(502, "Bad Gateway", {}, "nano-net: " + (e?.message || String(e))));
-    }
+    return this._netBridge.openFromRawRequest(reqBytes);
   }
 
   // Turn a fetch()-style Response into a net stream. Small responses with a
   // known Content-Length keep the legacy fully-buffered framing (byte-identical
   // to the pre-streaming bridge); everything else streams and ends with EOF.
   async _respToNetStream(resp) {
-    const hdrs = {}; resp.headers.forEach((v, k) => { hdrs[k] = v; });
-    const cl = parseInt(resp.headers.get("content-length") ?? "", 10);
-    if (!resp.body || (Number.isFinite(cl) && cl <= NET_BUFFER_MAX)) {
-      const buf = new Uint8Array(await resp.arrayBuffer());
-      return this._bufferedNetStream(this._httpResp(resp.status, resp.statusText || "", hdrs, buf));
-    }
-    return this._pumpNetStream(resp.status, resp.statusText || "", hdrs, resp.body.getReader());
+    return this._netBridge.respToStream(resp);
   }
 
   // Normalize a setLlmBridge() handler result into a net stream.
   async _llmResultToStream(r) {
-    if (typeof Response !== "undefined" && r instanceof Response) return this._respToNetStream(r);
-    if (!r) return this._bufferedNetStream(this._httpResp(502, "Bad Gateway", {}, "nano-net: empty LLM bridge result"));
-    const status = r.status ?? 200;
-    const statusText = r.statusText ?? "";
-    const hdrs = {};
-    const rh = r.headers;
-    if (rh && typeof rh.forEach === "function" && typeof rh.get === "function") rh.forEach((v, k) => { hdrs[k] = v; });
-    else if (rh) Object.assign(hdrs, rh);
-    const b = r.body;
-    if (b && typeof b.getReader === "function") return this._pumpNetStream(status, statusText, hdrs, b.getReader());
-    const bytes = b == null ? new Uint8Array(0) : (typeof b === "string" ? new TextEncoder().encode(b) : b);
-    return this._bufferedNetStream(this._httpResp(status, statusText, hdrs, bytes));
+    return this._netBridge.llmResultToStream(r);
   }
 
   // A net stream whose full framed response is already in memory (legacy path).
   _bufferedNetStream(bytes) {
-    return { chunks: [bytes], pos: 0, ended: true, error: null, reader: null,
-             served: false, eofDelivered: false, waker: null };
+    return this._netBridge.bufferedStream(bytes);
   }
 
   // Emit the response head immediately (no content-length — the body length is
   // unknown up-front; the guest reads until EOF), then pump body chunks from
   // `reader` into the queue in the background, waking any parked guest read.
   _pumpNetStream(status, statusText, headers, reader) {
-    const st = { chunks: [], pos: 0, ended: false, error: null, reader,
-                 served: false, eofDelivered: false, waker: null };
-    let head = `HTTP/1.1 ${status} ${statusText}\r\n`;
-    for (const [k, v] of Object.entries(headers)) {
-      const kl = k.toLowerCase();
-      // The streamed body is decoded/reframed by the host, so the origin's
-      // length/coding headers no longer describe it — drop them.
-      if (kl === "content-length" || kl === "transfer-encoding" || kl === "content-encoding") continue;
-      head += `${k}: ${v}\r\n`;
-    }
-    head += `\r\n`;
-    st.chunks.push(new TextEncoder().encode(head));
-    (async () => {
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value && value.length) {
-            st.chunks.push(value);
-            if (st.waker) st.waker();
-          }
-        }
-      } catch (e) {
-        st.error = e; // surfaced as EIO once the queued chunks are drained
-      }
-      st.ended = true;
-      if (st.waker) st.waker();
-    })();
-    return st;
+    return this._netBridge.pumpStream(status, statusText, headers, reader);
   }
 
   // Copy the next chunk(s) of the response stream into the guest read buffer
@@ -1806,35 +1929,16 @@ class NanoVM {
       dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
       return;
     }
-    let copied = 0;
-    while (copied < bufLen && st.chunks.length) {
-      const c = st.chunks[0];
-      const n = Math.min(c.length - st.pos, bufLen - copied);
-      new Uint8Array(this._memory.buffer, this._ramPtr + bufPtr + copied, n).set(c.subarray(st.pos, st.pos + n));
-      st.pos += n; copied += n;
-      if (st.pos >= c.length) { st.chunks.shift(); st.pos = 0; }
-    }
-    if (copied > 0) {
-      st.served = true;
-      this._setA0(dv, copied);
-      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+    const dest = new Uint8Array(this._memory.buffer, this._ramPtr + bufPtr, bufLen);
+    const r = this._netBridge.readFromStream(st, dest);
+    if (r.park) {
+      // Stream open, no data yet: park (status stays FS_PENDING; the run loop
+      // sleeps in _parkNet and then re-enters this read via _processFsRequest).
+      this._blockedOnNet = true;
       return;
     }
-    if (st.error) {
-      st.eofDelivered = true;
-      this._setA0(dv, -5); // EIO
-      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-      return;
-    }
-    if (st.ended) {
-      st.eofDelivered = true;
-      this._setA0(dv, 0); // EOF
-      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-      return;
-    }
-    // Stream open, no data yet: park (status stays FS_PENDING; the run loop
-    // sleeps in _parkNet and then re-enters this read via _processFsRequest).
-    this._blockedOnNet = true;
+    this._setA0(dv, r.error ? -5 /* EIO */ : r.copied);
+    dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
   }
 
   // Guest closed the /dev/__net__ fd. If it read from this response, the cycle
@@ -1845,9 +1949,7 @@ class NanoVM {
   _netOnClose() {
     const st = this._netStream;
     if (st && st.served) {
-      if (!st.ended && st.reader) { try { st.reader.cancel(); } catch { /* already errored/closed */ } }
-      st.ended = true;
-      if (st.waker) st.waker();
+      this._netBridge.cancelStream(st);
       this._netStream = null;
     }
   }
@@ -1858,25 +1960,39 @@ class NanoVM {
    * otherwise re-check after a short fallback. Mirror of {@link _parkStdin}.
    */
   _parkNet() {
-    const st = this._netStream;
-    if (!st || st.chunks.length || st.ended) return Promise.resolve();
+    return this._netBridge.parkStream(this._netStream);
+  }
+
+  /**
+   * Park the run loop while a guest server sits in epoll_pwait with nothing
+   * ready. Resolves as soon as {@link VirtualServer#injectConnection} delivers a
+   * connection (or writeStdin supplies input), otherwise after the guest's own
+   * epoll timeout — libuv's next-timer deadline — so timers still fire on time.
+   * `timeoutMs < 0` means the guest asked for an infinite wait (idle listening
+   * server, no near timer); we back that with a heartbeat and rely on the
+   * connection wake for real responsiveness. Replaces the _adaptiveYield poll
+   * that busy-re-entered the event loop and pinned an idle server at 100% CPU.
+   * Mirror of {@link _parkStdin} / {@link _parkNet}.
+   * @param {number} timeoutMs
+   */
+  _parkServer(timeoutMs) {
+    // A connection is already queued (or arrived while we weren't parked) →
+    // re-enter the guest immediately so it can accept it.
+    if (this._pendingConnections.length > 0 || this._serverWakePending) {
+      this._serverWakePending = false;
+      return Promise.resolve();
+    }
+    const ms = timeoutMs < 0 ? SERVER_IDLE_HEARTBEAT_MS : Math.max(1, timeoutMs);
     return new Promise((resolve) => {
-      const wake = () => { st.waker = null; clearTimeout(timer); resolve(); };
-      const timer = setTimeout(wake, 50);
-      st.waker = wake;
+      const wake = () => { this._serverWake = null; clearTimeout(timer); resolve(); };
+      const timer = setTimeout(wake, ms);
+      this._serverWake = wake;
     });
   }
 
   // Frame a host response as HTTP/1.1 (status line + headers + body) for the guest.
   _httpResp(status, statusText, headers, body) {
-    const bodyBytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
-    let head = `HTTP/1.1 ${status} ${statusText}\r\n`;
-    for (const [k, v] of Object.entries(headers)) head += `${k}: ${v}\r\n`;
-    head += `content-length: ${bodyBytes.length}\r\n\r\n`;
-    const headBytes = new TextEncoder().encode(head);
-    const out = new Uint8Array(headBytes.length + bodyBytes.length);
-    out.set(headBytes, 0); out.set(bodyBytes, headBytes.length);
-    return out;
+    return this._netBridge.httpResp(status, statusText, headers, body);
   }
 
   _processFsRequest() {
@@ -2167,6 +2283,23 @@ class NanoVM {
         break;
       }
 
+      // Positioned writes: write at an explicit offset WITHOUT moving the fd
+      // cursor (mirror of pread64/preadv). SQLite's unix VFS uses pwrite for all
+      // DB-file writes, so without these opencode's migrations fail with
+      // "SQL logic error" / "Failed to execute statement". (pwritev delegates the
+      // first non-empty iovec from Rust, exactly like preadv.)
+      case SYS_PWRITE64:
+      case SYS_PWRITEV: {
+        if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
+        const fe = this._fdRead(dv, gfd);
+        if (fe.fd_type !== FD_TYPE_FILE) { result = -9; break; }
+        const count = bufLen || arg1;
+        const pwriteOffset = arg2;
+        const bufPhys = ramPtr + bufPtr;
+        result = memfs.pwrite(fe.host_fd, this._memory, bufPhys, count, pwriteOffset);
+        break;
+      }
+
       case SYS_WRITE: {
         if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
         const fe = this._fdRead(dv, gfd);
@@ -2332,8 +2465,81 @@ class VirtualServer {
         resolve,
         responseChunks: [],
       });
+      // Wake a run loop parked on an idle server so it accepts this connection
+      // now instead of after the heartbeat. If it isn't parked yet, latch the
+      // wake so the next _parkServer() returns immediately.
+      vm._serverWakePending = true;
+      if (vm._serverWake) vm._serverWake();
     });
   }
 }
 
-export { NanoVM, MemFS };
+// ============================================================
+// Snapshot ↔ bytes — serialize a snapshot() to one portable Uint8Array (and
+// back) so it can be gzipped, shipped in a recipe, and restored on a fresh VM.
+// Format v1: "NSN1" | u32 metaLen | meta(JSON) | vmStruct|lowRAM|stackRAM|
+// sockets|evloop|blocks | memfs-node-data-blobs (in node order). The big regions
+// are already Uint8Arrays; the 1.3GB RAM is mostly zero pages → ~170MB gzipped.
+// ============================================================
+const _SNAP_MAGIC = [0x4e, 0x53, 0x4e, 0x31]; // "NSN1"
+
+function serializeSnapshot(snap) {
+  const emptyU8 = new Uint8Array(0);
+  const regions = [snap.vmStruct, snap.lowRAM, snap.stackRAM, snap.sockets || emptyU8, snap.evloop || emptyU8, snap.blocks || emptyU8];
+  const meta = {
+    v: 1,
+    lowEnd: snap.lowEnd,
+    stackStart: snap.stackStart,
+    regions: {
+      vmStruct: snap.vmStruct.length,
+      lowRAM: snap.lowRAM.length,
+      stackRAM: snap.stackRAM.length,
+      sockets: snap.sockets ? snap.sockets.length : 0,
+      evloop: snap.evloop ? snap.evloop.length : 0,
+      blocks: snap.blocks ? snap.blocks.length : 0,
+    },
+    memfs: snap.memfs.map((n) => ({
+      id: n.id, parentId: n.parentId, name: n.name, mode: n.mode, nlink: n.nlink, size: n.size,
+      dataLen: n.data ? n.data.length : -1,
+      target: n.target === undefined ? null : n.target,
+    })),
+  };
+  const metaBytes = new TextEncoder().encode(JSON.stringify(meta));
+  let total = 8 + metaBytes.length;
+  for (const r of regions) total += r.length;
+  for (const n of snap.memfs) if (n.data) total += n.data.length;
+  const out = new Uint8Array(total);
+  out.set(_SNAP_MAGIC, 0);
+  new DataView(out.buffer).setUint32(4, metaBytes.length, true);
+  out.set(metaBytes, 8);
+  let o = 8 + metaBytes.length;
+  for (const r of regions) { out.set(r, o); o += r.length; }
+  for (const n of snap.memfs) if (n.data) { out.set(n.data, o); o += n.data.length; }
+  return out;
+}
+
+function deserializeSnapshot(bytes) {
+  if (bytes[0] !== 0x4e || bytes[1] !== 0x53 || bytes[2] !== 0x4e || bytes[3] !== 0x31) {
+    throw new Error("deserializeSnapshot: bad magic");
+  }
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const metaLen = dv.getUint32(4, true);
+  const meta = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + metaLen)));
+  let o = 8 + metaLen;
+  const take = (len) => { const s = bytes.subarray(o, o + len).slice(); o += len; return s; };
+  const vmStruct = take(meta.regions.vmStruct);
+  const lowRAM = take(meta.regions.lowRAM);
+  const stackRAM = take(meta.regions.stackRAM);
+  const sockets = meta.regions.sockets ? take(meta.regions.sockets) : null;
+  const evloop = meta.regions.evloop ? take(meta.regions.evloop) : null;
+  const blocks = meta.regions.blocks ? take(meta.regions.blocks) : null;
+  const memfs = meta.memfs.map((n) => {
+    const node = { id: n.id, parentId: n.parentId, name: n.name, mode: n.mode, nlink: n.nlink, size: n.size };
+    if (n.dataLen >= 0) node.data = take(n.dataLen);
+    if (n.target !== null) node.target = n.target;
+    return node;
+  });
+  return { vmStruct, lowRAM, lowEnd: meta.lowEnd, stackRAM, stackStart: meta.stackStart, memfs, sockets, evloop, blocks };
+}
+
+export { NanoVM, MemFS, serializeSnapshot, deserializeSnapshot };

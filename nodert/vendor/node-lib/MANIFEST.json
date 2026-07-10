@@ -1,0 +1,8 @@
+{
+  "tag": "v25.4.0",
+  "source": "https://nodejs.org/dist/v25.4.0/node-v25.4.0.tar.gz",
+  "tarballSha256": "aa85eaa3c2c81c8b755039018d725bc140c409c2100508785bc8275e610b0e81",
+  "moduleCount": 348,
+  "rawBytes": 4085698,
+  "bundleSha256": "3401743d88fe8bae88fafeda433497c2f30a3133ecae5e367e5c903158e11ff9"
+}

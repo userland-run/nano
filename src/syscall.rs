@@ -33,6 +33,10 @@ const SYS_PREAD64: u64 = 67;
 const SYS_PWRITE64: u64 = 68;
 const SYS_PREADV: u64 = 69;
 const SYS_PWRITEV: u64 = 70;
+const SYS_SYNC: u64 = 81;      // whole-system sync — no-op (memfs is in RAM)
+const SYS_FSYNC: u64 = 82;     // flush a file — no-op (memfs is in RAM)
+const SYS_FDATASYNC: u64 = 83; // flush file data — no-op (memfs is in RAM)
+const SYS_SYNCFS: u64 = 267;   // sync a filesystem — no-op (memfs is in RAM)
 const SYS_RISCV_FLUSH_ICACHE: u64 = 259; // RISC-V: flush icache (no-op on the interpreter)
 const SYS_IO_URING_SETUP: u64 = 425;     // io_uring: intentionally unavailable (callers fall back)
 const SYS_READLINKAT: u64 = 78;
@@ -165,6 +169,20 @@ const EMPTY_SOCKET: SocketSlot = SocketSlot {
 
 static mut SOCKETS: [SocketSlot; MAX_SOCKETS] = [EMPTY_SOCKET; MAX_SOCKETS];
 
+/// Address + byte size of the SOCKETS table, so the host can persist the
+/// in-memory socket state (listening sockets, accept queues, recv rings) across
+/// snapshot()/restoreAndRun(). SocketSlot is pure value state (no host handles /
+/// pointers), so a raw byte copy round-trips it. reset_statics() zeroes SOCKETS,
+/// so the host must write these bytes back AFTER vm_snapshot_restore_reset() —
+/// otherwise a warm-restored server (e.g. `opencode serve`) loses the sockets it
+/// bound before the snapshot and its event loop watches dead fds.
+pub unsafe fn sockets_ptr() -> u32 {
+    core::ptr::addr_of!(SOCKETS) as u32
+}
+pub unsafe fn sockets_bytes() -> u32 {
+    (MAX_SOCKETS * core::mem::size_of::<SocketSlot>()) as u32
+}
+
 // ============================================================
 // Epoll interest list (tracks registered FD watches)
 // ============================================================
@@ -218,6 +236,18 @@ static mut TIMERFD_ALLOC: usize = 0;
 /// epoll_wait threads so the event loop can yield to the host for real time
 /// to advance.
 static mut EPOLL_FINITE_TIMEOUT_ACTIVE: bool = false;
+
+/// The epoll_pwait timeout (ms, -1 = infinite) of the wait that most recently
+/// yielded STATUS_EPOLL_BLOCKED. The host reads this via vm_epoll_timeout_ms()
+/// to park an idle listening server for exactly that long (waking early on an
+/// injected connection) instead of busy re-entering the event loop every
+/// macrotask — which pinned the tab at 100% for `opencode serve`.
+static mut EPOLL_BLOCKED_TIMEOUT_MS: i32 = 0;
+
+/// Timeout (ms; -1 = infinite) the last STATUS_EPOLL_BLOCKED wait asked for.
+pub unsafe fn epoll_blocked_timeout_ms() -> i32 {
+    EPOLL_BLOCKED_TIMEOUT_MS
+}
 
 // ioctl constants
 const TIOCGWINSZ: u64 = 0x5413;
@@ -287,6 +317,36 @@ pub unsafe fn signals_reset() {
     TRAMPOLINE_READY = false;
 }
 
+// Serialized-fork signal preservation. SIG_HANDLERS/SIG_FLAGS are process-global
+// statics, but a forked child's execve() runs reset_statics()/signals_reset() —
+// which would also clobber the PARENT shell's handlers (they share the globals).
+// The host saves them on clone() and restores them when the child exits, through
+// this scratch buffer, so an interactive shell KEEPS its SIGINT handler across
+// running a command → Ctrl-C at the prompt aborts the input line, it doesn't kill
+// the shell. (A real OS keeps handlers per-process; only the exec'ing child resets.)
+static mut SIG_DUMP: [u64; 2 * NSIG] = [0; 2 * NSIG];
+
+/// Copy the current handler/flag tables into the scratch buffer; return its addr.
+pub unsafe fn signals_dump() -> u32 {
+    let mut i = 0;
+    while i < NSIG {
+        SIG_DUMP[i] = SIG_HANDLERS[i];
+        SIG_DUMP[NSIG + i] = SIG_FLAGS[i];
+        i += 1;
+    }
+    SIG_DUMP.as_ptr() as u32
+}
+
+/// Restore the handler/flag tables from the scratch buffer (written by the host).
+pub unsafe fn signals_load() {
+    let mut i = 0;
+    while i < NSIG {
+        SIG_HANDLERS[i] = SIG_DUMP[i];
+        SIG_FLAGS[i] = SIG_DUMP[NSIG + i];
+        i += 1;
+    }
+}
+
 /// Mark a signal pending on this VM (from ^C, kill, or the host).
 pub unsafe fn raise_signal(vm: &mut Vm, signum: u32) {
     if signum >= 1 && (signum as usize) <= NSIG {
@@ -313,7 +373,20 @@ unsafe fn ensure_trampoline(vm: &Vm) {
 /// signal. No-op while already inside a handler.
 pub unsafe fn deliver_signals(vm: &mut Vm) {
     if SIG_ACTIVE {
-        return;
+        // A handler that returns normally clears SIG_ACTIVE via the rt_sigreturn
+        // trampoline. But busybox ash's SIGINT handler (onsig) escapes through
+        // longjmp and never runs the trampoline — which would leave SIG_ACTIVE
+        // stuck true forever, blocking every later signal and (via io_retry's
+        // EINTR path) spinning the shell in a prompt-reprint storm. Detect the
+        // escape by the stack pointer: the guest SP (x[2]) always sits BELOW the
+        // pre-handler SP (SIG_SAVED_X[2]) while the handler frame is live, so once
+        // it has unwound to/above that level the frame is gone (longjmped out) and
+        // we can safely recover and deliver the next signal.
+        if vm.x[2] >= SIG_SAVED_X[2] {
+            SIG_ACTIVE = false;
+        } else {
+            return;
+        }
     }
     let deliverable = vm.sig_pending & !vm.sig_mask;
     if deliverable == 0 {
@@ -394,6 +467,67 @@ unsafe fn sys_rt_sigreturn(vm: &mut Vm) -> i64 {
     vm.x[10] as i64
 }
 
+// Event-loop syscall statics that reset_statics() clears but a warm snapshot
+// must preserve (paired with the SOCKETS ptr/size restore): the epoll interest
+// list + count, eventfd counters + alloc, timerfd expiries/intervals + alloc,
+// and the finite-timeout latch. Serialized into a scratch buffer for the host,
+// mirroring signals_dump(). Without these, a warm-restored server's libuv loop
+// watches an empty epoll set and never wakes. Layout: EPOLL_ENTRIES |
+// EVENTFD_COUNTERS | TIMERFD_EXPIRY | TIMERFD_INTERVAL | 4 u64 counters.
+const EVLOOP_DUMP_SIZE: usize = MAX_EPOLL_ENTRIES * core::mem::size_of::<EpollEntry>()
+    + MAX_EVENTFDS * 4
+    + MAX_TIMERFDS * 8
+    + MAX_TIMERFDS * 8
+    + 4 * 8;
+static mut EVLOOP_DUMP: [u8; EVLOOP_DUMP_SIZE] = [0; EVLOOP_DUMP_SIZE];
+
+pub unsafe fn evloop_size() -> u32 {
+    EVLOOP_DUMP_SIZE as u32
+}
+
+/// Copy the event-loop statics into the scratch buffer; return its address.
+pub unsafe fn evloop_dump() -> u32 {
+    let dst = core::ptr::addr_of_mut!(EVLOOP_DUMP) as *mut u8;
+    let mut o = 0usize;
+    let n_ep = MAX_EPOLL_ENTRIES * core::mem::size_of::<EpollEntry>();
+    core::ptr::copy_nonoverlapping(core::ptr::addr_of!(EPOLL_ENTRIES) as *const u8, dst.add(o), n_ep);
+    o += n_ep;
+    let n_ev = MAX_EVENTFDS * 4;
+    core::ptr::copy_nonoverlapping(core::ptr::addr_of!(EVENTFD_COUNTERS) as *const u8, dst.add(o), n_ev);
+    o += n_ev;
+    let n_tf = MAX_TIMERFDS * 8;
+    core::ptr::copy_nonoverlapping(core::ptr::addr_of!(TIMERFD_EXPIRY_MS) as *const u8, dst.add(o), n_tf);
+    o += n_tf;
+    core::ptr::copy_nonoverlapping(core::ptr::addr_of!(TIMERFD_INTERVAL_MS) as *const u8, dst.add(o), n_tf);
+    o += n_tf;
+    let c = [EPOLL_COUNT as u64, EVENTFD_ALLOC as u64, TIMERFD_ALLOC as u64, EPOLL_FINITE_TIMEOUT_ACTIVE as u64];
+    core::ptr::copy_nonoverlapping(c.as_ptr() as *const u8, dst.add(o), 4 * 8);
+    dst as u32
+}
+
+/// Restore the event-loop statics from the scratch buffer (host wrote it back).
+pub unsafe fn evloop_load() {
+    let src = core::ptr::addr_of!(EVLOOP_DUMP) as *const u8;
+    let mut o = 0usize;
+    let n_ep = MAX_EPOLL_ENTRIES * core::mem::size_of::<EpollEntry>();
+    core::ptr::copy_nonoverlapping(src.add(o), core::ptr::addr_of_mut!(EPOLL_ENTRIES) as *mut u8, n_ep);
+    o += n_ep;
+    let n_ev = MAX_EVENTFDS * 4;
+    core::ptr::copy_nonoverlapping(src.add(o), core::ptr::addr_of_mut!(EVENTFD_COUNTERS) as *mut u8, n_ev);
+    o += n_ev;
+    let n_tf = MAX_TIMERFDS * 8;
+    core::ptr::copy_nonoverlapping(src.add(o), core::ptr::addr_of_mut!(TIMERFD_EXPIRY_MS) as *mut u8, n_tf);
+    o += n_tf;
+    core::ptr::copy_nonoverlapping(src.add(o), core::ptr::addr_of_mut!(TIMERFD_INTERVAL_MS) as *mut u8, n_tf);
+    o += n_tf;
+    let mut c = [0u64; 4];
+    core::ptr::copy_nonoverlapping(src.add(o), c.as_mut_ptr() as *mut u8, 4 * 8);
+    EPOLL_COUNT = c[0] as usize;
+    EVENTFD_ALLOC = c[1] as usize;
+    TIMERFD_ALLOC = c[2] as usize;
+    EPOLL_FINITE_TIMEOUT_ACTIVE = c[3] != 0;
+}
+
 /// Reset all static mut globals to their initial state.
 /// Must be called before each new program execution to avoid stale state.
 pub unsafe fn reset_statics() {
@@ -406,6 +540,8 @@ pub unsafe fn reset_statics() {
     TIMERFD_INTERVAL_MS = [0.0; MAX_TIMERFDS];
     TIMERFD_ALLOC = 0;
     EPOLL_FINITE_TIMEOUT_ACTIVE = false;
+    EPOLL_BLOCKED_TIMEOUT_MS = 0;
+    MMAP_FREE_COUNT = 0; // free-list isn't part of the snapshot image
     crate::tty::reset();
     signals_reset();
 }
@@ -655,6 +791,12 @@ pub unsafe fn handle(vm: &mut Vm) {
         SYS_RECVFROM => sys_recvfrom(vm, a0 as i32, a1, a2 as u32, a3 as i32),
         SYS_SOCKETPAIR => ENOSYS, // not supported
 
+        // Durability syscalls: the memfs lives in RAM, so there is nothing to
+        // flush to stable storage — succeed. Without this, fsync/fdatasync fall
+        // through to ENOSYS and SQLite's unix VFS reports SQLITE_IOERR_FSYNC
+        // ("disk I/O error") on every commit, blocking all file-backed node:sqlite.
+        SYS_SYNC | SYS_FSYNC | SYS_FDATASYNC | SYS_SYNCFS => 0,
+
         // RISC-V icache flush after JIT codegen — the interpreter re-reads guest
         // memory every step, so there is no separate icache to flush. Succeed.
         SYS_RISCV_FLUSH_ICACHE => 0,
@@ -737,22 +879,44 @@ unsafe fn sys_mmap(
 
     let ram_limit = vm.ram_size as u64;
 
+    // True when this address came from the munmap free list (below the frontier,
+    // holding stale bytes) → must be fully zeroed for MAP_ANONYMOUS.
+    let mut reused = false;
     let guest_addr = if is_fixed && addr != 0 {
         // MAP_FIXED: must use the exact address
         addr
     } else {
-        // Bump allocator — check bounds BEFORE advancing pointer
-        let next = vm.mmap_next_addr;
-        let end = next + len;
-        if end > ram_limit {
-            // Log: next_addr in KB (fits in 24 bits up to 16GB)
-            host::debug_log(0x1E000000 | ((next >> 10) as i32 & 0xFFFFFF));
-            // Log: len in KB
-            host::debug_log(0x1F000000 | ((len >> 10) as i32 & 0xFFFFFF));
-            return ENOMEM;
+        // Anonymous requests first try to reuse a previously-freed region so a
+        // long-running guest stays bounded to its working set; otherwise bump.
+        if is_anon {
+            if let Some(a) = take_free_region(len) {
+                reused = true;
+                a
+            } else {
+                let next = vm.mmap_next_addr;
+                let end = next + len;
+                if end > ram_limit {
+                    host::debug_log(0x1E000000 | ((next >> 10) as i32 & 0xFFFFFF));
+                    host::debug_log(0x1F000000 | ((len >> 10) as i32 & 0xFFFFFF));
+                    return ENOMEM;
+                }
+                vm.mmap_next_addr = end;
+                next
+            }
+        } else {
+            // Bump allocator — check bounds BEFORE advancing pointer
+            let next = vm.mmap_next_addr;
+            let end = next + len;
+            if end > ram_limit {
+                // Log: next_addr in KB (fits in 24 bits up to 16GB)
+                host::debug_log(0x1E000000 | ((next >> 10) as i32 & 0xFFFFFF));
+                // Log: len in KB
+                host::debug_log(0x1F000000 | ((len >> 10) as i32 & 0xFFFFFF));
+                return ENOMEM;
+            }
+            vm.mmap_next_addr = end;
+            next
         }
-        vm.mmap_next_addr = end;
-        next
     };
 
     // Check bounds for MAP_FIXED
@@ -763,9 +927,11 @@ unsafe fn sys_mmap(
 
     // Zero the region for anonymous mappings. Mappings taken from the bump
     // frontier at/above the high-water mark are virgin (engine-zero) memory —
-    // skip the redundant memset. MAP_FIXED can land anywhere (possibly reused),
-    // so zero it unconditionally.
-    if is_anon {
+    // skip the redundant memset. MAP_FIXED and free-list reuse can land on dirty
+    // memory, so zero those unconditionally.
+    if is_anon && reused {
+        mem::zero_mem(vm.ram_base, guest_addr, len as usize);
+    } else if is_anon {
         let end_addr = guest_addr + len;
         let from_bump = !(is_fixed && addr != 0);
         if !(from_bump && guest_addr >= MMAP_HWM) {
@@ -798,9 +964,89 @@ unsafe fn sys_mmap(
     guest_addr as i64
 }
 
-unsafe fn sys_munmap(vm: &mut Vm, _addr: u64, _length: u64) -> i64 {
-    // Stub: we don't actually free memory in the bump allocator
+unsafe fn sys_munmap(vm: &mut Vm, addr: u64, length: u64) -> i64 {
+    // Frontier reclaim: the mmap bump allocator normally never shrinks, so a
+    // long-running guest (e.g. `opencode serve`, whose V8 GC churns tens of
+    // thousands of mmap/munmap pairs) marches mmap_next_addr to the RAM limit
+    // and OOMs. When a region ends exactly at the frontier, pull the frontier
+    // back so the space is reused — this reclaims LIFO-freed allocations (the
+    // common V8 page-pool pattern) with zero bookkeeping and no reuse hazard
+    // (only the bump pointer moves; nothing stale is ever handed back live).
+    // Also absorb any free-listed regions that are now adjacent to the frontier.
+    if addr != 0 && length != 0 {
+        let len = (length + PAGE_SIZE - 1) & PAGE_MASK;
+        let end = addr + len;
+        if end == vm.mmap_next_addr {
+            vm.mmap_next_addr = addr;
+            coalesce_free_frontier(vm);
+            return 0;
+        }
+        // Not at the frontier: record it for first-fit reuse (bounded list; a
+        // full list just means that region stays un-reclaimed — degrades to the
+        // old no-op, never corrupts).
+        if MMAP_FREE_COUNT < MMAP_FREE_CAP {
+            MMAP_FREE[MMAP_FREE_COUNT] = (addr, len);
+            MMAP_FREE_COUNT += 1;
+        }
+    }
     0
+}
+
+// Bounded free list of non-frontier munmap'd regions, reused by later anonymous
+// mmap (first-fit) so the guest address space stays bounded to the working set.
+// Module-global (single guest, cooperative — like BRK_HWM/MMAP_HWM); cleared on
+// program load via reset_mmap_free() so a new program never reuses stale ranges.
+const MMAP_FREE_CAP: usize = 1024;
+static mut MMAP_FREE: [(u64, u64); MMAP_FREE_CAP] = [(0, 0); MMAP_FREE_CAP];
+static mut MMAP_FREE_COUNT: usize = 0;
+
+/// Clear the mmap free list (call whenever the mmap frontier is reset — new ELF
+/// load / snapshot restore — so freed ranges from a prior image aren't reused).
+pub unsafe fn reset_mmap_free() {
+    MMAP_FREE_COUNT = 0;
+}
+
+/// After the frontier moves back, absorb any free-listed region that now ends at
+/// the frontier (repeatedly), turning scattered LIFO frees into one contiguous
+/// reclaim.
+unsafe fn coalesce_free_frontier(vm: &mut Vm) {
+    let mut progress = true;
+    while progress {
+        progress = false;
+        let mut i = 0;
+        while i < MMAP_FREE_COUNT {
+            let (faddr, flen) = MMAP_FREE[i];
+            if faddr + flen == vm.mmap_next_addr {
+                vm.mmap_next_addr = faddr;
+                MMAP_FREE[i] = MMAP_FREE[MMAP_FREE_COUNT - 1];
+                MMAP_FREE_COUNT -= 1;
+                progress = true;
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// First-fit a freed region of at least `len` bytes; returns its address and
+/// removes/splits it from the free list, or None. The caller must zero it
+/// (MAP_ANONYMOUS memory must read as zero and a reused region isn't virgin).
+unsafe fn take_free_region(len: u64) -> Option<u64> {
+    let mut i = 0;
+    while i < MMAP_FREE_COUNT {
+        let (faddr, flen) = MMAP_FREE[i];
+        if flen >= len {
+            if flen == len {
+                MMAP_FREE[i] = MMAP_FREE[MMAP_FREE_COUNT - 1];
+                MMAP_FREE_COUNT -= 1;
+            } else {
+                MMAP_FREE[i] = (faddr + len, flen - len); // keep the remainder free
+            }
+            return Some(faddr);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// mremap(old_addr, old_size, new_size, flags, [new_addr])
@@ -1523,7 +1769,18 @@ unsafe fn set_futex_addr(vm: &mut Vm, slot: usize, addr: u64) {
 }
 
 /// Find a runnable thread slot (not the current one). Returns slot or -1.
-unsafe fn find_runnable(vm: &Vm, exclude: usize) -> i32 {
+/// Find a thread to switch to. The first two passes return a thread that will
+/// make real progress (RUNNABLE, or an EPOLL_WAIT thread whose fds are ready).
+///
+/// `allow_idle_epoll` controls the third pass, which returns an EPOLL_WAIT thread
+/// that has *no* ready events. That is a spin hazard: node's event loop runs on
+/// two idle EPOLL_WAIT threads, and letting one eventless epoll_pwait switch to
+/// the other just ping-pongs between them at 100% CPU, never yielding to the
+/// host. So `sys_epoll_pwait` passes `false` — an eventless wait with no
+/// progressable peer yields STATUS_EPOLL_BLOCKED to the host instead. `sys_futex`
+/// passes `true` (a blocked futex has genuinely nowhere else to go; the epoll
+/// thread it wakes will itself park via the fixed epoll path).
+unsafe fn find_runnable(vm: &Vm, exclude: usize, allow_idle_epoll: bool) -> i32 {
     let n = vm.thread_count as usize;
     // First pass: prefer RUNNABLE threads
     let mut i = 0;
@@ -1543,11 +1800,8 @@ unsafe fn find_runnable(vm: &Vm, exclude: usize) -> i32 {
         }
         i += 1;
     }
-    // Third pass: pick any EPOLL_WAIT thread if there's a listening socket
-    // or an active timer wait. This wakes the event loop thread so it can
-    // yield to the host for real time to advance (timers) or to accept
-    // incoming connections (servers).
-    if has_listening_socket() || EPOLL_FINITE_TIMEOUT_ACTIVE {
+    // Third pass (opt-in): any EPOLL_WAIT thread even without ready events.
+    if allow_idle_epoll && (has_listening_socket() || EPOLL_FINITE_TIMEOUT_ACTIVE) {
         i = 0;
         while i < n && i < MAX_THREADS {
             if i != exclude && get_tstate(vm, i) == TSTATE_EPOLL_WAIT {
@@ -1658,7 +1912,7 @@ unsafe fn sys_futex(
             }
 
             // Would block. Try to switch to another runnable thread.
-            let target = find_runnable(vm, current_slot);
+            let target = find_runnable(vm, current_slot, true);
             if target >= 0 {
                 let target = target as usize;
 
@@ -1930,6 +2184,39 @@ unsafe fn sys_fcntl(vm: &mut Vm, fd: i32, cmd: i32, arg: u64) -> i64 {
             // F_SETFL
             vm.fd_table[fd as usize].flags = arg as i32;
             0
+        }
+        // POSIX advisory record locks (F_GETLK=5, F_SETLK=6, F_SETLKW=7) and the
+        // open-file-description variants (F_OFD_GETLK=36, F_OFD_SETLK=37,
+        // F_OFD_SETLKW=38). The VM runs one guest process cooperatively, so these
+        // locks never contend — grant every request. Without this, SQLite's unix
+        // VFS gets a lock error on the first write to a file-backed DB and reports
+        // SQLITE_IOERR_LOCK ("disk I/O error"), which blocks node:sqlite (e.g.
+        // opencode's serve DB) entirely. For the GETLK queries, report the region
+        // as unlocked so the caller proceeds: struct flock has `short l_type` at
+        // offset 0; F_UNLCK = 2.
+        5 | 36 => {
+            if arg != 0 {
+                mem::write_u16(vm.ram_base, arg, 2); // l_type = F_UNLCK
+            }
+            0
+        }
+        6 | 7 | 37 | 38 => 0,
+        // F_DUPFD_CLOEXEC: dup to the lowest free fd >= arg, like F_DUPFD. (The
+        // VM has no exec-time fd table to close, so the CLOEXEC bit is a no-op;
+        // returning the dup is what callers need.)
+        1030 => {
+            let min = arg as usize;
+            let mut result: i64 = -24; // EMFILE
+            let mut i = min;
+            while i < MAX_FDS {
+                if vm.fd_table[i].fd_type == FD_TYPE_NONE {
+                    vm.fd_table[i] = vm.fd_table[fd as usize];
+                    result = i as i64;
+                    break;
+                }
+                i += 1;
+            }
+            result
         }
         _ => EINVAL,
     }
@@ -2325,7 +2612,10 @@ unsafe fn sys_epoll_pwait(
     // No events found — context-switch to let other threads run.
     if timeout != 0 {
         let current_slot = vm._tid_extra as usize;
-        let target = find_runnable(vm, current_slot);
+        // Only switch to a thread that can make progress (RUNNABLE or an
+        // epoll thread with ready events) — NOT another eventless epoll thread
+        // (that just ping-pongs node's two idle event-loop threads at 100% CPU).
+        let target = find_runnable(vm, current_slot, false);
         if target >= 0 {
             let target = target as usize;
             log_switch(current_slot, target, 2); // 2=epoll_wait
@@ -2354,17 +2644,16 @@ unsafe fn sys_epoll_pwait(
             vm._tid_extra = target as i32;
             return vm.x[10] as i64;
         }
-        // No other thread to switch to — all threads are deadlocked.
-        // Yield to the host when:
-        // - there's a listening socket (server waiting for connections), OR
-        // - timeout > 0 (finite wait, e.g. libuv timer — real time must advance)
-        // We do NOT yield for timeout == -1 without a listening socket, as that
-        // would slow down V8 init where worker threads block with infinite waits.
-        if has_listening_socket() || timeout > 0 {
-            vm.status = STATUS_EPOLL_BLOCKED;
-            return 0; // host will set a0 to -EINTR before resuming
-        }
-        // No listening socket and infinite timeout: return 0 (timeout expired).
+        // No thread can make progress: the whole VM is idle (every other thread
+        // is futex-wait or eventless epoll-wait). Yield to the host so it parks
+        // and real time advances (libuv timers) or a connection / stdin can wake
+        // us. Park for ANY timeout, infinite included — spinning while everything
+        // is blocked achieves nothing, and gating on this whole-VM-idle condition
+        // is what avoids stalling V8 init: during init some thread is RUNNABLE, so
+        // find_runnable returns it above and we switch instead of parking.
+        EPOLL_BLOCKED_TIMEOUT_MS = timeout;
+        vm.status = STATUS_EPOLL_BLOCKED;
+        return 0; // host will set a0 to -EINTR before resuming
     }
     0 // Return 0 events
 }

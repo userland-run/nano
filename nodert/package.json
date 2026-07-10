@@ -1,0 +1,11 @@
+{
+  "name": "@userland-run/nodert",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Host-engine Node runtime tier for userland.run (UL-SPEC/nodert)",
+  "type": "module",
+  "scripts": {
+    "vendor": "node tools/vendor-node-lib.mjs",
+    "check:vendor": "node tools/vendor-node-lib.mjs --verify"
+  }
+}

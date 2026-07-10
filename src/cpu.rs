@@ -149,6 +149,19 @@ pub fn reset_blocks() {
     reset_stats();
 }
 
+/// Address + byte size of the direct-mapped block cache. The host snapshots it
+/// alongside guest RAM so a warm-restored VM keeps its decoded-instruction blocks
+/// (BlockEntry is pure value data — tag + packed ops, no host pointers — and the
+/// dirty-code-page tracking invalidates any block whose guest code V8 later
+/// re-JITs). Without this, a restored guest re-decodes every block cold — the
+/// dominant cost of a serve warm-restore (host RAM memcpy is only ~250ms).
+pub unsafe fn blocks_ptr() -> u32 {
+    core::ptr::addr_of!(BLOCKS) as u32
+}
+pub unsafe fn blocks_bytes() -> u32 {
+    (BLOCK_CACHE_SIZE * core::mem::size_of::<BlockEntry>()) as u32
+}
+
 /// Classify a 32-bit instruction into (op_id, immediate)
 #[inline(always)]
 fn classify_insn(insn: u32) -> (u8, i32) {
@@ -381,6 +394,10 @@ unsafe fn exec_block(
         let mut loop_back = false;
 
         while i < len {
+            #[cfg(feature = "memcheck")]
+            {
+                crate::mem::set_dbg_pc(pc);
+            }
             let p = blk.packed[i];
             let op = (p >> 32) as u32;
             let imm = p as u32 as i32;

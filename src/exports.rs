@@ -83,6 +83,14 @@ pub unsafe extern "C" fn vm_thread_step(vm_ptr: u32, budget: i32) -> i32 {
     vm_step(vm_ptr, budget)
 }
 
+/// The epoll_pwait timeout (ms; -1 = infinite) of the wait that yielded the
+/// current STATUS_EPOLL_BLOCKED. The host reads this to park an idle listening
+/// server for the right duration instead of busy-polling the event loop.
+#[no_mangle]
+pub unsafe extern "C" fn vm_epoll_timeout_ms() -> i32 {
+    crate::syscall::epoll_blocked_timeout_ms()
+}
+
 /// Load an ELF binary from guest memory
 #[no_mangle]
 pub unsafe extern "C" fn vm_load_elf(vm_ptr: u32, elf_offset: u32, elf_size: u32) -> i32 {
@@ -144,6 +152,7 @@ pub unsafe extern "C" fn vm_load_raw(
     vm.brk_start = (end + PAGE_SIZE - 1) & PAGE_MASK;
     vm.brk_current = vm.brk_start;
     vm.mmap_next_addr = vm.brk_start + 64 * 1024 * 1024;
+    crate::syscall::reset_mmap_free();
 
     0
 }
@@ -513,4 +522,64 @@ pub unsafe extern "C" fn vm_snapshot_restore_reset() {
 #[no_mangle]
 pub extern "C" fn console_queue_char(_ch: i32) {
     // Intentionally empty - reference binary aliases this to free (no-op)
+}
+
+// ---------- Signal handler preservation across a serialized fork ----------
+
+/// Copy the process-global signal handler/flag tables into a scratch buffer and
+/// return its address; the host reads it into the parent's fork snapshot so a
+/// child's execve() reset can't wipe the parent shell's SIGINT handler.
+#[no_mangle]
+pub unsafe extern "C" fn vm_signals_dump() -> u32 {
+    crate::syscall::signals_dump()
+}
+
+/// Restore the signal handler/flag tables from the scratch buffer (host wrote the
+/// parent's saved tables back before this call). Paired with vm_signals_dump().
+#[no_mangle]
+pub unsafe extern "C" fn vm_signals_load() {
+    crate::syscall::signals_load();
+}
+
+/// Address + byte size of the in-memory socket table. The host copies these bytes
+/// into snapshot() and writes them back in restoreAndRun() (after the restore
+/// reset) so a warm-restored server keeps its listening/connected sockets.
+#[no_mangle]
+pub unsafe extern "C" fn vm_sockets_ptr() -> u32 {
+    crate::syscall::sockets_ptr()
+}
+#[no_mangle]
+pub unsafe extern "C" fn vm_sockets_size() -> u32 {
+    crate::syscall::sockets_bytes()
+}
+
+/// Event-loop statics (epoll interest list, eventfd/timerfd tables + counters)
+/// that reset_statics() clears. dump copies them into a scratch buffer and
+/// returns its address; the host reads it into snapshot() and writes it back
+/// before load() in restoreAndRun() — so a warm-restored server's libuv loop
+/// keeps its fd watches. Paired with vm_sockets_ptr/size.
+#[no_mangle]
+pub unsafe extern "C" fn vm_evloop_size() -> u32 {
+    crate::syscall::evloop_size()
+}
+#[no_mangle]
+pub unsafe extern "C" fn vm_evloop_dump() -> u32 {
+    crate::syscall::evloop_dump()
+}
+#[no_mangle]
+pub unsafe extern "C" fn vm_evloop_load() {
+    crate::syscall::evloop_load();
+}
+
+/// Address + byte size of the decoded-block cache. The host snapshots it with
+/// guest RAM and writes it back after the restore reset, so a warm-restored VM
+/// keeps its warm blocks instead of re-decoding everything cold (the dominant
+/// cost of a serve warm-restore).
+#[no_mangle]
+pub unsafe extern "C" fn vm_blocks_ptr() -> u32 {
+    crate::cpu::blocks_ptr()
+}
+#[no_mangle]
+pub unsafe extern "C" fn vm_blocks_size() -> u32 {
+    crate::cpu::blocks_bytes()
 }

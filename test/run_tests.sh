@@ -100,6 +100,135 @@ fi
 echo ""
 
 # ============================================================
+# Phase 2c: Kernel unit tests (pure JS, no WASM needed)
+# ============================================================
+
+echo "--- Kernel Unit Tests ---"
+for kt in "$SCRIPT_DIR"/kernel/test_*.mjs; do
+    [ -f "$kt" ] || continue
+    kt_name="kernel/$(basename "$kt" .mjs)"
+    if node "$kt" 2>/dev/null; then
+        ok "$kt_name"
+    else
+        fail "$kt_name"
+    fi
+done
+echo ""
+
+# ============================================================
+# Phase 2d: nodert host-engine tier (worker + Kernel bus; no VM needed)
+# ============================================================
+
+echo "--- nodert Tier (host engine) ---"
+NODERT_DIR="$PROJECT_ROOT/nodert"
+if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
+    if node "$NODERT_DIR/test/smoke.mjs" 2>/dev/null; then
+        ok "nodert smoke (14 programs run on the host engine)"
+    else
+        fail "nodert smoke"
+    fi
+    # Differential vs host Node (pure-JS fidelity); --vm mode is @heavy (needs images/node)
+    if node "$NODERT_DIR/test/differential.mjs" 2>/dev/null; then
+        ok "nodert differential (vs host-node oracle)"
+    else
+        fail "nodert differential"
+    fi
+    # Event-loop ordering harness (§16.2): phase/callback interleave, byte-exact vs oracle
+    if node "$NODERT_DIR/test/ordering.mjs" 2>/dev/null; then
+        ok "nodert ordering harness (event-loop phases vs host-node oracle)"
+    else
+        fail "nodert ordering harness"
+    fi
+    # Engine selector (§14): vm/nodert/auto policy + ERR_NODERT_UNSUPPORTED fallback + pins
+    if node "$NODERT_DIR/test/engine.mjs" 2>/dev/null; then
+        ok "nodert engine selector (vm/nodert/auto, fallback, routing pins)"
+    else
+        fail "nodert engine selector"
+    fi
+    # K9-browser: host loads the node-lib bundle (disk/brotli + gzip/fetch) → boot from bytes
+    if node "$NODERT_DIR/test/lib-loader.mjs" 2>/dev/null; then
+        ok "nodert lib-loader (browser bundle-in-init: gzip == brotli, boot from bytes)"
+    else
+        fail "nodert lib-loader"
+    fi
+    # Cross-tier spawn (nodert → nodert child_process, §12)
+    if node "$NODERT_DIR/test/cross-tier.mjs" 2>/dev/null; then
+        ok "nodert cross-tier spawn (child_process)"
+    else
+        fail "nodert cross-tier spawn"
+    fi
+    # Real-tool proof: the actual TypeScript compiler on the host engine.
+    # Self-skips if a typescript checkout isn't reachable (heaviest nodert phase).
+    if node "$NODERT_DIR/test/tsc.mjs" 2>/dev/null; then
+        ok "nodert real-tool: tsc (version + compile + type-check on the host engine)"
+    else
+        fail "nodert real-tool: tsc"
+    fi
+    # Upstream lib/*.js run verbatim (P2 fidelity)
+    if node "$NODERT_DIR/test/upstream.mjs" 2>/dev/null; then
+        ok "nodert upstream-verbatim (events/qs/punycode/string_decoder/assert/path/streams/util/console)"
+    else
+        fail "nodert upstream-verbatim"
+    fi
+    # M1 net loopback + http server/client (§11)
+    if node "$NODERT_DIR/test/net-http.mjs" 2>/dev/null; then
+        ok "nodert net+http (loopback, server/client, ServeBridge reachable)"
+    else
+        fail "nodert net+http"
+    fi
+    # WASM tier W-1: wasip1 apps as Kernel processes (UL-SPEC/wasm-tier)
+    if node "$NODERT_DIR/test/wasm.mjs" 2>/dev/null; then
+        ok "nodert wasm tier (wasip1 apps, structural preopens, node→wasm spawn)"
+    else
+        fail "nodert wasm tier"
+    fi
+    # WASM tier W-3: WASI service runner (wasm module as a svc.* Kernel Service)
+    if node "$NODERT_DIR/test/wasi-service.mjs" 2>/dev/null; then
+        ok "nodert WASI service runner (wasm-service over svc.* bus)"
+    else
+        fail "nodert WASI service runner"
+    fi
+    # M2 ESM blob-URL loader (§9.2)
+    if node "$NODERT_DIR/test/esm.mjs" 2>/dev/null; then
+        ok "nodert ESM loader (import/export/TLA/dynamic/cycles/TS via SWC)"
+    else
+        fail "nodert ESM loader"
+    fi
+    # M2 worker_threads + fs.watch (§10.3, §6.1)
+    if node "$NODERT_DIR/test/worker-watch.mjs" 2>/dev/null; then
+        ok "nodert worker_threads + fs.watch"
+    else
+        fail "nodert worker_threads + fs.watch"
+    fi
+    # M3 cross-tier chain (node → sh → node; npm lifecycle showcase §12.3)
+    if node "$NODERT_DIR/test/cross-tier-chain.mjs" 2>/dev/null; then
+        ok "nodert cross-tier chain (npm run build → sh → node)"
+    else
+        fail "nodert cross-tier chain"
+    fi
+    # The REAL §12.3 showcase: live NanoVM (BusyBox) as the vm tier + nodert +
+    # shared VFS. Needs wasm/nano.wasm + images/busybox (skips otherwise).
+    if [ -f "$PROJECT_ROOT/images/busybox" ]; then
+        if node "$NODERT_DIR/test/vm-cross-tier.mjs" 2>/dev/null; then
+            ok "nodert ↔ real BusyBox cross-tier (§12.3 acceptance, shared VFS)"
+        else
+            fail "nodert ↔ real BusyBox cross-tier"
+        fi
+        # Kernel-native applets difftested byte-for-byte vs BusyBox (UL-SPEC/applets)
+        if node "$NODERT_DIR/test/applets-difftest.mjs" 2>/dev/null; then
+            ok "kernel-native applets == BusyBox (difftest + S2 fallback)"
+        else
+            fail "kernel-native applets difftest"
+        fi
+    else
+        skip "real-VM cross-tier + applet difftest" "images/busybox not present"
+    fi
+else
+    skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"
+fi
+echo ""
+
+# ============================================================
 # Phase 3: ELF execution tests
 # ============================================================
 
