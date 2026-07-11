@@ -21,8 +21,8 @@ import { registerNodertDelegate } from "../src/host/delegate.mjs";
 import { createVmDelegate } from "../src/host/vm-delegate.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const wasmPath = join(here, "..", "..", "wasm", "nano.wasm");
-const busyboxPath = join(here, "..", "..", "images", "busybox");
+const wasmPath = join(here, "..", "..", "..", "wasm", "nano.wasm");
+const busyboxPath = join(here, "..", "..", "riscv", "images", "busybox");
 
 if (!existsSync(wasmPath) || !existsSync(busyboxPath)) {
   console.log(`  SKIP: real-VM cross-tier (missing ${existsSync(wasmPath) ? "images/busybox" : "wasm/nano.wasm"})`);

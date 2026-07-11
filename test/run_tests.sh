@@ -127,7 +127,7 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert smoke"
     fi
-    # Differential vs host Node (pure-JS fidelity); --vm mode is @heavy (needs images/node)
+    # Differential vs host Node (pure-JS fidelity); --vm mode is @heavy (needs runners/riscv/images/node)
     if node "$NODERT_DIR/test/differential.mjs" 2>/dev/null; then
         ok "nodert differential (vs host-node oracle)"
     else
@@ -220,8 +220,8 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
         fail "nodert cross-tier chain"
     fi
     # The REAL §12.3 showcase: live NanoVM (BusyBox) as the vm tier + nodert +
-    # shared VFS. Needs wasm/nano.wasm + images/busybox (skips otherwise).
-    if [ -f "$PROJECT_ROOT/images/busybox" ]; then
+    # shared VFS. Needs wasm/nano.wasm + runners/riscv/images/busybox (skips otherwise).
+    if [ -f "$PROJECT_ROOT/runners/riscv/runners/riscv/images/busybox" ]; then
         if node "$NODERT_DIR/test/vm-cross-tier.mjs" 2>/dev/null; then
             ok "nodert ↔ real BusyBox cross-tier (§12.3 acceptance, shared VFS)"
         else
@@ -234,7 +234,7 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
             fail "kernel-native applets difftest"
         fi
     else
-        skip "real-VM cross-tier + applet difftest" "images/busybox not present"
+        skip "real-VM cross-tier + applet difftest" "runners/riscv/images/busybox not present"
     fi
 else
     skip "nodert tier" "vendored node-lib bundle missing - run 'node runners/node/tools/vendor-node-lib.mjs'"
@@ -285,7 +285,7 @@ echo ""
 # ============================================================
 
 echo "--- BusyBox Smoke Tests ---"
-BUSYBOX="$PROJECT_ROOT/images/busybox"
+BUSYBOX="$PROJECT_ROOT/runners/riscv/runners/riscv/images/busybox"
 
 if [ ! -f "$BUSYBOX" ]; then
     skip "BusyBox smoke tests" "busybox binary not found"
@@ -339,7 +339,7 @@ echo ""
 # ============================================================
 
 echo "--- Devenv Tool Tests ---"
-NODE_BIN="$PROJECT_ROOT/images/node"
+NODE_BIN="$PROJECT_ROOT/runners/riscv/runners/riscv/images/node"
 
 # Devenv tests need: bundled WASM (>1MB) + node binary + --devenv flag
 WASM_SIZE=$(wc -c < "$WASM" | tr -d ' ')
@@ -351,7 +351,7 @@ fi
 if [ "$HAS_BUNDLED" -eq 0 ]; then
     skip "Devenv tool tests" "no bundled WASM - run 'make build' then use --devenv"
 elif [ ! -f "$NODE_BIN" ]; then
-    skip "Devenv tool tests" "images/node binary not found"
+    skip "Devenv tool tests" "runners/riscv/images/node binary not found"
 else
     # Run a devenv tool via: node <js_path> --version
     run_devenv_tool() {

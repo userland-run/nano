@@ -48,7 +48,7 @@ while IFS= read -r cmd; do
     fi
 
     # Run with 3 second timeout
-    output=$(timeout 3 node test/run.mjs images/busybox --cmd "$cmd" 2>&1)
+    output=$(timeout 3 node test/run.mjs runners/riscv/images/busybox --cmd "$cmd" 2>&1)
     exit_code=$?
 
     if [ $exit_code -eq 124 ]; then

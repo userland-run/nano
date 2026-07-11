@@ -30,11 +30,11 @@ build:
 # Legacy all-in-one: bundle busybox + node + devenv into wasm/nano.wasm for a
 # fully-offline build (no catalog/CDN at first use). Requires the prebuilt images.
 build-full:
-	@test -f images/busybox || (echo "ERROR: images/busybox not found." && exit 1)
-	@test -f images/node || (echo "ERROR: images/node not found." && exit 1)
+	@test -f runners/riscv/images/busybox || (echo "ERROR: runners/riscv/images/busybox not found." && exit 1)
+	@test -f runners/riscv/images/node || (echo "ERROR: runners/riscv/images/node not found." && exit 1)
 	@test -f build/devenv.tar.gz || (echo "ERROR: build/devenv.tar.gz not found. Run 'make devenv' first." && exit 1)
-	gzip -9 -k -f images/busybox && mv images/busybox.gz build/busybox.gz
-	gzip -9 -k -f images/node && mv images/node.gz build/node.gz
+	gzip -9 -k -f runners/riscv/images/busybox && mv runners/riscv/images/busybox.gz build/busybox.gz
+	gzip -9 -k -f runners/riscv/images/node && mv runners/riscv/images/node.gz build/node.gz
 	$(BUILD_STD) cargo build --target $(WASM_TARGET) --release --features demo
 	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.wasm
 
@@ -61,8 +61,8 @@ build-trace:
 # CI. Used by the SDK and terminal smoke runs that must actually execute
 # `echo`/`sort`/etc.
 build-busybox:
-	@test -f images/busybox || (echo "ERROR: images/busybox not found." && exit 1)
-	gzip -9 -k -f images/busybox && mv images/busybox.gz build/busybox.gz
+	@test -f runners/riscv/images/busybox || (echo "ERROR: runners/riscv/images/busybox not found." && exit 1)
+	gzip -9 -k -f runners/riscv/images/busybox && mv runners/riscv/images/busybox.gz build/busybox.gz
 	$(BUILD_STD) cargo build --target $(WASM_TARGET) --release --no-default-features --features busybox
 	cp target/$(WASM_TARGET)/release/nanovm.wasm $(OUT_DIR)/nano.busybox.wasm
 

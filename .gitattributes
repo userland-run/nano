@@ -1,4 +1,4 @@
-images/* filter=lfs diff=lfs merge=lfs -text
+runners/riscv/images/* filter=lfs diff=lfs merge=lfs -text
 wasm/*.wasm filter=lfs diff=lfs merge=lfs -text
 web/demo/public/nano.wasm filter=lfs diff=lfs merge=lfs -text
 web/demo/public/boa.wasm filter=lfs diff=lfs merge=lfs -text
