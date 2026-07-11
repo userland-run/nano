@@ -39,18 +39,6 @@ node test/run.mjs runners/riscv/images/busybox --cmd echo "Hello from RISC-V"
 node test/run.mjs runners/riscv/images/node --cmd node -e "console.log(process.arch)"
 ```
 
-## Web demo
-
-The demo is a browser-based IDE with a file tree, code editor, and console/preview panel:
-
-```bash
-make demo    # Builds WASM with bundled binaries + starts Vite dev server
-```
-
-Requires `runners/riscv/images/busybox`, `runners/riscv/images/node`, and `build/devenv.tar.gz`. See [docs/build.md](docs/build.md) for details.
-
-The demo includes examples that run inside the emulator: basic Node.js (hello world, filesystem, crypto), and HTTP servers with live preview in an iframe via a Service Worker bridge.
-
 ## Architecture
 
 NanoVM follows Fabrice Bellard's approach to high-performance WASM interpreters:
@@ -79,7 +67,6 @@ runners/
 apps/core/          Upstream tools → wasm (ripgrep, coreutils) that run on runners/wasm
 integration/        Cross-runner tests (differential-vs-oracle, cross-tier chains)
 bench/              Cross-runner workload benchmarks
-web/demo/           React + Vite IDE demo app
 test/               RISC-V ELF conformance harness + the top-level test orchestrator
 build/              Devenv Docker build scripts
 ```
@@ -98,7 +85,6 @@ The source pages also live in this repo under `docs/`:
 - [Host API](docs/host-api.md) — WASM imports/exports and FS_PENDING protocol
 - [Virtual Server](docs/virtual-server.md) — HTTP request injection for the preview iframe
 - [Build Guide](docs/build.md) — Build targets, feature flags, testing, devenv setup
-- [Demo](docs/demo.md) — Web IDE architecture and Service Worker bridge
 
 ## Part of userland.run
 

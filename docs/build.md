@@ -112,25 +112,3 @@ ls -lh build/devenv.tar.gz
 
 The build script is at `build/devenv/build.sh`. It uses a multi-stage Docker build to cross-compile packages for riscv64.
 
-## Running the Demo
-
-```bash
-make demo         # Builds bundled WASM + starts vite dev server
-```
-
-This:
-1. Checks that `images/busybox`, `images/node`, and `build/devenv.tar.gz` exist
-2. Builds WASM with all features (embeds all three)
-3. Copies `wasm/nano.wasm` to `web/demo/public/nano.wasm`
-4. Starts the Vite dev server
-
-Visit `http://localhost:5173/nano/` to see the demo.
-
-### Manual demo setup
-
-```bash
-make build                               # Build the bundled WASM
-mkdir -p web/demo/public
-cp wasm/nano.wasm web/demo/public/
-cd web/demo && npm install && npm run dev
-```

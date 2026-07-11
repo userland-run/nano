@@ -99,7 +99,7 @@ _pollConnections() {
 }
 ```
 
-### Service Worker (`web/demo/public/sw.js`)
+### Service Worker
 
 The SW intercepts requests matching `/sw/PORT/path`:
 

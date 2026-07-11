@@ -1,6 +1,2 @@
 runners/riscv/images/* filter=lfs diff=lfs merge=lfs -text
 wasm/*.wasm filter=lfs diff=lfs merge=lfs -text
-web/demo/public/nano.wasm filter=lfs diff=lfs merge=lfs -text
-web/demo/public/boa.wasm filter=lfs diff=lfs merge=lfs -text
-web/demo/dist/*.wasm filter=lfs diff=lfs merge=lfs -text
-test/nodejs/tests/bundle-react-ssr.js filter=lfs diff=lfs merge=lfs -text

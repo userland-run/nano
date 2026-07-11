@@ -121,14 +121,11 @@ When the VM needs filesystem I/O:
 
 **WASM imports**: `memory` (SharedArrayBuffer), `console_write(fd, ptr, len)`, `debug_log(val)`, `abort_js()`, `emscripten_random()`, `emscripten_date_now()`
 
-### Web Demo (`web/demo/`)
-
-React + Vite app with three-panel IDE layout (FileTree, Editor, Preview/Console).
+### Browser host (`runners/riscv/host/`)
 
 - `runners/riscv/host/nanovm.mjs` — Browser NanoVM wrapper (imports WASM, provides high-level API)
-- `runners/riscv/host/memfs.mjs` — In-memory POSIX filesystem
-- `web/demo/src/vm/runtime.ts` — Singleton VM management, wraps NanoVM for React
-- `web/demo/src/vm/sw-bridge.ts` — Service Worker bridge for HTTP preview
-- `web/demo/src/vm/examples.ts` — Example files seeded into VFS
+- `runners/riscv/host/memfs.mjs` — In-memory POSIX filesystem (re-exports the kernel MemFS)
 
-The `@container` alias in the web demo + terminal resolves to `runners/riscv/host/` (the RISC-V VM JS host).
+The `@container` alias in the terminal resolves to `runners/riscv/host/`. (The old
+`web/demo` React IDE was removed — the terminal web component + the website are its
+successors.)

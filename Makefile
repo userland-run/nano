@@ -1,4 +1,4 @@
-.PHONY: build build-full build-minimal build-min build-trace build-busybox build-boa devenv clean serve test test-build test-devenv test-boa test-boa-vm test-trace demo
+.PHONY: build build-full build-minimal build-min build-trace build-busybox build-boa devenv clean serve test test-build test-devenv test-boa test-boa-vm test-trace
 
 WASM_TARGET = wasm32-unknown-unknown
 OUT_DIR = wasm
@@ -122,9 +122,3 @@ test-boa-vm: build-boa
 test-trace: build-min build-trace
 	node test/test_trace.mjs
 
-# Run demo dev server (copies WASM to public dir, starts vite)
-demo: build build-boa
-	mkdir -p web/demo/public
-	cp $(OUT_DIR)/nano.wasm web/demo/public/nano.wasm
-	cp $(OUT_DIR)/boa.wasm web/demo/public/boa.wasm
-	cd web/demo && npm run dev
