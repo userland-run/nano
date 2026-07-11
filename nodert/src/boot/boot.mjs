@@ -145,8 +145,8 @@ async function boot(ctx) {
     if (moduleCache.has(path)) return moduleCache.get(path).exports;
     const raw = sync_readFile(path);
     if (path.endsWith(".json")) { const ex = JSON.parse(raw); moduleCache.set(path, { exports: ex, loaded: true }); return ex; }
-    let src = raw;
-    if (/\.ts$/.test(path)) { try { src = sync("svc.invoke", { service: "swc", method: "transform", payload: { code: raw } }).result.code; } catch {} }
+    let src = stripShebang(raw);
+    if (/\.ts$/.test(path)) { try { src = sync("svc.invoke", { service: "swc", method: "transform", payload: { code: src } }).result.code; } catch {} }
     const dir = path.slice(0, path.lastIndexOf("/")) || "/";
     const mod = { exports: {}, id: path, filename: path, loaded: false, paths: [] };
     moduleCache.set(path, mod);
@@ -424,7 +424,7 @@ async function boot(ctx) {
     req.cache = {};
     const fn = new Function(
       "exports", "require", "module", "__filename", "__dirname", "process", "Buffer", "console",
-      `${source}\n//# sourceURL=${filename}`
+      `${stripShebang(source)}\n//# sourceURL=${filename}`
     );
     fn.call(mod.exports, mod.exports, req, mod, filename, dirname, proc, Buffer, consoleObj);
   }
@@ -525,6 +525,15 @@ async function boot(ctx) {
   function shimFactory(norm) {
     switch (norm) {
       case "fs": return () => makeFsModule({ internalBinding, sync, busAsync, Buffer, EventEmitter: requireModule("events") });
+      // fs/promises → the lean fs shim's promise API (avoids the upstream
+      // internal/fs/watchers chain, which needs an fs_event_wrap binding).
+      case "fs/promises": case "node:fs/promises": return () => requireModule("fs").promises;
+      // timers/promises over the host timers (real apps: setTimeout awaits).
+      case "timers/promises": case "node:timers/promises": return () => ({
+        setTimeout: (ms, val) => new Promise((r) => globalThis.setTimeout(() => r(val), ms)),
+        setImmediate: (val) => new Promise((r) => globalThis.setImmediate(() => r(val))),
+        setInterval: async function* (ms, val) { while (true) { await new Promise((r) => globalThis.setTimeout(r, ms)); yield val; } },
+      });
       case "os": return () => makeOs();
       case "buffer": return () => ({ Buffer, kMaxLength: 4294967296, kStringMaxLength: (1 << 29) - 24, constants: { MAX_LENGTH: 4294967296, MAX_STRING_LENGTH: (1 << 29) - 24 }, atob: (s) => globalThis.atob(s), btoa: (s) => globalThis.btoa(s), Blob: globalThis.Blob });
       // util: prefer upstream lib/util.js (inspect/format now run verbatim);
@@ -818,6 +827,15 @@ function leanFormat(args) {
     out += (out ? " " : "") + (typeof args[i] === "string" ? args[i] : leanInspect(args[i]));
   }
   return out;
+}
+
+// Strip a leading `#!...` shebang line before compiling (Node does this for
+// CJS/main modules). Keeps the newline so line numbers are preserved. Real
+// tool entrypoints (npm-cli.js, tsc bins, .bin/* scripts) start with one.
+function stripShebang(src) {
+  return typeof src === "string" && src.charCodeAt(0) === 0x23 && src.charCodeAt(1) === 0x21
+    ? src.slice(src.indexOf("\n") === -1 ? src.length : src.indexOf("\n"))
+    : src;
 }
 
 export { boot, leanInspect, leanFormat };
