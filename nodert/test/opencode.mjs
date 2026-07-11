@@ -67,5 +67,44 @@ await test("host-engine boot of the 16MB bundle is fast (< 8s, vs seconds-per-bo
   assert(ms < 8000, `booted+ran in ${ms}ms`);
 });
 
+// Drive one loopback HTTP request into a listening in-Kernel server (replicates
+// net.connect_loopback from the host: crossed pipes + a 'connection' event).
+async function loopbackRequest(k, port, rawReq) {
+  const l = k.ports.lookup(port);
+  if (!l) return "(no listener)";
+  const c2s = k.pipes.create(), s2c = k.pipes.create();
+  k.hub.sendEvent(l.ownerPid, { ev: "connection", port, readPipe: c2s.id, writePipe: s2c.id, remotePort: 12345 });
+  c2s.write(new TextEncoder().encode(rawReq));
+  let resp = ""; const dec = new TextDecoder();
+  for (let i = 0; i < 400; i++) {
+    const r = s2c.read(65536);
+    if (r === "eof") break;
+    if (r) { resp += dec.decode(r, { stream: true }); if (resp.includes("\r\n\r\n")) break; }
+    else await Promise.race([s2c.waitReadable(), new Promise((res) => setTimeout(res, 30))]);
+  }
+  return resp;
+}
+
+await test("opencode serve starts a listening HTTP server that handles requests [heavy]", async () => {
+  const k = await newKernel();
+  for (const p of ["/root", "/root/.local", "/root/.local/share"]) try { k.vfs.mkdir(p, 0o755); } catch {}
+  const auth = "Basic " + Buffer.from("opencode:x").toString("base64");
+  const results = new Promise((resolve) => {
+    const off = k.ports.onListening(async (info) => {
+      if ((info?.port ?? info) !== 4096) return; off?.();
+      await new Promise((r) => setTimeout(r, 300)); // let the server settle its routes
+      const unauth = await loopbackRequest(k, 4096, "GET / HTTP/1.1\r\nHost: 127.0.0.1:4096\r\nConnection: close\r\n\r\n");
+      const authed = await loopbackRequest(k, 4096, `GET /doc HTTP/1.1\r\nHost: 127.0.0.1:4096\r\nAuthorization: ${auth}\r\nConnection: close\r\n\r\n`);
+      resolve({ unauth, authed });
+    });
+  });
+  const runP = runNode(k, { argv: ["node", "/opencode/index-nano.js", "serve", "--port", "4096"], entryPath: "/opencode/index-nano.js", cwd: "/opencode", env: { HOME: "/root", PATH: "/usr/bin", OPENCODE_SERVER_PASSWORD: "x", XDG_DATA_HOME: "/root/.local/share" }, timeoutMs: 10000 });
+  const r = await Promise.race([results, runP.then(() => ({ unauth: "(server exited)", authed: "" }))]);
+  assert(r.unauth.startsWith("HTTP/1.1 401"), `unauthed → 401 auth challenge (got: ${r.unauth.split("\r\n")[0]})`);
+  assert(/www-authenticate/i.test(r.unauth), "server issued a WWW-Authenticate challenge (auth middleware ran)");
+  assert(r.authed.startsWith("HTTP/1.1 200"), `authed GET /doc → 200 OK (got: ${r.authed.split("\r\n")[0]})`);
+  await runP; // let the server shut down at its timeout
+});
+
 console.log(`\n=== nodert real-app: opencode on the host engine: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);
