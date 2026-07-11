@@ -97,9 +97,14 @@ function nodeSqliteBackend() {
   // every connection, so opencode migrating on one handle and querying on
   // another must see the same tables. Keyed by guest path (":memory:" → one).
   const byPath = new Map();
-  const bind = (stmt, fn, params) =>
-    Array.isArray(params) && params.length ? stmt[fn](...params)
-    : (params && !Array.isArray(params) && typeof params === "object" ? stmt[fn](params) : stmt[fn]());
+  // node:sqlite throws on an `undefined` bind, but ORMs (Drizzle) pass undefined
+  // for unset columns — real drivers coerce it to NULL. Normalize before binding.
+  const nz = (v) => (v === undefined ? null : v);
+  const bind = (stmt, fn, params) => {
+    if (Array.isArray(params) && params.length) return stmt[fn](...params.map(nz));
+    if (params && !Array.isArray(params) && typeof params === "object") { const o = {}; for (const kk in params) o[kk] = nz(params[kk]); return stmt[fn](o); }
+    return stmt[fn]();
+  };
   return {
     async connect(path) {
       if (!tried) { tried = true; try { ({ DatabaseSync } = await import("node:sqlite")); } catch { DatabaseSync = null; } }
