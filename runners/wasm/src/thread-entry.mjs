@@ -10,7 +10,7 @@
 // parallelism via the SAB); their own WASI syscalls are minimal here — a
 // sibling that needs fs/stdio would carry its own bus client (deferred).
 
-import { workerContext } from "../platform.mjs";
+import { workerContext } from "../../../kernel/platform.mjs";
 
 const ctx = await workerContext();
 const init = ctx.workerData;

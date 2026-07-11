@@ -18,7 +18,7 @@
 // …/nodert/fixtures/generated), so a vendored copy Just Works wherever it lands.
 // The result is cached: one decode serves every nodert spawn.
 
-import { isNode } from "../platform.mjs";
+import { isNode } from "../../../../kernel/platform.mjs";
 
 const NODE_LIB_DIR = new URL("../../vendor/node-lib/", import.meta.url);
 const FIXTURES_DIR = new URL("../../fixtures/generated/", import.meta.url);

@@ -10,7 +10,7 @@
 // kind:"wasm-service" manifest driving registration, and non-string payloads.
 
 import { Kernel, registerBuiltinServices } from "../../../kernel/index.mjs";
-import { createWasiService, createWarmWasmService, registerWasmServiceFromManifest } from "../src/host/wasi-service.mjs";
+import { createWasiService, createWarmWasmService, registerWasmServiceFromManifest } from "../src/wasi-service.mjs";
 import { stdinEchoModule, counterReactorModule } from "./wasm-fixtures.mjs";
 
 let passed = 0, failed = 0, current = "";

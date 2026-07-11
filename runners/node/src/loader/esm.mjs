@@ -15,7 +15,7 @@
 // runtime; import.meta is patched per module.
 
 import { scanEsm, initScanner } from "./scan.mjs";
-import { createModuleUrl } from "../platform.mjs";
+import { createModuleUrl } from "../../../../kernel/platform.mjs";
 
 function createEsmLoader(host) {
   const revokers = [];

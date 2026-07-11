@@ -8,7 +8,7 @@
 // stdout/stderr and the exit code. This is what the SDK's nano.node({engine:
 // "nodert"}) calls under the hood (spec §14).
 
-import { spawnWorker, isNode } from "../platform.mjs";
+import { spawnWorker, isNode } from "../../../../kernel/platform.mjs";
 import { loadLibBundle } from "./lib-loader.mjs";
 
 const workerEntry = new URL("../boot/worker-entry.mjs", import.meta.url).href;

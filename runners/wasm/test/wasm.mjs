@@ -11,11 +11,11 @@
 
 import { Kernel, registerBuiltinServices } from "../../../kernel/index.mjs";
 import { normalizeCaps } from "../../../kernel/caps/caps.mjs";
-import { runWasm, moduleCacheStats } from "../src/host/wasm-runtime.mjs";
-import { inspectWasm } from "../src/wasm/inspect.mjs";
-import { registerWasmDelegate } from "../src/host/wasm-delegate.mjs";
-import { runNode } from "../src/host/runtime.mjs";
-import { registerNodertDelegate } from "../src/host/delegate.mjs";
+import { runWasm, moduleCacheStats } from "../src/wasm-runtime.mjs";
+import { inspectWasm } from "../src/inspect.mjs";
+import { registerWasmDelegate } from "../src/wasm-delegate.mjs";
+import { runNode } from "../../node/src/host/runtime.mjs";
+import { registerNodertDelegate } from "../../node/src/host/delegate.mjs";
 import { helloModule, exitModule, readFileModule, threadsModule } from "./wasm-fixtures.mjs";
 
 let passed = 0, failed = 0, current = "";

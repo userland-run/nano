@@ -21,7 +21,7 @@ import { runWasm } from "./wasm-runtime.mjs";
  * Wrap a wasip1 module as a Kernel Service object (id/version/kind/methods/
  * invoke), suitable for kernel.services.register().
  *
- * @param {import("../../../../kernel/kernel.mjs").Kernel} kernel
+ * @param {import("../../../kernel/kernel.mjs").Kernel} kernel
  * @param {{ id: string, wasmBytes: Uint8Array, version?: string, methods?: string[],
  *           argvPrefix?: string[], caps?: object, encoding?: "utf8"|"bytes",
  *           timeoutMs?: number, moduleKey?: string }} cfg
@@ -71,7 +71,7 @@ function createWasiService(kernel, cfg) {
  * (or are passed in). name → service id, entrypoint.argv[0] → argvPrefix.
  * Returns the unregister fn from the registry.
  *
- * @param {import("../../../../kernel/kernel.mjs").Kernel} kernel
+ * @param {import("../../../kernel/kernel.mjs").Kernel} kernel
  * @param {{ name: string, version?: string, kind?: string, entrypoint?: { argv?: string[] } }} manifest
  * @param {Uint8Array} wasmBytes
  * @param {{ methods?: string[], caps?: object }} [opts]
@@ -100,7 +100,7 @@ function registerWasmServiceFromManifest(kernel, manifest, wasmBytes, opts = {})
  * `method`. Runs on the calling thread (no WASI I/O); a module that imports
  * wasi gets a minimal no-op shim.
  *
- * @param {import("../../../../kernel/kernel.mjs").Kernel} kernel
+ * @param {import("../../../kernel/kernel.mjs").Kernel} kernel
  * @param {{ id: string, wasmBytes: Uint8Array, version?: string, methods?: string[],
  *           imports?: object, decode?: (result:any, exports:object)=>any }} cfg
  */

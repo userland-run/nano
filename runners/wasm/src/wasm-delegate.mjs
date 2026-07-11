@@ -11,7 +11,7 @@
 import { runWasm } from "./wasm-runtime.mjs";
 
 /**
- * @param {import("../../../../kernel/kernel.mjs").Kernel} kernel
+ * @param {import("../../../kernel/kernel.mjs").Kernel} kernel
  * @returns {() => void} unregister
  */
 function registerWasmDelegate(kernel) {

@@ -189,17 +189,17 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert LLM bridge"
     fi
-    # WASM tier W-1: wasip1 apps as Kernel processes (UL-SPEC/wasm-tier)
-    if node "$NODERT_DIR/test/wasm.mjs" 2>/dev/null; then
-        ok "nodert wasm tier (wasip1 apps, structural preopens, node→wasm spawn)"
+    # WASM tier W-1: wasip1 apps as Kernel processes (runners/wasm, UL-SPEC/wasm-tier)
+    if node "$PROJECT_ROOT/runners/wasm/test/wasm.mjs" 2>/dev/null; then
+        ok "wasm tier (wasip1 apps, structural preopens, node→wasm spawn)"
     else
-        fail "nodert wasm tier"
+        fail "wasm tier"
     fi
     # WASM tier W-3: WASI service runner (wasm module as a svc.* Kernel Service)
-    if node "$NODERT_DIR/test/wasi-service.mjs" 2>/dev/null; then
-        ok "nodert WASI service runner (wasm-service over svc.* bus)"
+    if node "$PROJECT_ROOT/runners/wasm/test/wasi-service.mjs" 2>/dev/null; then
+        ok "WASI service runner (wasm-service over svc.* bus)"
     else
-        fail "nodert WASI service runner"
+        fail "WASI service runner"
     fi
     # M2 ESM blob-URL loader (§9.2)
     if node "$NODERT_DIR/test/esm.mjs" 2>/dev/null; then

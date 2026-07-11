@@ -8,9 +8,9 @@
 // and runs a wasip1 module in its own Worker. This is what nano.wasm.run()
 // calls and what the router's wasm spawn delegate uses.
 
-import { spawnWorker } from "../platform.mjs";
+import { spawnWorker } from "../../../kernel/platform.mjs";
 
-const workerEntry = new URL("../wasm/worker-entry.mjs", import.meta.url).href;
+const workerEntry = new URL("./worker-entry.mjs", import.meta.url).href;
 
 // Compiled-Module cache keyed by content hash (UL-SPEC/wasm-tier §4.1 X5):
 // repeat launches of the same artifact skip compilation. WebAssembly.Module is
@@ -27,7 +27,7 @@ async function compileCached(bytes, key) {
 function moduleCacheStats() { return { size: moduleCache.size, keys: [...moduleCache.keys()] }; }
 
 /**
- * @param {import("../../../../kernel/kernel.mjs").Kernel} kernel
+ * @param {import("../../../kernel/kernel.mjs").Kernel} kernel
  * @param {{ wasmBytes: Uint8Array, argv: string[], env?: object, cwd?: string,
  *           caps?: object, ppid?: number, preopens?: Array<{guestPath,hostPath,readonly}>,
  *           onStdout?: (b)=>void, timeoutMs?: number, _reuseProc?, _stdout?, _stderr?, _stdin? }} opts

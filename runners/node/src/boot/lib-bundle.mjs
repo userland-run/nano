@@ -7,7 +7,7 @@
 // host Function with Node's builtin wrapper params; source text is upstream,
 // byte-identical (P2).
 
-import { isNode } from "../platform.mjs";
+import { isNode } from "../../../../kernel/platform.mjs";
 
 let index = null;
 let raw = null;

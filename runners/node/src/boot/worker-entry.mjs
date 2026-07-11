@@ -7,7 +7,7 @@
 // the binding fixtures, and hands control to the boot orchestrator. Runs in a
 // worker_threads Worker under Node (tests) or a Web Worker in the browser.
 
-import { workerContext, isNode } from "../platform.mjs";
+import { workerContext, isNode } from "../../../../kernel/platform.mjs";
 import { BusClient } from "../../../../kernel/bus/client.mjs";
 import { SyncCaller } from "../../../../kernel/bus/sab-channel.mjs";
 import { boot } from "./boot.mjs";
