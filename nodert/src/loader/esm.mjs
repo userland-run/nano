@@ -273,9 +273,23 @@ function normalize(p) {
   for (const seg of p.split("/")) { if (seg === "" || seg === ".") continue; if (seg === "..") parts.pop(); else parts.push(seg); }
   return (abs ? "/" : "") + parts.join("/");
 }
+// Node's canonical builtin module set (v25), including the subpath forms
+// (fs/promises, stream/promises, path/posix, …) real apps import. A name here
+// is resolved as a BUILTIN (never a file); whether it is actually implemented
+// is a separate concern handled by the binding/shim layer.
+const NODE_BUILTINS = new Set([
+  "assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster",
+  "console", "constants", "crypto", "dgram", "diagnostics_channel", "dns",
+  "dns/promises", "domain", "events", "fs", "fs/promises", "http", "http2",
+  "https", "inspector", "inspector/promises", "module", "net", "os", "path",
+  "path/posix", "path/win32", "perf_hooks", "process", "punycode", "querystring",
+  "readline", "readline/promises", "repl", "stream", "stream/consumers",
+  "stream/promises", "stream/web", "string_decoder", "sys", "timers",
+  "timers/promises", "tls", "trace_events", "tty", "url", "util", "util/types",
+  "v8", "vm", "wasi", "worker_threads", "zlib",
+]);
 function isBareBuiltin(spec) {
-  const s = spec.replace(/^node:/, "");
-  return ["fs", "path", "os", "util", "events", "stream", "crypto", "net", "http", "url", "querystring", "punycode", "string_decoder", "assert", "buffer", "zlib", "child_process", "process"].includes(s);
+  return NODE_BUILTINS.has(spec.replace(/^node:/, ""));
 }
 function moduleNotFound(p) { const e = new Error(`Cannot find module '${p}'`); e.code = "ERR_MODULE_NOT_FOUND"; return e; }
 
