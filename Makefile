@@ -110,12 +110,12 @@ test-devenv: build
 
 # Run the scripting-layer unit tests (builds boa.wasm first)
 test-boa: build-boa
-	node test/test_boa.mjs $(OUT_DIR)/boa.wasm
+	node runners/boa/test/test_boa.mjs $(OUT_DIR)/boa.wasm
 
 # Integration: a Boa script driving the real emulator (needs bundled nano.wasm)
 test-boa-vm: build-boa
 	@test -f $(OUT_DIR)/nano.wasm || (echo "ERROR: $(OUT_DIR)/nano.wasm not found. Run 'make build' first." && exit 1)
-	node test/test_boa_vm.mjs
+	node runners/boa/test/test_boa_vm.mjs
 
 # Verify the trace feature gate: build both release wasms, assert nano.trace.wasm
 # emits per-syscall events and nano.min.wasm does not.

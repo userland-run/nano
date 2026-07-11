@@ -13,15 +13,15 @@
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Kernel, registerBuiltinServices, registerKernelApplets } from "../../../kernel/index.mjs";
-import { createVmDelegate } from "../src/host/vm-delegate.mjs";
+import { Kernel, registerBuiltinServices, registerKernelApplets } from "../kernel/index.mjs";
+import { createVmDelegate } from "../runners/node/src/host/vm-delegate.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const wasmPath = join(here, "..", "..", "..", "wasm", "nano.wasm");
-const busyboxPath = join(here, "..", "..", "riscv", "images", "busybox");
+const wasmPath = join(here, "..", "wasm", "nano.wasm");
+const busyboxPath = join(here, "..", "runners", "riscv", "images", "busybox");
 if (!existsSync(busyboxPath)) { console.log("  SKIP: applet difftest (images/busybox not present)"); process.exit(0); }
 
-const { NanoVM } = await import("../../riscv/host/nanovm.mjs");
+const { NanoVM } = await import("../runners/riscv/host/nanovm.mjs");
 
 const kernel = new Kernel();
 await registerBuiltinServices(kernel);

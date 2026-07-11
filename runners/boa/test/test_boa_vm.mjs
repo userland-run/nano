@@ -17,7 +17,7 @@
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { NanoVM } from "../runners/riscv/host/nanovm.mjs";
+import { NanoVM } from "../../riscv/host/nanovm.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const NANO_WASM = process.env.NANOVM_WASM || resolve(root, "wasm/nano.wasm");

@@ -15,21 +15,21 @@
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Kernel, registerBuiltinServices, materializePackages } from "../../../kernel/index.mjs";
-import { runNode } from "../src/host/runtime.mjs";
-import { registerNodertDelegate } from "../src/host/delegate.mjs";
-import { createVmDelegate } from "../src/host/vm-delegate.mjs";
+import { Kernel, registerBuiltinServices, materializePackages } from "../kernel/index.mjs";
+import { runNode } from "../runners/node/src/host/runtime.mjs";
+import { registerNodertDelegate } from "../runners/node/src/host/delegate.mjs";
+import { createVmDelegate } from "../runners/node/src/host/vm-delegate.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const wasmPath = join(here, "..", "..", "..", "wasm", "nano.wasm");
-const busyboxPath = join(here, "..", "..", "riscv", "images", "busybox");
+const wasmPath = join(here, "..", "wasm", "nano.wasm");
+const busyboxPath = join(here, "..", "runners", "riscv", "images", "busybox");
 
 if (!existsSync(wasmPath) || !existsSync(busyboxPath)) {
   console.log(`  SKIP: real-VM cross-tier (missing ${existsSync(wasmPath) ? "images/busybox" : "wasm/nano.wasm"})`);
   process.exit(0);
 }
 
-const { NanoVM } = await import("../../riscv/host/nanovm.mjs");
+const { NanoVM } = await import("../runners/riscv/host/nanovm.mjs");
 
 let passed = 0, failed = 0;
 
