@@ -6,6 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 NanoVM is a `#![no_std]` Rust WebAssembly emulator implementing an **RV64 RISC-V Linux userland emulator** targeting BusyBox and Node.js workloads in the browser. The architecture is defined in `.claude/skills/bellard/SKILL.md`.
 
+## Repository Layout
+
+The repo is organized as **one shared kernel + peer runners + apps** (see [`runners/README.md`](runners/README.md)):
+
+- `kernel/` — the shared OS layer (bus IDL, VFS, proc/router, net, caps, services) + `kernel/platform.mjs` (worker-spawn host infra). Its tests live in `kernel/test/`.
+- `runners/riscv/` — this emulator: `src/` (Rust), `host/nanovm.mjs` (JS host, registers the `vm` delegate), `images/` (RV64 ELF, Git LFS).
+- `runners/node/` — Node.js on the host JS engine (the `node` delegate).
+- `runners/wasm/` — wasm32-wasip1 command tier (the `wasm` delegate).
+- `runners/boa/` — sandboxed JS: `crate/` (nano-boa → boa.wasm) + `host/boa.mjs`.
+- `apps/core/` — upstream tools compiled to wasm (ripgrep, coreutils) that run on `runners/wasm`.
+- `integration/` — cross-runner tests (differential-vs-oracle, cross-tier chains).
+- `bench/` — cross-runner workload benchmarks.
+
+**Rule:** a runner imports only from `kernel/`; runners never import each other (cross-tier goes through the router + bus + shared VFS). Everything below (`src/…`) is the riscv runner at `runners/riscv/src/…`.
+
 ## Build Commands
 
 ```bash
@@ -29,16 +44,16 @@ Tests are in `test/` and run via Node.js:
 ```bash
 bash test/run_tests.sh              # Run tests (requires wasm/nano.wasm)
 bash test/run_tests.sh --build      # Build test ELFs first (requires cross-compiler)
-bash test/run_tests.sh --devenv     # Include devenv tool tests (requires bundled WASM + images/node)
+bash test/run_tests.sh --devenv     # Include devenv tool tests (requires bundled WASM + runners/riscv/images/node)
 
 # Run single ELF test:
 node test/run.mjs test/hello.elf
 
 # Run busybox command:
-node test/run.mjs images/busybox --cmd echo Hello
+node test/run.mjs runners/riscv/images/busybox --cmd echo Hello
 
 # Run with syscall tracing:
-node test/run.mjs images/busybox --trace --cmd ls /tmp
+node test/run.mjs runners/riscv/images/busybox --trace --cmd ls /tmp
 ```
 
 **Test phases**: MemFS unit tests → ELF execution (hello, test_suite, test_rvc, test_memory, test_syscalls, test_float) → BusyBox smoke tests (17 applets) → Devenv tool tests (node, tsc, npm, eslint, prettier).
@@ -70,15 +85,15 @@ The core design principle is a **single monolithic `exec()` function** with dens
 
 ### Source Layout
 
-- `src/cpu.rs` — Main RV64 interpreter loop (`exec()`) with instruction decode/dispatch
-- `src/decode.rs` — Instruction decode helpers
-- `src/syscall.rs` — Linux syscall dispatch (handles ~50 syscalls for BusyBox + Node.js)
-- `src/mem.rs` — Guest memory access (read/write with bounds checking)
-- `src/elf.rs` — ELF loader (parses segments, sets up stack with argv/envp/auxv)
-- `src/types.rs` — VM struct layout (12680 bytes, `#[repr(C)]`, compile-time size assertion)
-- `src/exports.rs` — WASM exports (vm_create, vm_step, vm_load_elf, debug_*, etc.)
-- `src/alloc.rs` — Bump allocator for WASM linear memory
-- `src/host.rs` — Host import declarations (console_write, debug_log, etc.)
+- `runners/riscv/src/cpu.rs` — Main RV64 interpreter loop (`exec()`) with instruction decode/dispatch
+- `runners/riscv/src/decode.rs` — Instruction decode helpers
+- `runners/riscv/src/syscall.rs` — Linux syscall dispatch (handles ~50 syscalls for BusyBox + Node.js)
+- `runners/riscv/src/mem.rs` — Guest memory access (read/write with bounds checking)
+- `runners/riscv/src/elf.rs` — ELF loader (parses segments, sets up stack with argv/envp/auxv)
+- `runners/riscv/src/types.rs` — VM struct layout (12680 bytes, `#[repr(C)]`, compile-time size assertion)
+- `runners/riscv/src/exports.rs` — WASM exports (vm_create, vm_step, vm_load_elf, debug_*, etc.)
+- `runners/riscv/src/alloc.rs` — Bump allocator for WASM linear memory
+- `runners/riscv/src/host.rs` — Host import declarations (console_write, debug_log, etc.)
 
 ### VM Struct Layout (types.rs, 12680 bytes)
 
@@ -110,10 +125,10 @@ When the VM needs filesystem I/O:
 
 React + Vite app with three-panel IDE layout (FileTree, Editor, Preview/Console).
 
-- `container/nanovm.mjs` — Browser NanoVM wrapper (imports WASM, provides high-level API)
-- `container/memfs.mjs` — In-memory POSIX filesystem
+- `runners/riscv/host/nanovm.mjs` — Browser NanoVM wrapper (imports WASM, provides high-level API)
+- `runners/riscv/host/memfs.mjs` — In-memory POSIX filesystem
 - `web/demo/src/vm/runtime.ts` — Singleton VM management, wraps NanoVM for React
 - `web/demo/src/vm/sw-bridge.ts` — Service Worker bridge for HTTP preview
 - `web/demo/src/vm/examples.ts` — Example files seeded into VFS
 
-The `@container` alias in vite.config.ts resolves to `container/` (project root).
+The `@container` alias in the web demo + terminal resolves to `runners/riscv/host/` (the RISC-V VM JS host).

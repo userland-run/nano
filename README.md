@@ -33,10 +33,10 @@ make build
 make test
 
 # Run a BusyBox command
-node test/run.mjs images/busybox --cmd echo "Hello from RISC-V"
+node test/run.mjs runners/riscv/images/busybox --cmd echo "Hello from RISC-V"
 
 # Run a Node.js script
-node test/run.mjs images/node --cmd node -e "console.log(process.arch)"
+node test/run.mjs runners/riscv/images/node --cmd node -e "console.log(process.arch)"
 ```
 
 ## Web demo
@@ -47,7 +47,7 @@ The demo is a browser-based IDE with a file tree, code editor, and console/previ
 make demo    # Builds WASM with bundled binaries + starts Vite dev server
 ```
 
-Requires `images/busybox`, `images/node`, and `build/devenv.tar.gz`. See [docs/build.md](docs/build.md) for details.
+Requires `runners/riscv/images/busybox`, `runners/riscv/images/node`, and `build/devenv.tar.gz`. See [docs/build.md](docs/build.md) for details.
 
 The demo includes examples that run inside the emulator: basic Node.js (hello world, filesystem, crypto), and HTTP servers with live preview in an iframe via a Service Worker bridge.
 
@@ -64,27 +64,27 @@ The WASM binary is ~585KB without bundled binaries, or ~68MB with BusyBox + Node
 
 ## Project structure
 
+One shared kernel + peer runners + apps (see [`runners/README.md`](runners/README.md)):
+
 ```
-src/
-├── cpu.rs          RV64GC interpreter loop (instruction decode & dispatch)
-├── decode.rs       Instruction field extraction
-├── syscall.rs      Linux syscall dispatch (~80 syscalls)
-├── mem.rs          Guest memory read/write
-├── elf.rs          ELF loader (segments, argv/envp/auxv)
-├── types.rs        VM struct (12,680 bytes, #[repr(C)])
-├── exports.rs      WASM exports
-├── alloc.rs        Bump allocator
-├── host.rs         Host import declarations
-└── lib.rs          Crate root
-
-container/
-├── nanovm.mjs      Browser NanoVM wrapper (WASM + MemFS + virtual server)
-└── memfs.mjs       In-memory POSIX filesystem
-
+kernel/             Shared OS layer: bus IDL, VFS, proc/router, net, caps, services, platform.mjs
+runners/
+├── riscv/          This emulator
+│   ├── src/        RV64GC interpreter — cpu/decode/syscall/mem/elf/types/exports/alloc/host/lib .rs
+│   ├── host/       nanovm.mjs (browser wrapper: WASM + MemFS + virtual server) + memfs.mjs
+│   └── images/     RISC-V ELF binaries (busybox, node — Git LFS)
+├── node/           Node.js on the host JS engine (the `node` delegate)
+├── wasm/           wasm32-wasip1 command tier (the `wasm` delegate)
+└── boa/            Sandboxed JS: crate/ (nano-boa → boa.wasm) + host/boa.mjs
+apps/core/          Upstream tools → wasm (ripgrep, coreutils) that run on runners/wasm
+integration/        Cross-runner tests (differential-vs-oracle, cross-tier chains)
+bench/              Cross-runner workload benchmarks
 web/demo/           React + Vite IDE demo app
-test/               Test suite (Node.js runner + RISC-V ELF test binaries)
+test/               RISC-V ELF conformance harness + the top-level test orchestrator
 build/              Devenv Docker build scripts
 ```
+
+A runner imports only from `kernel/` — never another runner (cross-tier goes through the router + bus + shared VFS).
 
 ## Documentation
 
