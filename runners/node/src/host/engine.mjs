@@ -11,8 +11,8 @@
 //
 //   "vm"     — always the RISC-V emulator (fidelity oracle, native addons, the
 //              things nodert can't do). Requires an injected `vmRun`.
-//   "nodert" — always the host-engine tier (JIT speed). Errors surface as-is.
-//   "auto"   — try nodert; on a documented ERR_NODERT_UNSUPPORTED (an
+//   "host" — always the host-engine tier (JIT speed). Errors surface as-is.
+//   "auto"   — try nodert; on a documented ERR_NODE_HOST_UNSUPPORTED (an
 //              unavailable Kernel Service like rspack, or a routing pin), fall
 //              back to the VM. This is the §14 default once M2 exit is met.
 //
@@ -27,13 +27,13 @@
 
 import { runNode } from "./runtime.mjs";
 
-const UNSUPPORTED = "ERR_NODERT_UNSUPPORTED";
+const UNSUPPORTED = "ERR_NODE_HOST_UNSUPPORTED";
 
 /**
  * @param {import("../../../../kernel/kernel.mjs").Kernel} kernel
  * @param {{
- *   engine?: "vm"|"nodert"|"auto",
- *   pins?: Record<string, "vm"|"nodert">,
+ *   engine?: "vm"|"host"|"auto",
+ *   pins?: Record<string, "vm"|"host">,
  *   vmRun?: (argv: string[], opts: object) => Promise<{ exitCode: number, stdout: string, stderr: string, signal?: string|null }>,
  *   timeoutMs?: number,
  * }} [config]
@@ -86,9 +86,9 @@ function createNodeEngine(kernel, config = {}) {
     // nodert (explicit) or auto: run on the host engine first.
     const res = await runOnNodert(argv, opts, timeoutMs);
 
-    if (decision.engine === "nodert") {
+    if (decision.engine === "host") {
       // No fallback: surface an unsupported failure honestly.
-      return { ...res, engine: "nodert" };
+      return { ...res, engine: "host" };
     }
 
     // auto: fall back to the VM only on a documented unsupported signal, and
@@ -97,7 +97,7 @@ function createNodeEngine(kernel, config = {}) {
       const vmRes = await runOnVm(argv, opts, timeoutMs);
       return { ...vmRes, engine: "vm", fellBack: true };
     }
-    return { ...res, engine: "nodert" };
+    return { ...res, engine: "host" };
   }
 
   async function runOnNodert(argv, opts, timeoutMs) {
@@ -148,7 +148,7 @@ function isUnsupported(res) {
   if (!res) return false;
   if (errName(res.error) === UNSUPPORTED) return true;
   // A guest that printed the marker to stderr and exited non-zero (a service
-  // adapter surfacing ERR_NODERT_UNSUPPORTED to the program) also triggers it.
+  // adapter surfacing ERR_NODE_HOST_UNSUPPORTED to the program) also triggers it.
   return res.exitCode !== 0 && typeof res.stderr === "string" && res.stderr.includes(UNSUPPORTED);
 }
 

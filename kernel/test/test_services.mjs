@@ -100,11 +100,11 @@ await test("duckdb stateful session end-to-end (registry direct)", async () => {
   kernel.services.closeSession(sess, 1);
 });
 
-await test("rspack: honest ERR_NODERT_UNSUPPORTED (no browser wasm exists)", async () => {
+await test("rspack: honest ERR_NODE_HOST_UNSUPPORTED (no browser wasm exists)", async () => {
   const { client } = await boot(["rspack"]);
   await client.call("svc.invoke", { service: "rspack", method: "build", payload: {} }).then(
     () => assert(false, "should be unsupported"),
-    (e) => { assert(e instanceof KernelError, "KernelError"); assertEqual(e.name, "ERR_NODERT_UNSUPPORTED", "documented deferral"); }
+    (e) => { assert(e instanceof KernelError, "KernelError"); assertEqual(e.name, "ERR_NODE_HOST_UNSUPPORTED", "documented deferral"); }
   );
   client.close();
 });

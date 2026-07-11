@@ -616,7 +616,7 @@ async function boot(ctx) {
       // that probe/import it fall back to HTTP/1.1 rather than fail at load
       // (the upstream node:http2 calls assertCrypto()).
       case "http2": case "node:http2": return () => {
-        const nope = () => { throw Object.assign(new Error("http2 is not supported on nodert; use HTTP/1.1"), { code: "ERR_NODERT_UNSUPPORTED" }); };
+        const nope = () => { throw Object.assign(new Error("http2 is not supported on nodert; use HTTP/1.1"), { code: "ERR_NODE_HOST_UNSUPPORTED" }); };
         return { constants: {}, createServer: nope, createSecureServer: nope, connect: nope, getDefaultSettings: () => ({}), getPackedSettings: () => Buffer.alloc(0), getUnpackedSettings: () => ({}), sensitiveHeaders: Symbol.for("nodejs.http2.sensitiveHeaders") };
       };
       // dns: no cares_wrap binding — and none needed (the server binds 127.0.0.1;

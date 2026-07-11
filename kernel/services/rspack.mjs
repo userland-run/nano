@@ -7,7 +7,7 @@
 // HONEST STATUS: Rspack is a native Rust/napi binary. There is NO browser-wasm
 // build of Rspack in existence today, so it cannot run as an in-tab wasm
 // Kernel Service. This adapter registers the service contract so tiers can
-// probe for it and get a clean, documented ERR_NODERT_UNSUPPORTED rather than a
+// probe for it and get a clean, documented ERR_NODE_HOST_UNSUPPORTED rather than a
 // silent failure — and so a future wasm build (or a WASI runner) drops in
 // behind the same id without touching callers.
 //
@@ -27,7 +27,7 @@ function createRspackService({ backend } = {}) {
       if (backend) return backend.invoke(method, payload);
       throw new KernelError(
         ERRNO.ENOTSUP,
-        "ERR_NODERT_UNSUPPORTED",
+        "ERR_NODE_HOST_UNSUPPORTED",
         "rspack has no browser-wasm build; run bundling in the VM (engine:'vm') " +
           "or use the esbuild-wasm service. See kernel/services/rspack.mjs."
       );

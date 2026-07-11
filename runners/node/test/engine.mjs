@@ -4,7 +4,7 @@
 // Part of NanoVM; dual-licensed - see LICENSE.md.
 
 // Engine-selection tests (spec §14): createNodeEngine's vm/nodert/auto policy,
-// ERR_NODERT_UNSUPPORTED fallback, and routing pins. The VM tier is a STUB
+// ERR_NODE_HOST_UNSUPPORTED fallback, and routing pins. The VM tier is a STUB
 // vmRun (so this runs headless in <1s); a separate @heavy test wires the real
 // emulated node. The nodert path is REAL — programs actually run on the host
 // engine.
@@ -32,9 +32,9 @@ function stubVm() {
 
 await test("engine 'nodert' runs a program on the host engine (real)", async () => {
   const k = await newKernel();
-  const eng = createNodeEngine(k, { engine: "nodert" });
+  const eng = createNodeEngine(k, { engine: "host" });
   const r = await eng.node(["node", "-e", 'process.stdout.write("hi from nodert")'], { timeoutMs: 15000 });
-  assertEqual(r.engine, "nodert", "served by nodert");
+  assertEqual(r.engine, "host", "served by nodert");
   assertEqual(r.stdout, "hi from nodert", "nodert stdout");
   assertEqual(r.exitCode, 0, "exit 0");
 });
@@ -54,19 +54,19 @@ await test("engine 'auto' stays on nodert for a supported program (no fallback)"
   const vm = stubVm();
   const eng = createNodeEngine(k, { engine: "auto", vmRun: vm.run });
   const r = await eng.node(["node", "-e", 'process.stdout.write("ok")'], { timeoutMs: 15000 });
-  assertEqual(r.engine, "nodert", "auto → nodert when supported");
+  assertEqual(r.engine, "host", "auto → nodert when supported");
   assertEqual(r.stdout, "ok", "nodert output");
   assert(!r.fellBack, "no fallback");
   assertEqual(vm.calls.length, 0, "vm NOT called");
 });
 
-await test("engine 'auto' falls back to vm on ERR_NODERT_UNSUPPORTED", async () => {
+await test("engine 'auto' falls back to vm on ERR_NODE_HOST_UNSUPPORTED", async () => {
   const k = await newKernel();
   const vm = stubVm();
   const eng = createNodeEngine(k, { engine: "auto", vmRun: vm.run });
   // A guest surfacing the documented marker to stderr + non-zero exit (exactly
   // how a service adapter like rspack reports "can't do this on the host").
-  const src = 'process.stderr.write("ERR_NODERT_UNSUPPORTED: rspack has no browser build"); process.exit(1);';
+  const src = 'process.stderr.write("ERR_NODE_HOST_UNSUPPORTED: rspack has no browser build"); process.exit(1);';
   const r = await eng.node(["node", "-e", src], { timeoutMs: 15000 });
   assertEqual(r.engine, "vm", "fell back to vm");
   assert(r.fellBack, "fellBack flag set");
@@ -77,10 +77,10 @@ await test("engine 'auto' falls back to vm on ERR_NODERT_UNSUPPORTED", async () 
 await test("engine 'nodert' does NOT fall back on unsupported (honest failure)", async () => {
   const k = await newKernel();
   const vm = stubVm();
-  const eng = createNodeEngine(k, { engine: "nodert", vmRun: vm.run });
-  const src = 'process.stderr.write("ERR_NODERT_UNSUPPORTED"); process.exit(1);';
+  const eng = createNodeEngine(k, { engine: "host", vmRun: vm.run });
+  const src = 'process.stderr.write("ERR_NODE_HOST_UNSUPPORTED"); process.exit(1);';
   const r = await eng.node(["node", "-e", src], { timeoutMs: 15000 });
-  assertEqual(r.engine, "nodert", "stays nodert");
+  assertEqual(r.engine, "host", "stays nodert");
   assertEqual(r.exitCode, 1, "surfaces the failure");
   assertEqual(vm.calls.length, 0, "no vm fallback in explicit nodert mode");
 });
@@ -88,7 +88,7 @@ await test("engine 'nodert' does NOT fall back on unsupported (honest failure)",
 await test("routing pin forces a program to the vm (argv0)", async () => {
   const k = await newKernel();
   const vm = stubVm();
-  const eng = createNodeEngine(k, { engine: "nodert", pins: { jest: "vm" }, vmRun: vm.run });
+  const eng = createNodeEngine(k, { engine: "host", pins: { jest: "vm" }, vmRun: vm.run });
   const d = eng.which(["jest", "--run"]);
   assertEqual(d.engine, "vm", "which() resolves the pin");
   assertEqual(d.reason, "pin", "reason is pin");
@@ -100,7 +100,7 @@ await test("routing pin forces a program to the vm (argv0)", async () => {
 await test("routing pin matches the entry bin, not just argv0 (node .bin/jest)", async () => {
   const k = await newKernel();
   const vm = stubVm();
-  const eng = createNodeEngine(k, { engine: "nodert", pins: { jest: "vm" }, vmRun: vm.run });
+  const eng = createNodeEngine(k, { engine: "host", pins: { jest: "vm" }, vmRun: vm.run });
   const d = eng.which(["node", "node_modules/.bin/jest", "--ci"]);
   assertEqual(d.engine, "vm", "pin resolves via the entry basename");
   const r = await eng.node(["node", "/proj/node_modules/.bin/jest"]);
@@ -112,11 +112,11 @@ await test("per-call opts.engine overrides the default (but not a pin)", async (
   const vm = stubVm();
   const eng = createNodeEngine(k, { engine: "vm", pins: { jest: "vm" }, vmRun: vm.run });
   // Default is vm; override this one call to nodert.
-  const r = await eng.node(["node", "-e", 'process.stdout.write("override")'], { engine: "nodert", timeoutMs: 15000 });
-  assertEqual(r.engine, "nodert", "opts.engine overrode the default");
+  const r = await eng.node(["node", "-e", 'process.stdout.write("override")'], { engine: "host", timeoutMs: 15000 });
+  assertEqual(r.engine, "host", "opts.engine overrode the default");
   assertEqual(r.stdout, "override", "ran on nodert");
   // A pin still wins over a per-call preference.
-  const p = eng.which(["jest"], { engine: "nodert" });
+  const p = eng.which(["jest"], { engine: "host" });
   assertEqual(p.engine, "vm", "pin beats opts.engine");
 });
 
