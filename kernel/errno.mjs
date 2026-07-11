@@ -101,6 +101,10 @@ class KernelError extends Error {
     super(message || name || ERRNO_NAMES[errno] || `errno ${errno}`);
     this.errno = errno;
     this.name = name || ERRNO_NAMES[errno] || `E${errno}`;
+    // Node's errors expose `.code` (the string errno name, e.g. "ENOENT");
+    // libraries branch on it (y18n, graceful-fs, …). Mirror it so guest code
+    // treating a Kernel error like a Node error works.
+    this.code = this.name;
     if (capability !== undefined) this.capability = capability;
   }
 

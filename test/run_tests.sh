@@ -164,6 +164,13 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert real-tool: tsc"
     fi
+    # Real-app proof: the actual opencode agent CLI (16MB minified ESM) on the
+    # host engine. Self-skips if the opencode assets aren't present (terminal/).
+    if node "$NODERT_DIR/test/opencode.mjs" 2>/dev/null; then
+        ok "nodert real-app: opencode CLI (16MB ESM bundle runs on the host engine)"
+    else
+        fail "nodert real-app: opencode"
+    fi
     # Upstream lib/*.js run verbatim (P2 fidelity)
     if node "$NODERT_DIR/test/upstream.mjs" 2>/dev/null; then
         ok "nodert upstream-verbatim (events/qs/punycode/string_decoder/assert/path/streams/util/console)"
