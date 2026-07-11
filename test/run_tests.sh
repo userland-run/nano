@@ -43,7 +43,7 @@ NC='\033[0m' # No Color
 # When RESULTS_NDJSON is set, append one JSON line per assertion so
 # tools/harness-ledger-to-results.mjs can map it to a registry feature and
 # publish a `node-harness` suite to the userland.run status hub.
-record() { [ -n "${RESULTS_NDJSON:-}" ] && printf '{"name":"%s","status":"%s"}\n' "$1" "$2" >> "$RESULTS_NDJSON"; }
+record() { [ -n "${RESULTS_NDJSON:-}" ] && printf '{"name":"%s","status":"%s"}\n' "$1" "$2" >> "$RESULTS_NDJSON"; return 0; }
 ok()   { echo -e "  ${GREEN}PASS${NC}: $1"; PASS=$((PASS + 1)); record "$1" passed; }
 fail() { echo -e "  ${RED}FAIL${NC}: $1"; FAIL=$((FAIL + 1)); record "$1" failed; }
 skip() { echo -e "  ${YELLOW}SKIP${NC}: $1 ($2)"; SKIP=$((SKIP + 1)); record "$1" skipped; }
@@ -221,7 +221,7 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     fi
     # The REAL §12.3 showcase: live NanoVM (BusyBox) as the vm tier + nodert +
     # shared VFS. Needs wasm/nano.wasm + runners/riscv/images/busybox (skips otherwise).
-    if [ -f "$PROJECT_ROOT/runners/riscv/runners/riscv/images/busybox" ]; then
+    if [ -f "$PROJECT_ROOT/runners/riscv/images/busybox" ]; then
         if node "$PROJECT_ROOT/integration/vm-cross-tier.mjs" 2>/dev/null; then
             ok "nodert ↔ real BusyBox cross-tier (§12.3 acceptance, shared VFS)"
         else
@@ -285,7 +285,7 @@ echo ""
 # ============================================================
 
 echo "--- BusyBox Smoke Tests ---"
-BUSYBOX="$PROJECT_ROOT/runners/riscv/runners/riscv/images/busybox"
+BUSYBOX="$PROJECT_ROOT/runners/riscv/images/busybox"
 
 if [ ! -f "$BUSYBOX" ]; then
     skip "BusyBox smoke tests" "busybox binary not found"
@@ -339,7 +339,7 @@ echo ""
 # ============================================================
 
 echo "--- Devenv Tool Tests ---"
-NODE_BIN="$PROJECT_ROOT/runners/riscv/runners/riscv/images/node"
+NODE_BIN="$PROJECT_ROOT/runners/riscv/images/node"
 
 # Devenv tests need: bundled WASM (>1MB) + node binary + --devenv flag
 WASM_SIZE=$(wc -c < "$WASM" | tr -d ' ')
