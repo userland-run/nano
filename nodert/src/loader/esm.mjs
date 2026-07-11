@@ -30,6 +30,9 @@ function createEsmLoader(host) {
     const url = await buildFrom(resolved.path);
     return import(url);
   };
+  // Curried form so the rewrite can turn `import(` into a span-based prefix
+  // without needing the closing paren: `import(X)` → `__nodert_import2(base)(X)`.
+  globalThis.__nodert_import2 = (fromPath) => (spec) => globalThis.__nodert_import(spec, fromPath);
 
   // ---- resolution ----
   function resolveSpec(spec, fromPath) {
@@ -185,15 +188,24 @@ function createEsmLoader(host) {
   // A null result means "remove this import statement" (intra-SCC edge).
   function rewriteModule(mod, urlFor) {
     let out = mod.source;
+    const base = JSON.stringify("file://" + mod.path);
     const edits = [];
+    // Static import specifiers → facade/module URLs.
     for (let i = 0; i < mod.scan.statics.length; i++) {
       const s = mod.scan.statics[i];
-      const dep = mod.deps[i];
-      const rep = urlFor(dep);
+      const rep = urlFor(mod.deps[i]);
       if (rep === null) edits.push({ removeStatement: true, specStart: s.start, specEnd: s.end });
       else edits.push({ start: s.start, end: s.end, rep });
     }
-    // Apply back-to-front.
+    // Dynamic import() → the curried host importer. SPAN-BASED off the scanner
+    // positions, so `import(` text inside string literals is never touched
+    // (a global regex here corrupts real-world minified bundles — "Unexpected
+    // string"). `import(` → `globalThis.__nodert_import2(<base>)(`.
+    for (const d of mod.scan.dynamics) {
+      if (d.keywordStart == null) continue;
+      edits.push({ start: d.keywordStart, end: d.parenStart + 1, rep: `globalThis.__nodert_import2(${base})(` });
+    }
+    // Apply all edits back-to-front on the original source (positions stay valid).
     edits.sort((a, b) => (b.specStart ?? b.start) - (a.specStart ?? a.start));
     for (const e of edits) {
       if (e.removeStatement) {
@@ -203,18 +215,13 @@ function createEsmLoader(host) {
         out = out.slice(0, e.start) + e.rep + out.slice(e.end);
       }
     }
-    out = rewriteDynamicImports(out, mod.path);
     if (mod.scan.hasImportMeta) {
-      out = `const __nodert_meta = { url: ${JSON.stringify("file://" + mod.path)}, resolve: (s) => new URL(s, ${JSON.stringify("file://" + mod.path)}).href };\n` +
-        out.replace(/\bimport\.meta\b/g, "__nodert_meta");
+      // `import.meta` is an identifier, not inside a string in practice; keep the
+      // global replace but only outside string spans via a strings-aware pass.
+      out = `const __nodert_meta = { url: ${base}, resolve: (s) => new URL(s, ${base}).href };\n` +
+        replaceOutsideStrings(out, /\bimport\.meta\b/g, "__nodert_meta");
     }
     return out;
-  }
-
-  function rewriteDynamicImports(source, path) {
-    return source
-      .replace(/\bimport\s*\(/g, "globalThis.__nodert_import(")
-      .replace(/globalThis\.__nodert_import\(([^,()]*)\)/g, (m, arg) => `globalThis.__nodert_import(${arg.trim() || "''"}, ${JSON.stringify(path)})`);
   }
 
   function builtinFacade(name) {
@@ -264,6 +271,25 @@ function statementSpan(src, specStart, specEnd) {
   let end = specEnd;
   while (end < src.length && src[end] !== "\n") { if (src[end] === ";") { end++; break; } end++; }
   return [start, end];
+}
+
+// Apply a /g regex replacement to `src` ONLY outside string/template literals
+// and comments — so identifier rewrites (import.meta) never touch look-alike
+// text inside strings.
+function replaceOutsideStrings(src, re, rep) {
+  let out = "", i = 0; const n = src.length;
+  const skipStr = (s, p) => { const q = s[p]; let k = p + 1; while (k < n) { const ch = s[k]; if (ch === "\\") { k += 2; continue; } if (ch === q) return k + 1; k++; } return n; };
+  while (i < n) {
+    const c = src[i];
+    if (c === '"' || c === "'" || c === "`") { const e = skipStr(src, i); out += src.slice(i, e); i = e; continue; }
+    if (c === "/" && src[i + 1] === "/") { const e = src.indexOf("\n", i); const end = e === -1 ? n : e; out += src.slice(i, end); i = end; continue; }
+    if (c === "/" && src[i + 1] === "*") { const e = src.indexOf("*/", i + 2); const end = e === -1 ? n : e + 2; out += src.slice(i, end); i = end; continue; }
+    let j = i;
+    while (j < n) { const d = src[j]; if (d === '"' || d === "'" || d === "`" || (d === "/" && (src[j + 1] === "/" || src[j + 1] === "*"))) break; j++; }
+    out += src.slice(i, j).replace(re, rep);
+    i = j;
+  }
+  return out;
 }
 
 function dirname(p) { const i = p.lastIndexOf("/"); return i <= 0 ? "/" : p.slice(0, i); }

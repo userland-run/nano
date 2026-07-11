@@ -43,9 +43,11 @@ function scanEsm(src) {
         while (j < n && /\s/.test(src[j])) j++;
         if (src[j] === ".") { hasImportMeta = true; i += 6; continue; }
         if (src[j] === "(") {
-          // dynamic import — capture the (possibly literal) specifier
+          // dynamic import — capture the (possibly literal) specifier PLUS the
+          // keyword/paren positions so the rewrite is span-based (never a global
+          // regex, which would corrupt `import(` inside string literals).
           const arg = readCallArg(src, j);
-          dynamics.push(arg);
+          dynamics.push({ ...arg, keywordStart: i, parenStart: j });
           i = j + 1;
           continue;
         }
@@ -136,9 +138,24 @@ function skipString(src, i) {
   const q = src[i]; i++;
   if (q === "`") {
     while (i < src.length) {
-      if (src[i] === "\\") { i += 2; continue; }
-      if (src[i] === "`") return i + 1;
-      if (src[i] === "$" && src[i + 1] === "{") { let d = 1; i += 2; while (i < src.length && d) { if (src[i] === "{") d++; else if (src[i] === "}") d--; i++; } continue; }
+      const c = src[i];
+      if (c === "\\") { i += 2; continue; }
+      if (c === "`") return i + 1;
+      if (c === "$" && src[i + 1] === "{") {
+        // `${ … }` interpolation: skip to the MATCHING `}`, recursively skipping
+        // nested strings/templates so a brace INSIDE a string (e.g. `${x?"{":"}"}`)
+        // doesn't miscount the depth (which would drift every later position).
+        i += 2; let depth = 1;
+        while (i < src.length && depth > 0) {
+          const d = src[i];
+          if (d === "\\") { i += 2; continue; }
+          if (d === '"' || d === "'" || d === "`") { i = skipString(src, i); continue; }
+          if (d === "{") { depth++; i++; continue; }
+          if (d === "}") { depth--; i++; continue; }
+          i++;
+        }
+        continue;
+      }
       i++;
     }
     return i;
