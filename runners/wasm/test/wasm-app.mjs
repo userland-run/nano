@@ -32,8 +32,8 @@ function project() {
   return registerBuiltinServices(k).then(() => {
     for (const d of ["/proj", "/proj/src", "/proj/.git"]) k.vfs.mkdir(d, 0o755);
     const mk = (p, c) => k.vfs.rootMem.createFile(p, new TextEncoder().encode(c));
-    mk("/proj/README.md", "#\n"); mk("/proj/package.json", "{}\n");
-    mk("/proj/src/a.js", "1\n"); mk("/proj/src/b.js", "2\n");
+    mk("/proj/README.md", "# demo\nhello world\n"); mk("/proj/package.json", "{}\n");
+    mk("/proj/src/a.js", "const answer = 42;\n"); mk("/proj/src/b.js", "export const B = 2;\n");
     mk("/proj/.gitignore", "x\n"); mk("/proj/.git/config", "y\n");
     return k;
   });
@@ -56,7 +56,9 @@ await test("rg --files walks the spawn cwd (fd_readdir), skips .git/hidden", asy
   const delegate = k.router.delegateFor("wasm-app");
   const r = await delegate({ parent, argv: ["rg", "--no-config", "--files", "--glob=!**/.git/**", "."], cwd: "/proj", env: {}, caps: parent.caps, wait: true, timeoutMs: 15000 });
   assert(r.exitCode === 0, `exit 0 (got ${r.exitCode}, stderr ${r.stderr})`);
-  assert(r.stdout === "README.md\npackage.json\nsrc/a.js\nsrc/b.js\n", `sorted project files, no .git/hidden (got ${JSON.stringify(r.stdout)})`);
+  // ripgrep --files is not alphabetically sorted (walk order) — compare the set.
+  const got = r.stdout.trim().split("\n").sort().join(",");
+  assert(got === "README.md,package.json,src/a.js,src/b.js", `project files, no .git/hidden (got ${JSON.stringify(r.stdout)})`);
 });
 
 await test("async spawn: parent drains the file list from the pipe", async () => {
@@ -76,6 +78,26 @@ await test("async spawn: parent drains the file list from the pipe", async () =>
   }
   assert(out.includes("README.md") && out.includes("src/a.js"), `streamed the file list (got ${JSON.stringify(out)})`);
   assert(!out.includes(".git"), "no .git in the streamed output");
+});
+
+await test("rg search: real regex engine (path:line:text), -l, -c", async () => {
+  const k = await project();
+  createWasmAppRunner(k).register("rg", rgBytes);
+  const parent = k.registerProcess({ kind: "node", argv: ["p"] });
+  const del = k.router.delegateFor("wasm-app");
+  const run = (...a) => del({ parent, argv: ["rg", ...a], cwd: "/proj", env: {}, caps: parent.caps, wait: true, timeoutMs: 15000 });
+
+  const s = await run("answer", ".");
+  assert(s.stdout.trim() === "src/a.js:1:const answer = 42;", `search prints path:line:text (got ${JSON.stringify(s.stdout)})`);
+
+  const w = await run("-l", "world", ".");
+  assert(w.stdout.trim() === "README.md", `-l lists files with matches (got ${JSON.stringify(w.stdout)})`);
+
+  const c = await run("-c", "const", ".");
+  assert(c.stdout.split("\n").filter(Boolean).sort().join(",") === "src/a.js:1,src/b.js:1", `-c counts per file (got ${JSON.stringify(c.stdout)})`);
+
+  const none = await run("nomatchxyz", ".");
+  assert(none.exitCode === 1, `exit 1 on no matches (got ${none.exitCode})`);
 });
 
 console.log(`\n=== wasm-app runner (apps/core rg on wasm32-wasip1): ${passed} passed, ${failed} failed ===`);

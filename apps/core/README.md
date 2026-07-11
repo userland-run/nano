@@ -1,48 +1,51 @@
 # apps/core — core system apps (wasm)
 
-The `nano-core-apps` set: upstream Unix tools **compiled to `wasm32-wasip1`** and
-run on the wasm runner (`runners/wasm`) — fast (host wasm engine, no emulation),
-GNU-compatible (compiled from the real tools, not reimplemented), and installed
-through the catalog/CAS like any other app.
+Upstream Unix tools **compiled to `wasm32-wasip1`** and run on the wasm runner
+(`runners/wasm`) — fast (host wasm engine, no emulation), and (for search/globs)
+built on the real upstream crates, not reimplemented.
 
-An **app** targets a runner's ABI; it never imports runner code. These modules
-run under `runners/wasm` (routed via the Kernel `wasm` tier) and are
-difftested against the RISC-V BusyBox oracle (`runners/riscv/images/busybox`).
+An **app** targets a runner's ABI; it never imports runner code. These run on
+`runners/wasm` (via a router pin to the wasm-app tier) and, like any Unix tool,
+see their spawn cwd as `.`.
 
-## Planned contents
+## Scope — only what busybox/kernel applets DON'T already provide
 
-| tool | upstream | why compile, not reimplement |
+The basic coreutils (`cat`, `ls`, `echo`, `head`, `tail`, `wc`, …) are already
+covered twice: the **kernel-native JS applets** (fast, byte-identical to
+BusyBox) and **BusyBox-in-VM** (the fidelity oracle). We do **not** replicate
+those in wasm — that would be pure redundancy.
+
+`apps/core` is for **gap-fillers**: tools BusyBox lacks that modern workflows
+need, where compiling the real upstream tool to wasm beats both the slow VM and
+a hand-rolled applet.
+
+| tool | status | why |
 |---|---|---|
-| `rg` (ripgrep) | BurntSushi/ripgrep (Rust) | opencode's file enumeration + search; ripgrep-only flags (`--files`, `--json`, `--glob`) |
-| coreutils (`ls`/`cat`/`cp`/`mv`/`rm`/`head`/`tail`/`wc`/`sort`/…) | uutils/coreutils (Rust) | GNU-compatible, passes the GNU test suite |
-| `fd`, `sd`, `bat` | Rust ecosystem | as demand appears |
+| **`rg`** (ripgrep) | **shipped** (`rg.wasm`) | no grep in BusyBox with ripgrep semantics; opencode's file enumeration + search |
+| `fd` | planned | fast, gitignore-aware find |
+| `jq` | planned | JSON processing |
+| `sd`, `bat`, `delta` | later | as demand appears |
 
-## Layout (as tools land)
+## `rg` — built on ripgrep's own crates
+
+`build/rg` is a real ripgrep front-end over **`ignore`** (gitignore/hidden/glob
+directory walking) + **`regex`** (the same matcher) + **`globset`** — single-
+threaded (`Walk`, not `WalkParallel`) and std-only I/O so it runs on wasip1.
+
+Supported: `--files`; search with `-i`/`-S`/`-w`/`-F`/`-v`, `-n`/`-N`,
+`-H`/`--no-filename`, `-l`/`--files-with-matches`, `--files-without-match`,
+`-c`/`--count`, `-o`/`--only-matching`, `-A`/`-B`/`-C` context, `-g`/`--glob`,
+`--hidden`, `--no-ignore`, `--json` (ripgrep JSON Lines), `-e`/`--regexp`,
+`-m`/`--max-count`. Not yet: PCRE2 (`-P`), multiline (`-U`), replacements, `--type`.
+
+## Layout
 
 ```
 apps/core/
-  build/       build configs (cargo → wasm32-wasip1, wasm-opt)
-  manifests/   catalog manifests (kind: "wasm-service" / "wasm-app")
-  test/        difftest vs the BusyBox oracle
+  rg.wasm            the built artifact (wasm32-wasip1)
+  build/rg/          its Rust crate — `make build-rg`
+  test/              difftest home (vs the BusyBox oracle)
 ```
 
-## Layout so far
-
-```
-apps/core/
-  rg.wasm            first artifact — a minimal `rg --files` (wasm32-wasip1)
-  build/rg/          its Rust crate (std-only; `make build-rg`)
-```
-
-## Status
-
-**First artifact shipped: `rg.wasm`** — a minimal `rg --files` (recursive
-enumeration, ripgrep's hidden/.git skip, `--glob=!` exclusions), the subset the
-opencode agent needs before its first model turn. It runs on `runners/wasm` via
-the **wasm-app runner** (`runners/wasm/src/wasm-app.mjs`): a registered name is
-pinned so `rg …` routes to the wasm tier and sees its spawn cwd as `.` (this is
-what forced implementing the shim's `fd_readdir`). `make build-rg` rebuilds it;
-`runners/wasm/test/wasm-app.mjs` covers it.
-
-**Next:** search mode via the upstream regex/`grep` crate (where compiling
-upstream beats reimplementing), then `uutils/coreutils` → wasm.
+`make build-rg` rebuilds `rg.wasm`; `runners/wasm/test/wasm-app.mjs` covers it
+(route pin, `--files` walk incl. fd_readdir + gitignore, real-regex search).

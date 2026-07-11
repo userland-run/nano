@@ -4,15 +4,20 @@ name = "rg"
 version = "0.1.0"
 edition = "2021"
 
-# Self-contained: keep this crate out of nano's package manifest one dir up.
 [workspace]
 
 [[bin]]
 name = "rg"
 path = "src/main.rs"
 
+[dependencies]
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
+ignore = "0.4"
+globset = "0.4"
+
 [profile.release]
 opt-level = "s"
 lto = true
 panic = "abort"
 strip = true
+codegen-units = 1
