@@ -92,6 +92,11 @@ function defaultBackend() {
 function nodeSqliteBackend() {
   let DatabaseSync = null, tried = false;
   const mini = miniSqlBackend();
+  // Guest paths are Kernel-VFS paths the host can't open, so each maps to an
+  // in-memory DB — but SHARED by path: a real SQLite file is one database across
+  // every connection, so opencode migrating on one handle and querying on
+  // another must see the same tables. Keyed by guest path (":memory:" → one).
+  const byPath = new Map();
   const bind = (stmt, fn, params) =>
     Array.isArray(params) && params.length ? stmt[fn](...params)
     : (params && !Array.isArray(params) && typeof params === "object" ? stmt[fn](params) : stmt[fn]());
@@ -99,10 +104,8 @@ function nodeSqliteBackend() {
     async connect(path) {
       if (!tried) { tried = true; try { ({ DatabaseSync } = await import("node:sqlite")); } catch { DatabaseSync = null; } }
       if (!DatabaseSync) return mini.connect(path);
-      // A guest path is a Kernel-VFS path the host can't open; each node:sqlite
-      // session is one persistent connection, so an in-memory DB is consistent
-      // for the session's lifetime. (Browser DuckDB-wasm persists to real VFS.)
-      const db = new DatabaseSync(":memory:");
+      const key = path || ":memory:";
+      const db = byPath.get(key) ?? (byPath.set(key, new DatabaseSync(":memory:")), byPath.get(key));
       return {
         async query(sql, params) {
           const stmt = db.prepare(sql);
@@ -110,7 +113,7 @@ function nodeSqliteBackend() {
           catch { try { bind(stmt, "run", params); } catch {} return []; }
         },
         async run(sql, params) { try { bind(db.prepare(sql), "run", params); } catch (e) { if (!/^(PRAGMA|BEGIN|COMMIT|END|ROLLBACK)/i.test(String(sql).trim())) throw e; } },
-        async close() { try { db.close(); } catch {} },
+        async close() { /* shared by path — kept open for the backend's lifetime */ },
       };
     },
   };
