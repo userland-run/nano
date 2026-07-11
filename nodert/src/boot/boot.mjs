@@ -547,6 +547,78 @@ async function boot(ctx) {
       case "crypto": case "node:crypto": return () => makeCrypto(Buffer);
       case "net": case "node:net": return () => makeNet({ sync, busAsync, Buffer, EventEmitter: requireModule("events"), setImmediate: globalThis.setImmediate });
       case "http": case "node:http": return () => makeHttp({ net: requireModule("net"), EventEmitter: requireModule("events"), Buffer });
+      // tls: the upstream node:tls throws assertCrypto() without an OpenSSL
+      // build. Locally, a server listens plain HTTP and real outbound TLS is
+      // done host-side (the /dev/__net__ / fetch bridge), so treat TLS as net
+      // and stub the rest — enough to LOAD and start a server.
+      case "tls": case "node:tls": return () => {
+        const net = requireModule("net");
+        return {
+          connect: (...a) => net.connect(...a),
+          createServer: (opts, listener) => net.createServer(typeof opts === "function" ? opts : listener),
+          TLSSocket: net.Socket, Server: net.Server,
+          createSecureContext: () => ({}), createSecurePair: () => ({}),
+          checkServerIdentity: () => undefined, getCiphers: () => [],
+          rootCertificates: [], DEFAULT_ECDH_CURVE: "auto",
+          DEFAULT_MIN_VERSION: "TLSv1.2", DEFAULT_MAX_VERSION: "TLSv1.3",
+          constants: {},
+        };
+      };
+      // https: the local server is HTTP; outbound HTTPS is host-side. Delegate
+      // to the lean http module + no-op TLS.
+      case "https": case "node:https": return () => {
+        const http = requireModule("http");
+        return { ...http, createServer: (opts, l) => http.createServer(typeof opts === "function" ? opts : l), request: (...a) => http.request(...a), get: (...a) => http.get(...a), Agent: http.Agent ?? class {}, globalAgent: {} };
+      };
+      // http2: not supported (no binding); present-but-throws-on-use so servers
+      // that probe/import it fall back to HTTP/1.1 rather than fail at load
+      // (the upstream node:http2 calls assertCrypto()).
+      case "http2": case "node:http2": return () => {
+        const nope = () => { throw Object.assign(new Error("http2 is not supported on nodert; use HTTP/1.1"), { code: "ERR_NODERT_UNSUPPORTED" }); };
+        return { constants: {}, createServer: nope, createSecureServer: nope, connect: nope, getDefaultSettings: () => ({}), getPackedSettings: () => Buffer.alloc(0), getUnpackedSettings: () => ({}), sensitiveHeaders: Symbol.for("nodejs.http2.sensitiveHeaders") };
+      };
+      // dns: no cares_wrap binding — and none needed (the server binds 127.0.0.1;
+      // outbound host resolution happens host-side at the fetch bridge). Resolve
+      // localhost locally; echo other hosts back.
+      case "dns": case "node:dns": return () => {
+        const lookup = (hostname, options, cb) => {
+          const callback = typeof options === "function" ? options : cb;
+          const h = String(hostname); const addr = h === "localhost" ? "127.0.0.1" : h;
+          queueMicrotask(() => callback?.(null, addr, addr.includes(":") ? 6 : 4));
+        };
+        const promises = {
+          lookup: (h, o) => new Promise((res, rej) => lookup(h, o, (e, address, family) => e ? rej(e) : res({ address, family }))),
+          resolve: async (h) => [h], resolve4: async (h) => [h], resolve6: async (h) => [h],
+          getServers: () => [], setServers: () => {}, reverse: async (ip) => [ip],
+        };
+        return {
+          lookup, promises,
+          lookupService: (a, p, cb) => queueMicrotask(() => cb?.(null, a, p)),
+          resolve: (h, t, cb) => queueMicrotask(() => (typeof t === "function" ? t : cb)?.(null, [h])),
+          resolve4: (h, cb) => queueMicrotask(() => cb?.(null, [h])),
+          resolve6: (h, cb) => queueMicrotask(() => cb?.(null, [h])),
+          reverse: (ip, cb) => queueMicrotask(() => cb?.(null, [ip])),
+          getServers: () => [], setServers: () => {}, setDefaultResultOrder: () => {}, getDefaultResultOrder: () => "verbatim",
+          Resolver: class { constructor() {} setServers() {} resolve() {} },
+          ADDRCONFIG: 0, V4MAPPED: 0, ALL: 0,
+        };
+      };
+      // dgram (UDP): no udp_wrap binding — and no UDP egress in-guest. Stub it so
+      // modules load (mDNS discovery just no-ops); the upstream node:dgram
+      // Object.defineProperty's an undefined binding otherwise.
+      case "dgram": case "node:dgram": return () => {
+        const EE = requireModule("events");
+        class Socket extends EE {
+          bind(...a) { const cb = a.find((x) => typeof x === "function"); queueMicrotask(() => { this.emit("listening"); cb?.(); }); return this; }
+          send(...a) { const cb = a.find((x) => typeof x === "function"); queueMicrotask(() => cb?.(null)); return this; }
+          close(cb) { queueMicrotask(() => { this.emit("close"); cb?.(); }); return this; }
+          address() { return { address: "0.0.0.0", family: "IPv4", port: 0 }; }
+          setBroadcast() {} setMulticastTTL() {} setMulticastLoopback() {} setMulticastInterface() {}
+          addMembership() {} dropMembership() {} addSourceSpecificMembership() {} dropSourceSpecificMembership() {}
+          setTTL() {} setRecvBufferSize() {} setSendBufferSize() {} ref() { return this; } unref() { return this; }
+        }
+        return { Socket, createSocket: (opts, cb) => { const s = new Socket(); if (typeof cb === "function") s.on("message", cb); return s; } };
+      };
       case "worker_threads": case "node:worker_threads": return () => makeWorkerThreads({ sync, busAsync, Buffer, EventEmitter: requireModule("events"), init });
       // url: the upstream module needs the ada `url` binding (M2). The host
       // URL/URLSearchParams are WHATWG-standard and present in the worker, so
@@ -630,15 +702,30 @@ async function boot(ctx) {
       exec(sql) { sync("svc.invoke", { service: "duckdb", sessionId: this._session, method: "exec", payload: { sql } }); }
       prepare(sql) {
         const session = this._session;
-        return {
-          all: (...params) => sync("svc.invoke", { service: "duckdb", sessionId: session, method: "query", payload: { sql, params } }).result.rows,
-          get: (...params) => sync("svc.invoke", { service: "duckdb", sessionId: session, method: "query", payload: { sql, params } }).result.rows[0] ?? undefined,
+        const query = (params) => sync("svc.invoke", { service: "duckdb", sessionId: session, method: "query", payload: { sql, params } }).result.rows ?? [];
+        const stmt = {
+          all: (...params) => query(params),
+          get: (...params) => query(params)[0] ?? undefined,
           run: (...params) => { sync("svc.invoke", { service: "duckdb", sessionId: session, method: "exec", payload: { sql, params } }); return { changes: 0, lastInsertRowid: 0 }; },
+          iterate: function* (...params) { yield* query(params); },
+          [Symbol.iterator]: function* () { yield* query([]); },
+          // node:sqlite Statement config setters (no-ops here) — chainable.
+          setReadBigInts: () => stmt, setAllowBareNamedParameters: () => stmt, setAllowUnknownNamedParameters: () => stmt, setReturnArrays: () => stmt,
+          finalize: () => {}, columns: () => [],
+          get sourceSQL() { return sql; }, get expandedSQL() { return sql; },
         };
+        return stmt;
       }
+      // node:sqlite extras real apps touch — no-ops on the lean backend.
+      function() { return this; }
+      aggregate() { return this; }
+      createSession() { return { changeset: () => new Uint8Array(0), patchset: () => new Uint8Array(0), close: () => {} }; }
+      applyChangeset() { return true; }
+      loadExtension() {} enableLoadExtension() {}
+      get isOpen() { return this._open; }
       close() { if (this._open) { sync("svc.close_session", { sessionId: this._session }); this._open = false; } }
     }
-    return { DatabaseSync };
+    return { DatabaseSync, constants: { SQLITE_CHANGESET_OMIT: 0, SQLITE_CHANGESET_REPLACE: 1, SQLITE_CHANGESET_ABORT: 2 }, backup: async () => {} };
   }
 
   // child_process over proc.spawn + Kernel pipes (spec §12). execSync/spawnSync

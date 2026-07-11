@@ -18,7 +18,7 @@ function createDuckDbService({ backend } = {}) {
   /** @type {Map<any, any>} sessionHandle → connection */
   const connections = new Map();
   let seq = 0;
-  const impl = backend ?? miniSqlBackend();
+  const impl = backend ?? defaultBackend();
 
   return {
     id: "duckdb",
@@ -77,6 +77,45 @@ async function loadDuckDbWasmBackend(loader) {
   };
 }
 
+// The default backend when none is injected. Where the Kernel runs on Node
+// (headless, and Node-hosted deployments), the host's real `node:sqlite` gives
+// full SQL (sqlite_master, joins, migrations) — the same role DuckDB-wasm plays
+// in the browser, so real ORMs (Drizzle) work. In a browser Kernel without a
+// wasm backend wired, it degrades to the mini-SQL smoke evaluator.
+function defaultBackend() {
+  const isNode = typeof process !== "undefined" && !!process.versions?.node;
+  return isNode ? nodeSqliteBackend() : miniSqlBackend();
+}
+
+// Real SQLite via the host node:sqlite (Node 22.5+). Lazily imported on first
+// connect so registration never fails where it's absent.
+function nodeSqliteBackend() {
+  let DatabaseSync = null, tried = false;
+  const mini = miniSqlBackend();
+  const bind = (stmt, fn, params) =>
+    Array.isArray(params) && params.length ? stmt[fn](...params)
+    : (params && !Array.isArray(params) && typeof params === "object" ? stmt[fn](params) : stmt[fn]());
+  return {
+    async connect(path) {
+      if (!tried) { tried = true; try { ({ DatabaseSync } = await import("node:sqlite")); } catch { DatabaseSync = null; } }
+      if (!DatabaseSync) return mini.connect(path);
+      // A guest path is a Kernel-VFS path the host can't open; each node:sqlite
+      // session is one persistent connection, so an in-memory DB is consistent
+      // for the session's lifetime. (Browser DuckDB-wasm persists to real VFS.)
+      const db = new DatabaseSync(":memory:");
+      return {
+        async query(sql, params) {
+          const stmt = db.prepare(sql);
+          try { return bind(stmt, "all", params); }
+          catch { try { bind(stmt, "run", params); } catch {} return []; }
+        },
+        async run(sql, params) { try { bind(db.prepare(sql), "run", params); } catch (e) { if (!/^(PRAGMA|BEGIN|COMMIT|END|ROLLBACK)/i.test(String(sql).trim())) throw e; } },
+        async close() { try { db.close(); } catch {} },
+      };
+    },
+  };
+}
+
 // A tiny in-memory SQL evaluator: CREATE TABLE / INSERT / SELECT * [WHERE col
 // op val] [ORDER BY col] [LIMIT n]. Enough to exercise the service contract
 // and node:sqlite smoke without the wasm download. NOT a real SQL engine.
@@ -128,6 +167,10 @@ function evalSql(sql, tables) {
     const cols = sel.split(",").map((c) => c.trim());
     return rows.map((r) => Object.fromEntries(cols.map((c) => [c, r[c]])));
   }
+  // Accept-and-ignore the framing statements a lean KV store doesn't model —
+  // PRAGMAs (config hints), transactions, index/trigger DDL, ANALYZE/VACUUM.
+  // Real apps (opencode) issue these at startup; ignoring them is safe.
+  if (/^(PRAGMA|BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE|CREATE\s+(UNIQUE\s+)?INDEX|DROP\s+INDEX|CREATE\s+TRIGGER|DROP\s+TRIGGER|ANALYZE|VACUUM|ATTACH|DETACH)\b/is.test(s)) return;
   throw new Error(`miniSql: unsupported statement: ${s.slice(0, 40)}`);
 }
 
