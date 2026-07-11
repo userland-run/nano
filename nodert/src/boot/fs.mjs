@@ -138,9 +138,20 @@ function makeFsModule({ sync, busAsync, Buffer, EventEmitter }) {
   // Real tools (tsc, esbuild) write output through an fd, not writeFileSync.
   // Backed by the Kernel fs.* fd ops; the shim tracks the current offset per fd
   // (the bus ops take an explicit position) and the path for fstat.
-  const openFds = new Map(); // fd -> { path, flags, pos }
+  const openFds = new Map(); // fd -> { path, flags, pos } | net device
+  let netDevSeq = 0x40000000;
   const openSync = (path, flags = "r", mode = 0o666) => {
     const p = String(path);
+    // /dev/__net__ — the host-brokered outbound HTTP device (Tier 1). Write the
+    // "METHOD url\nHeaders\n\nbody" wire form, then read the framed HTTP/1.1
+    // response until EOF; routed to the Kernel fetch bridge (incl.
+    // nanoinfer.internal → the LLM bridge). Lets the nano-net-proxy run
+    // unchanged on nodert. NOT a VFS file — synthetic fd, no fs.open.
+    if (p === "/dev/__net__") {
+      const fd = ++netDevSeq;
+      openFds.set(fd, { device: "net", reqChunks: [], streamId: null, eof: false });
+      return fd;
+    }
     const fl = typeof flags === "number" ? flags : flagToInt(flags);
     const fd = sync("fs.open", { path: p, flags: fl, mode }).fd;
     let pos = 0;
@@ -148,9 +159,18 @@ function makeFsModule({ sync, busAsync, Buffer, EventEmitter }) {
     openFds.set(fd, { path: p, flags: fl, pos });
     return fd;
   };
-  const closeSync = (fd) => { sync("fs.close", { fd }); openFds.delete(fd); };
+  const closeSync = (fd) => {
+    const e = openFds.get(fd);
+    if (e && e.device === "net") { if (e.streamId != null && !e.eof) { try { sync("net.fetch_abort", { streamId: e.streamId }); } catch {} } openFds.delete(fd); return; }
+    sync("fs.close", { fd }); openFds.delete(fd);
+  };
   const writeSync = (fd, data, a, b, c) => {
     const e = openFds.get(fd);
+    if (e && e.device === "net") {
+      const u8 = typeof data === "string" ? enc.encode(data) : (data instanceof Uint8Array ? data : new Uint8Array(data.buffer ?? data));
+      e.reqChunks.push(u8.slice()); // copy — the caller may reuse the buffer
+      return u8.length;
+    }
     let bytes, position;
     if (typeof data === "string") {
       // writeSync(fd, string[, position[, encoding]])
@@ -174,6 +194,20 @@ function makeFsModule({ sync, busAsync, Buffer, EventEmitter }) {
     const e = openFds.get(fd);
     const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer.buffer ?? buffer);
     const len = typeof length === "number" ? length : u8.length - offset;
+    if (e && e.device === "net") {
+      if (e.eof) return 0;
+      if (e.streamId == null) {
+        // First read: hand the accumulated request to the fetch bridge (blocks
+        // on the sync plane until the response head is ready, like the VM).
+        let total = 0; for (const c of e.reqChunks) total += c.length;
+        const req = new Uint8Array(total); let o = 0; for (const c of e.reqChunks) { req.set(c, o); o += c.length; }
+        e.streamId = sync("net.fetch_open_raw", { data: req.buffer.slice(req.byteOffset, req.byteOffset + req.byteLength) }).streamId;
+      }
+      const r = sync("net.fetch_read", { streamId: e.streamId, len });
+      if (r.eof || !r.bytes) { e.eof = true; return 0; }
+      u8.set(new Uint8Array(r.data), offset);
+      return r.bytes;
+    }
     const pos = position != null ? position : (e ? e.pos : 0);
     const r = sync("fs.read", { fd, len, pos });
     if (r.bytes) u8.set(new Uint8Array(r.data), offset);

@@ -79,6 +79,7 @@ const OP = {
   "net.fetch_open": code(NS.net, 0x09),
   "net.fetch_read": code(NS.net, 0x0a),
   "net.fetch_abort": code(NS.net, 0x0b),
+  "net.fetch_open_raw": code(NS.net, 0x0c),
 
   // svc.*
   "svc.invoke": code(NS.svc, 0x01),

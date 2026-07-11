@@ -156,6 +156,15 @@ function buildHandlers(hub) {
     hub._netStreams.set(streamId, { pid: p.pid, st });
     return { streamId };
   });
+  // Raw /dev/__net__ wire form ("METHOD url\nHeaders\n\nbody") — the same the VM
+  // device speaks, so a nodert /dev/__net__ device + the nano-net-proxy work
+  // unchanged (incl. nanoinfer.internal → the LLM bridge).
+  h.set(OP["net.fetch_open_raw"], async (p, a) => {
+    const st = await hub.kernel.fetchBridge.openFromRawRequest(new Uint8Array(a.data));
+    const streamId = hub._nextStreamId++;
+    hub._netStreams.set(streamId, { pid: p.pid, st });
+    return { streamId };
+  });
   h.set(OP["net.fetch_read"], async (p, a) => {
     const e = hub._netStreams.get(a.streamId);
     if (!e || e.pid !== p.pid) throw new KernelError(ERRNO.EBADF, undefined, "unknown stream");

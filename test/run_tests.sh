@@ -183,6 +183,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "nodert net+http"
     fi
+    # /dev/__net__ outbound device → Kernel fetch bridge → LLM bridge (nanoinfer)
+    if node "$NODERT_DIR/test/llm-bridge.mjs" 2>/dev/null; then
+        ok "nodert LLM bridge (/dev/__net__ → nanoinfer, incl. SSE streaming)"
+    else
+        fail "nodert LLM bridge"
+    fi
     # WASM tier W-1: wasip1 apps as Kernel processes (UL-SPEC/wasm-tier)
     if node "$NODERT_DIR/test/wasm.mjs" 2>/dev/null; then
         ok "nodert wasm tier (wasip1 apps, structural preopens, node→wasm spawn)"
