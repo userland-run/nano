@@ -97,5 +97,38 @@ await (async () => {
   else { failed++; console.error(`  FAIL: ${name}\n    got ${JSON.stringify(r.stdout)} exit ${r.exitCode}`); if (r.stderr) console.error(`    stderr ${r.stderr.split("\n").slice(0, 2).join(" | ")}`); }
 })();
 
+// Streaming child_process.spawn: a tool that writes its final chunk in the
+// same turn it exits must still deliver EVERY byte to the parent before 'close'
+// fires. Regression for the child-exit-races-the-last-pipe-chunk bug: 'close'
+// waits for the stdout drain to reach EOF (Node semantics), so nothing is lost.
+await (async () => {
+  const kernel = new Kernel();
+  await registerBuiltinServices(kernel);
+  // A minimal vm-tier delegate emulating a file-lister (like `rg --files`):
+  // it writes several lines AND closeWrites AND exits, all in one microtask.
+  kernel.router.registerDelegate("vm", (req) => {
+    const stdin = kernel.pipes.create(), stdout = kernel.pipes.create(), stderr = kernel.pipes.create();
+    const child = kernel.registerProcess({ kind: "applet", argv: req.argv, cwd: req.cwd, env: req.env, caps: req.caps, ppid: req.parent?.pid ?? 1, stdio: [stdin.id, stdout.id, stderr.id] });
+    queueMicrotask(() => {
+      stdout.write(new TextEncoder().encode("a.js\n"));
+      stdout.write(new TextEncoder().encode("b.js\nc.js\n"));
+      stdout.closeWrite(); stderr.closeWrite();
+      kernel.proc.exit(child.pid, 0, null);
+    });
+    return { pid: child.pid, stdin: stdin.id, stdout: stdout.id, stderr: stderr.id };
+  });
+  kernel.router.pin("rg", "vm");
+  const src = `const cp = require("child_process");
+   const out = [];
+   const ch = cp.spawn("rg", ["--files", "."], {});
+   ch.stdout.on("data", (d) => out.push(d.toString()));
+   ch.on("close", (code) => { process.stdout.write("close:" + code + " out:" + out.join("")); process.exit(0); });`;
+  const r = await runNode(kernel, { argv: ["node", "-e", src], source: src, cwd: "/proj", env: {}, timeoutMs: 20000 });
+  const name = "streaming spawn delivers the trailing chunk before 'close'";
+  const want = "close:0 out:a.js\nb.js\nc.js\n";
+  if (r.stdout === want && r.exitCode === 0) { passed++; console.log(`  PASS: ${name}`); }
+  else { failed++; console.error(`  FAIL: ${name}\n    got ${JSON.stringify(r.stdout)} exit ${r.exitCode}`); if (r.stderr) console.error(`    stderr ${r.stderr.split("\n").slice(0, 2).join(" | ")}`); }
+})();
+
 console.log(`\n=== cross-tier spawn: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);

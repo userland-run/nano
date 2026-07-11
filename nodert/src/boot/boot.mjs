@@ -846,9 +846,15 @@ async function boot(ctx) {
   function makeChildHandle(res, ipc) {
     const listeners = new Map();
     const emit = (ev, ...a) => (listeners.get(ev) ?? []).forEach((fn) => fn(...a));
+    // Track every stdout/stderr drain so 'close' can wait for them (below):
+    // a tool's final chunk is often written in the same turn it exits, so the
+    // child-exit event and the last pipe bytes race — gating 'close' on the
+    // drains reaching EOF is what keeps that trailing chunk from being dropped.
+    const drains = [];
+    const track = (p) => { if (p) drains.push(p); return p; };
     const readable = (pipeId) => ({
-      on(ev, fn) { if (ev === "data" && pipeId != null) drainPipe(pipeId, (b) => fn(Buffer.from(b))); return this; },
-      pipe(dest) { if (pipeId != null) drainPipe(pipeId, (b) => dest.write?.(Buffer.from(b))); return dest; },
+      on(ev, fn) { if (ev === "data" && pipeId != null) track(drainPipe(pipeId, (b) => fn(Buffer.from(b)))); return this; },
+      pipe(dest) { if (pipeId != null) track(drainPipe(pipeId, (b) => dest.write?.(Buffer.from(b)))); return dest; },
       setEncoding() { return this; },
     });
     // IPC (fork): JSON-framed messages over the crossed IPC pipe pair.
@@ -868,8 +874,8 @@ async function boot(ctx) {
     // fork() default (silent:false): the child's stdout/stderr flow to the
     // parent's (Node's inherit-ish behavior).
     if (ipc) {
-      if (res.stdout != null) drainPipe(res.stdout, (b) => proc.stdout.write(Buffer.from(b)));
-      if (res.stderr != null) drainPipe(res.stderr, (b) => proc.stderr.write(Buffer.from(b)));
+      if (res.stdout != null) track(drainPipe(res.stdout, (b) => proc.stdout.write(Buffer.from(b))));
+      if (res.stderr != null) track(drainPipe(res.stderr, (b) => proc.stderr.write(Buffer.from(b))));
     }
     if (ipc && res.ipcRead != null) {
       globalThis.__nodert_ref?.();
@@ -885,14 +891,24 @@ async function boot(ctx) {
         } catch {} finally { globalThis.__nodert_unref?.(); child.connected = false; emit("disconnect"); }
       })();
     }
-    // Bridge child-exit events (async plane) to 'exit'/'close'.
-    busAsync?.onEvent?.((msg) => { if (msg.ev === "child-exit" && msg.pid === res.pid) { emit("exit", msg.exitCode, msg.signal); emit("close", msg.exitCode, msg.signal); } });
+    // Bridge child-exit events (async plane) to 'exit'/'close'. Node fires
+    // 'exit' when the process ends but 'close' only once every stdio stream has
+    // ended; mirror that so a consumer reading stdout to completion (opencode's
+    // `rg --files`, any piped tool) sees the FULL output before 'close' — the
+    // last chunk written just before exit is still in flight on the drains.
+    busAsync?.onEvent?.((msg) => {
+      if (msg.ev !== "child-exit" || msg.pid !== res.pid) return;
+      emit("exit", msg.exitCode, msg.signal);
+      Promise.all(drains.slice()).then(() => emit("close", msg.exitCode, msg.signal));
+    });
     return child;
   }
 
+  // Reads a pipe to EOF, delivering each chunk to onData. Returns a promise that
+  // resolves once EOF is seen, so callers (child 'close') can await full drain.
   function drainPipe(pipeId, onData) {
     globalThis.__nodert_ref?.();
-    (async () => {
+    return (async () => {
       try {
         for (;;) {
           const r = await busAsync.call("proc.pipe_read", { pipeId });
