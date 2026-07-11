@@ -323,7 +323,7 @@ pub unsafe extern "C" fn vm_shared_efd_ptr(vm_ptr: u32) -> u32 {
 
 // BusyBox (~1MB static RISC-V ELF)
 #[cfg(feature = "busybox")]
-static BUSYBOX_DATA: &[u8] = include_bytes!("../build/busybox.gz");
+static BUSYBOX_DATA: &[u8] = include_bytes!("../../../build/busybox.gz");
 
 #[cfg(not(feature = "busybox"))]
 static BUSYBOX_DATA: &[u8] = &[];
@@ -340,7 +340,7 @@ pub extern "C" fn vm_bundled_busybox_size() -> i32 {
 
 // Node.js (~52MB static RISC-V ELF)
 #[cfg(feature = "node")]
-static NODE_DATA: &[u8] = include_bytes!("../build/node.gz");
+static NODE_DATA: &[u8] = include_bytes!("../../../build/node.gz");
 
 #[cfg(not(feature = "node"))]
 static NODE_DATA: &[u8] = &[];
@@ -371,7 +371,7 @@ pub extern "C" fn vm_bundled_elf_size() -> i32 {
 // embedded as a compressed tarball. Only included with `--features devenv`.
 
 #[cfg(feature = "devenv")]
-static DEVENV_DATA: &[u8] = include_bytes!("../build/devenv.tar.gz");
+static DEVENV_DATA: &[u8] = include_bytes!("../../../build/devenv.tar.gz");
 
 #[cfg(not(feature = "devenv"))]
 static DEVENV_DATA: &[u8] = &[];

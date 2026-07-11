@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [lib]
+path = "runners/riscv/src/lib.rs"
 # `rlib` is added only so `cargo test`/`cargo nextest` can build a host test
 # harness; the shipped wasm artifact is still the `cdylib`, byte-for-byte.
 crate-type = ["cdylib", "rlib"]
