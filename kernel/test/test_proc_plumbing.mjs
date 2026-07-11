@@ -10,11 +10,11 @@
  *
  * Usage: node test/kernel/test_proc_plumbing.mjs
  */
-import { Kernel, KernelError, ERRNO } from "../../kernel/index.mjs";
-import { Pipe, PipeRegistry } from "../../kernel/proc/pipes.mjs";
-import { SpawnRouter } from "../../kernel/proc/router.mjs";
-import { BusClient } from "../../kernel/bus/client.mjs";
-import { normalizeCaps } from "../../kernel/caps/caps.mjs";
+import { Kernel, KernelError, ERRNO } from "../index.mjs";
+import { Pipe, PipeRegistry } from "../proc/pipes.mjs";
+import { SpawnRouter } from "../proc/router.mjs";
+import { BusClient } from "../bus/client.mjs";
+import { normalizeCaps } from "../caps/caps.mjs";
 
 let passed = 0;
 let failed = 0;

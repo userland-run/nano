@@ -7,7 +7,7 @@
 // immutable) and node_modules materialization by HARDLINKING from it (pnpm
 // model — shared inodes, O(entries), no copy).
 
-import { Kernel, registerBuiltinServices, materializePackages } from "../../kernel/index.mjs";
+import { Kernel, registerBuiltinServices, materializePackages } from "../index.mjs";
 import { runNode } from "../../nodert/src/host/runtime.mjs";
 
 let passed = 0, failed = 0, current = "";

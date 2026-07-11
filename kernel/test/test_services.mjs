@@ -10,9 +10,9 @@
  *
  * Usage: node test/kernel/test_services.mjs
  */
-import { Kernel, KernelError, ERRNO, registerBuiltinServices, stripTypes } from "../../kernel/index.mjs";
-import { BusClient } from "../../kernel/bus/client.mjs";
-import { normalizeCaps } from "../../kernel/caps/caps.mjs";
+import { Kernel, KernelError, ERRNO, registerBuiltinServices, stripTypes } from "../index.mjs";
+import { BusClient } from "../bus/client.mjs";
+import { normalizeCaps } from "../caps/caps.mjs";
 
 let passed = 0, failed = 0, current = "";
 function assert(c, m) { if (!c) { console.error(`  FAIL: ${current} - ${m}`); failed++; return false; } return true; }

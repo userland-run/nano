@@ -9,10 +9,10 @@
  *
  * Usage: node test/kernel/test_proc_caps.mjs
  */
-import { Kernel, KernelError, ERRNO, OP } from "../../kernel/index.mjs";
-import { ProcessTable } from "../../kernel/proc/table.mjs";
-import { capsIsSubset, checkCap, normalizeCaps } from "../../kernel/caps/caps.mjs";
-import { trustedDev, boaDefault, fromExposeConfig } from "../../kernel/caps/profiles.mjs";
+import { Kernel, KernelError, ERRNO, OP } from "../index.mjs";
+import { ProcessTable } from "../proc/table.mjs";
+import { capsIsSubset, checkCap, normalizeCaps } from "../caps/caps.mjs";
+import { trustedDev, boaDefault, fromExposeConfig } from "../caps/profiles.mjs";
 
 let passed = 0;
 let failed = 0;

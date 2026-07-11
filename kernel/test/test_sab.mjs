@@ -16,8 +16,8 @@
  */
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
-import { Kernel } from "../../kernel/index.mjs";
-import { normalizeCaps } from "../../kernel/caps/caps.mjs";
+import { Kernel } from "../index.mjs";
+import { normalizeCaps } from "../caps/caps.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -32,7 +32,7 @@ function check(cond, msg) {
   }
 }
 
-const kernelUrl = new URL("../../kernel/", import.meta.url).href;
+const kernelUrl = new URL("../", import.meta.url).href;
 
 // The worker script: hello over the async plane, then a scripted series of
 // sync calls whose results are posted back for assertion.

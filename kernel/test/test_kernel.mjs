@@ -19,7 +19,7 @@ import {
   OP,
   OP_NAMES,
   opNamespace,
-} from "../../kernel/index.mjs";
+} from "../index.mjs";
 
 let passed = 0;
 let failed = 0;

@@ -10,7 +10,7 @@
  *
  * Usage: node test/kernel/test_vfs_memfs.mjs
  */
-import { MemFS } from "../../kernel/vfs/memfs.mjs";
+import { MemFS } from "../vfs/memfs.mjs";
 
 let passed = 0;
 let failed = 0;

@@ -9,9 +9,9 @@
  *
  * Usage: node test/kernel/test_vfs_kernel.mjs
  */
-import { KernelVfs } from "../../kernel/vfs/vfs.mjs";
-import { WatchRegistry } from "../../kernel/vfs/watch.mjs";
-import { Kernel, KernelError, ERRNO } from "../../kernel/index.mjs";
+import { KernelVfs } from "../vfs/vfs.mjs";
+import { WatchRegistry } from "../vfs/watch.mjs";
+import { Kernel, KernelError, ERRNO } from "../index.mjs";
 
 let passed = 0;
 let failed = 0;

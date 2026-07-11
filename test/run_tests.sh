@@ -104,7 +104,7 @@ echo ""
 # ============================================================
 
 echo "--- Kernel Unit Tests ---"
-for kt in "$SCRIPT_DIR"/kernel/test_*.mjs; do
+for kt in "$PROJECT_ROOT"/kernel/test/test_*.mjs; do
     [ -f "$kt" ] || continue
     kt_name="kernel/$(basename "$kt" .mjs)"
     if node "$kt" 2>/dev/null; then

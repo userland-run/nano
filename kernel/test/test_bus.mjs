@@ -13,9 +13,9 @@
  *
  * Usage: node test/kernel/test_bus.mjs
  */
-import { Kernel, KernelError, ERRNO } from "../../kernel/index.mjs";
-import { BusClient } from "../../kernel/bus/client.mjs";
-import { normalizeCaps } from "../../kernel/caps/caps.mjs";
+import { Kernel, KernelError, ERRNO } from "../index.mjs";
+import { BusClient } from "../bus/client.mjs";
+import { normalizeCaps } from "../caps/caps.mjs";
 
 let passed = 0;
 let failed = 0;
