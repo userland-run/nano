@@ -2,19 +2,52 @@
 // Copyright (C) 2026 And The Next GmbH - https://userland.run
 // Part of NanoVM; dual-licensed - see LICENSE.md.
 
-// nodert/src/loader/scan.mjs — a lean ES-module specifier scanner for the
-// blob-URL loader (spec §9.2 step 2). Finds static import/export-from
-// specifier strings (to rewrite to module URLs), dynamic import() calls (to
-// route through the loader at runtime), and import.meta usage. String-aware:
-// specifiers inside strings/templates/comments/regex are never matched.
+// nodert/src/loader/scan.mjs — ES-module specifier scanner for the blob-URL
+// loader (spec §9.2 step 2). Finds static import/export-from specifiers (to
+// rewrite to module URLs), dynamic import() calls, and import.meta.
+//
+// Backed by es-module-lexer (vendored) — a battle-tested wasm parser that is
+// CORRECT on real minified bundles (template-literal interpolations with braces
+// in strings, regex/division ambiguity, escapes) where a hand-written scanner
+// drifts. Call `await initScanner()` once before `scanEsm()`; the loader does
+// this at its async entry points. The hand-written scanner below is retained
+// only for `stripStrings` (the TLA heuristic).
+
+import { init as lexerInit, parse as lexerParse } from "../../vendor/es-module-lexer/lexer.js";
+
+/** Await once; resolves when the lexer wasm is ready. Idempotent. */
+function initScanner() { return lexerInit; }
 
 /**
  * @param {string} src
  * @returns {{ statics: Array<{start:number,end:number,spec:string}>,
- *             dynamics: Array<{argStart:number,argEnd:number,spec:string|null}>,
+ *             dynamics: Array<{keywordStart:number,parenStart:number}>,
  *             hasImportMeta: boolean, hasTLA: boolean }}
  */
 function scanEsm(src) {
+  const statics = [];
+  const dynamics = [];
+  let hasImportMeta = false;
+  const [imports] = lexerParse(src);
+  for (const im of imports) {
+    if (im.d === -2) { hasImportMeta = true; continue; }
+    if (im.d === -1) {
+      // Static import/export-from: [s,e] is the specifier WITHOUT quotes, so the
+      // full quoted span is [s-1, e+1) (verified for ", ', and bare imports).
+      // ss/se bound the whole statement — used to read the import clause so a
+      // builtin facade can declare the exact names the importer requests.
+      statics.push({ start: im.s - 1, end: im.e + 1, spec: im.n ?? src.slice(im.s, im.e), clause: src.slice(im.ss, im.s - 1) });
+    } else {
+      // Dynamic import(): ss = the `import` keyword, d = the `(`.
+      dynamics.push({ keywordStart: im.ss, parenStart: im.d });
+    }
+  }
+  const hasTLA = /(^|[\n;{(])\s*await\b/.test(stripStrings(src));
+  return { statics, dynamics, hasImportMeta, hasTLA };
+}
+
+// Legacy hand-written scanner (retained only for stripStrings/hasTLA).
+function scanEsmLegacy(src) {
   const statics = [];
   const dynamics = [];
   let hasImportMeta = false;
@@ -173,4 +206,4 @@ function stripStrings(src) {
   return out;
 }
 
-export { scanEsm };
+export { scanEsm, initScanner };

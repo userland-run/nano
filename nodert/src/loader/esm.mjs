@@ -14,12 +14,13 @@
 // the SWC Kernel Service; dynamic import() routes through the loader at
 // runtime; import.meta is patched per module.
 
-import { scanEsm } from "./scan.mjs";
+import { scanEsm, initScanner } from "./scan.mjs";
 import { createModuleUrl } from "../platform.mjs";
 
 function createEsmLoader(host) {
   const revokers = [];
   const builtinFacades = new Map();
+  const builtinNames = new Map(); // builtin → Set of named imports requested by the graph
   /** @type {Map<string, string>} realpath → module URL (after build) */
   const urls = new Map();
 
@@ -83,6 +84,15 @@ function createEsmLoader(host) {
       !/(^|\n)\s*export\s/.test(source) && /(module\.exports|exports\.|require\s*\()/.test(source);
     if (isCjs) return { path, json: false, cjs: true, source, scan: { statics: [], dynamics: [], hasImportMeta: false }, deps: [] };
     const deps = scan.statics.map((s) => ({ ...resolveSpec(s.spec, path), spec: s.spec, start: s.start, end: s.end }));
+    // Record the NAMED imports requested from each builtin, so its facade can
+    // declare exactly those names (missing ones resolve to undefined → the
+    // module LINKS and only fails if the name is actually used — real apps
+    // import more of a builtin than a lean shim provides).
+    for (let i = 0; i < deps.length; i++) {
+      if (!deps[i].builtin) continue;
+      const set = builtinNames.get(deps[i].builtin) ?? (builtinNames.set(deps[i].builtin, new Set()), builtinNames.get(deps[i].builtin));
+      for (const n of namedImportsOf(scan.statics[i].clause ?? "")) set.add(n);
+    }
     return { path, json: false, cjs: false, source, scan, deps };
   }
 
@@ -226,12 +236,18 @@ function createEsmLoader(host) {
 
   function builtinFacade(name) {
     if (builtinFacades.has(name)) return builtinFacades.get(name);
-    let named = [];
+    let named = new Set();
     try {
       const mod = globalThis.__nodert_require(name);
       const dflt = mod && mod.__esModule && mod.default !== undefined ? mod.default : mod;
-      named = Object.keys(dflt ?? {}).filter((k) => /^[A-Za-z_$][\w$]*$/.test(k) && k !== "default");
+      for (const k of Object.keys(dflt ?? {})) if (/^[A-Za-z_$][\w$]*$/.test(k) && k !== "default") named.add(k);
     } catch { /* default only */ }
+    // Also declare the names the graph actually imports from this builtin, even
+    // if the lean shim lacks them — they resolve to undefined so the module
+    // LINKS (only a real *use* would then fail). Avoids "does not provide an
+    // export named X" for real apps that import more than the shim provides.
+    for (const k of builtinNames.get(name.replace(/^node:/, "")) ?? []) if (k !== "default" && /^[A-Za-z_$][\w$]*$/.test(k)) named.add(k);
+    named = [...named];
     const src =
       `const m0 = globalThis.__nodert_require(${JSON.stringify(name)});\n` +
       `const m = (m0 && m0.__esModule && m0.default !== undefined) ? m0.default : m0;\n` +
@@ -244,11 +260,12 @@ function createEsmLoader(host) {
   }
 
   async function run(entryPath) {
-    globalThis.__nodert_require = globalThis.__nodert_require;
+    await initScanner(); // the specifier lexer (wasm) must be ready before scanning
     const url = await buildFrom(host.realpath(entryPath));
     return import(url);
   }
   async function evalModule(source, virtualPath = "/[eval].mjs") {
+    await initScanner();
     const src = /\.ts$|\.mts$/.test(virtualPath) ? host.stripTypes(source) : source;
     const scan = scanEsm(src);
     const deps = scan.statics.map((s) => ({ ...resolveSpec(s.spec, virtualPath), spec: s.spec, start: s.start, end: s.end }));
@@ -290,6 +307,15 @@ function replaceOutsideStrings(src, re, rep) {
     i = j;
   }
   return out;
+}
+
+// Parse the imported (source) names from an import/export clause, e.g.
+// `import{createRequire as x, readFile}from` → ["createRequire", "readFile"].
+// Only the `{ … }` named group matters (default/namespace never link-fail).
+function namedImportsOf(clause) {
+  const m = /\{([^}]*)\}/.exec(clause);
+  if (!m) return [];
+  return m[1].split(",").map((s) => s.trim().split(/\s+as\s+/)[0].trim()).filter((n) => /^[A-Za-z_$][\w$]*$/.test(n));
 }
 
 function dirname(p) { const i = p.lastIndexOf("/"); return i <= 0 ? "/" : p.slice(0, i); }

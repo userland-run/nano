@@ -12,9 +12,13 @@
 const isNode = typeof process !== "undefined" && process.versions?.node;
 
 let nodeWorker = null;
+let _node = null;
 if (isNode) {
   nodeWorker = await import("node:worker_threads");
+  const [fs, os, url] = await Promise.all([import("node:fs"), import("node:os"), import("node:url")]);
+  _node = { fs, url, tmpdir: os.tmpdir() };
 }
+let _tmpSeq = 0;
 
 /**
  * Spawn a worker running `entryUrl` (a data: or file: URL). Returns a handle
@@ -75,6 +79,15 @@ function createModuleUrl(source) {
   if (!isNode && typeof URL !== "undefined" && URL.createObjectURL) {
     const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
     return { url, revoke: () => URL.revokeObjectURL(url) };
+  }
+  // Node: data: URLs are simplest but blow up for large modules (a 16MB bundle
+  // → a ~48MB URL the ESM loader rejects). Spill big sources to a temp .mjs and
+  // import via a file: URL; small ones stay on fast data: URLs. (The browser
+  // uses blob: URLs above, which have no such size limit.)
+  if (isNode && _node && source.length > 128 * 1024) {
+    const p = `${_node.tmpdir}/nodert-${process.pid}-${_tmpSeq++}.mjs`;
+    _node.fs.writeFileSync(p, source);
+    return { url: _node.url.pathToFileURL(p).href, revoke: () => { try { _node.fs.unlinkSync(p); } catch {} } };
   }
   const url = "data:text/javascript;charset=utf-8," + encodeURIComponent(source);
   return { url, revoke: () => {} };

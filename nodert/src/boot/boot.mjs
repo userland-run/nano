@@ -559,6 +559,32 @@ async function boot(ctx) {
         format: (u) => (u instanceof globalThis.URL ? u.href : String(u)),
         domainToASCII: (d) => d, domainToUnicode: (d) => d,
       });
+      // node:module — createRequire (real apps bridge to CJS with it) + the
+      // builtin-module metadata. createRequire(path) returns a require bound to
+      // that file's dir, backed by the CJS loader.
+      case "module": case "node:module": return () => {
+        const createRequire = (filename) => {
+          const dir = String(filename).replace(/^file:\/\//, "").replace(/\/[^/]*$/, "") || "/";
+          const req = (spec) => requireModule(spec, dir);
+          req.resolve = (spec) => resolveUserModule(spec, dir) ?? spec;
+          req.cache = {};
+          req.main = undefined;
+          return req;
+        };
+        const ids = builtinIds();
+        function Module() {}
+        Module.createRequire = createRequire;
+        Module.builtinModules = ids;
+        Module.isBuiltin = (id) => { const n = String(id).replace(/^node:/, ""); return hasModule(n) || isNodeBuiltinName(n); };
+        Module._nodeModulePaths = () => [];
+        Module.syncBuiltinESMExports = () => {};
+        Module.register = () => {};
+        Module.enableCompileCache = () => ({ status: 0 });
+        Module.getCompileCacheDir = () => null;
+        Module.flushCompileCache = () => {};
+        Module.wrap = (s) => `(function (exports, require, module, __filename, __dirname) { ${s}\n});`;
+        return { createRequire, Module, default: Module, builtinModules: ids, isBuiltin: Module.isBuiltin, register: Module.register, enableCompileCache: Module.enableCompileCache, SourceMap: class {}, findSourceMap: () => undefined };
+      };
       // The bootstrap spine is not a requirable module (it declares
       // internalBinding and would clash with the wrapper param). Upstream
       // modules require it only for BuiltinModule metadata — a minimal shim.
@@ -664,6 +690,14 @@ async function boot(ctx) {
       exec: (command, options, callback) => {
         const cb = typeof options === "function" ? options : callback;
         queueMicrotask(() => { try { const out = execSync(command, typeof options === "object" ? options : {}); cb?.(null, out.toString(), ""); } catch (e) { cb?.(e, e.stdout?.toString() ?? "", e.stderr ?? ""); } });
+        return makeChildHandle({ pid: 0 });
+      },
+      // execFile(file, args?, options?, callback) — async form of execFileSync.
+      execFile: (file, args, options, callback) => {
+        const a = Array.isArray(args) ? args : [];
+        const cb = typeof args === "function" ? args : (typeof options === "function" ? options : callback);
+        const opts = typeof options === "object" ? options : (typeof args === "object" && !Array.isArray(args) ? args : {});
+        queueMicrotask(() => { try { const out = execFileSync(file, a, opts); cb?.(null, out.toString?.() ?? out, ""); } catch (e) { cb?.(e, e.stdout?.toString?.() ?? "", e.stderr ?? ""); } });
         return makeChildHandle({ pid: 0 });
       },
       // fork() → a node child with an IPC channel (process.send / 'message').
