@@ -12,7 +12,7 @@
  *
  * Usage: node test/test_boa.mjs [path/to/boa.wasm]
  */
-import { BoaRuntime, ScriptError } from "../container/boa.mjs";
+import { BoaRuntime, ScriptError } from "../runners/boa/host/boa.mjs";
 
 const WASM = process.argv[2] || "wasm/boa.wasm";
 

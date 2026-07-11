@@ -13,7 +13,7 @@ BUILD_STD = CARGO_UNSTABLE_BUILD_STD=core,alloc,panic_abort
 # memory, so it must NOT inherit nano's .cargo/config.toml rustflags
 # (--shared-memory/--import-memory). RUSTFLAGS via the environment fully
 # overrides config-file rustflags, which is the only clean way to do that.
-BOA_DIR = boa
+BOA_DIR = runners/boa/crate
 BOA_RUSTFLAGS = --cfg getrandom_backend="custom"
 # wasm-opt needs every wasm feature rustc emits enabled, or it rejects the input.
 WASM_OPT_FEATURES = --enable-bulk-memory --enable-sign-ext --enable-nontrapping-float-to-int \
