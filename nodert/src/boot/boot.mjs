@@ -206,6 +206,7 @@ async function boot(ctx) {
 
   // Timers wired to the loop.
   installTimers();
+  installFetch();
 
   // Loop-handle ref API for long-lived async readers (sockets, worker ports,
   // watchers) so they keep the process alive like a libuv handle (§10.4).
@@ -407,6 +408,47 @@ async function boot(ctx) {
     globalThis.clearImmediate = (t) => t?.__imm && loop.clearImmediate(t.__imm);
     globalThis.queueMicrotask = globalThis.queueMicrotask ?? ((cb) => Promise.resolve().then(cb));
   }
+
+  // Route the guest's global fetch() through the Kernel fetch bridge (async
+  // plane), the way the browser tab's egress is brokered: real URLs go via the
+  // host fetch/CORS proxy, and nanoinfer.internal is handed to the in-page LLM
+  // bridge. So an app (opencode's AI SDK) points straight at nanoinfer.internal
+  // — no loopback proxy needed — and its outbound fetch reaches the model.
+  // Streaming-capable: the Response body is a ReadableStream fed from the bridge
+  // (SSE token streaming works). ref/unref keeps the loop alive across the call.
+  function installFetch() {
+    const enc = new TextEncoder(), dec = new TextDecoder();
+    globalThis.fetch = async (input, init = {}) => {
+      const url = typeof input === "string" ? input : (input?.url ?? String(input));
+      const method = (init.method ?? (typeof input === "object" ? input?.method : "GET") ?? "GET").toUpperCase();
+      const headers = {};
+      const h = init.headers ?? (typeof input === "object" ? input?.headers : null);
+      if (h) { if (typeof h.forEach === "function") h.forEach((v, k) => { headers[k] = v; }); else if (Array.isArray(h)) for (const [k, v] of h) headers[k] = v; else Object.assign(headers, h); }
+      let body = init.body ?? "";
+      if (body && typeof body !== "string") body = body instanceof Uint8Array ? dec.decode(body) : (body.buffer ? dec.decode(new Uint8Array(body.buffer)) : String(body));
+      globalThis.__nodert_ref?.();
+      let streamId;
+      try { ({ streamId } = await busAsync.call("net.fetch_open", { method, url, headers, body })); }
+      finally { globalThis.__nodert_unref?.(); }
+      // Read the framed response head, then stream the body from the bridge.
+      let buf = new Uint8Array(0), headEnd = -1;
+      const pull1 = async () => { globalThis.__nodert_ref?.(); try { return await busAsync.call("net.fetch_read", { streamId, len: 1 << 16 }); } finally { globalThis.__nodert_unref?.(); } };
+      while (headEnd < 0) { const r = await pull1(); if (r.eof) break; const chunk = new Uint8Array(r.data); const nb = new Uint8Array(buf.length + chunk.length); nb.set(buf); nb.set(chunk, buf.length); buf = nb; headEnd = indexOfCRLF2(buf); }
+      const headText = dec.decode(buf.subarray(0, headEnd < 0 ? buf.length : headEnd));
+      const lines = headText.split("\r\n");
+      const m = /^HTTP\/\d\.\d\s+(\d+)\s*(.*)$/.exec(lines[0] ?? "") ?? [null, "502", "Bad Gateway"];
+      const status = Number(m[1]) || 502, statusText = m[2] || "";
+      const resHeaders = new Headers();
+      for (let i = 1; i < lines.length; i++) { const c = lines[i].indexOf(":"); if (c > 0) try { resHeaders.set(lines[i].slice(0, c).trim(), lines[i].slice(c + 1).trim()); } catch {} }
+      const rest = headEnd < 0 ? new Uint8Array(0) : buf.subarray(headEnd + 4);
+      const stream = new ReadableStream({
+        start(c) { if (rest.length) c.enqueue(rest); },
+        async pull(c) { const r = await pull1(); if (r.eof || !r.bytes) { c.close(); return; } c.enqueue(new Uint8Array(r.data)); },
+      });
+      return new Response(status === 204 || status === 304 ? null : stream, { status, statusText, headers: resHeaders });
+    };
+  }
+  function indexOfCRLF2(u8) { for (let i = 0; i + 3 < u8.length; i++) if (u8[i] === 13 && u8[i + 1] === 10 && u8[i + 2] === 13 && u8[i + 3] === 10) return i; return -1; }
   function wrapTimer(timer) {
     const h = { __timer: timer, ref() { loop.refTimer(timer); return h; }, unref() { loop.unrefTimer(timer); return h; }, hasRef: () => timer.ref, refresh() { timer.due = loop.now() + timer.ms; return h; }, [Symbol.toPrimitive]: () => timer.__id ?? (timer.__id = ++wrapTimer._n) };
     return h;
