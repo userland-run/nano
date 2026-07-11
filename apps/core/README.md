@@ -26,7 +26,23 @@ apps/core/
   test/        difftest vs the BusyBox oracle
 ```
 
+## Layout so far
+
+```
+apps/core/
+  rg.wasm            first artifact — a minimal `rg --files` (wasm32-wasip1)
+  build/rg/          its Rust crate (std-only; `make build-rg`)
+```
+
 ## Status
 
-Skeleton. First artifact: **ripgrep → wasm** (unblocks opencode's `rg --files`),
-registered via the W-3 WASI service runner with a router pin `rg → wasm`.
+**First artifact shipped: `rg.wasm`** — a minimal `rg --files` (recursive
+enumeration, ripgrep's hidden/.git skip, `--glob=!` exclusions), the subset the
+opencode agent needs before its first model turn. It runs on `runners/wasm` via
+the **wasm-app runner** (`runners/wasm/src/wasm-app.mjs`): a registered name is
+pinned so `rg …` routes to the wasm tier and sees its spawn cwd as `.` (this is
+what forced implementing the shim's `fd_readdir`). `make build-rg` rebuilds it;
+`runners/wasm/test/wasm-app.mjs` covers it.
+
+**Next:** search mode via the upstream regex/`grep` crate (where compiling
+upstream beats reimplementing), then `uutils/coreutils` → wasm.

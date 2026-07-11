@@ -201,6 +201,12 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "WASI service runner"
     fi
+    # First apps/core artifact: rg --files on wasm32-wasip1 (fd_readdir + wasm-app runner)
+    if node "$PROJECT_ROOT/runners/wasm/test/wasm-app.mjs" 2>/dev/null; then
+        ok "wasm-app runner (apps/core rg --files, fd_readdir)"
+    else
+        fail "wasm-app runner (rg)"
+    fi
     # M2 ESM blob-URL loader (§9.2)
     if node "$NODERT_DIR/test/esm.mjs" 2>/dev/null; then
         ok "nodert ESM loader (import/export/TLA/dynamic/cycles/TS via SWC)"

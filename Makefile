@@ -1,4 +1,4 @@
-.PHONY: build build-full build-minimal build-min build-trace build-busybox build-boa devenv clean serve test test-build test-devenv test-boa test-boa-vm test-trace
+.PHONY: build build-full build-minimal build-min build-trace build-busybox build-boa build-rg devenv clean serve test test-build test-devenv test-boa test-boa-vm test-trace
 
 WASM_TARGET = wasm32-unknown-unknown
 OUT_DIR = wasm
@@ -83,6 +83,14 @@ build-boa:
 		echo "  (wasm-opt not found; skipping size optimization)"; \
 	fi
 	@ls -lh $(OUT_DIR)/boa.wasm | awk '{print "boa.wasm:", $$5}'
+
+# Core apps (apps/core): tools compiled to wasm32-wasip1 for the wasm runner.
+# rg = a minimal `rg --files` (recursive enumeration; opencode's turn blocker).
+build-rg:
+	rustup target add wasm32-wasip1 2>/dev/null || true
+	cargo build --release --target wasm32-wasip1 --manifest-path apps/core/build/rg/Cargo.toml
+	cp apps/core/build/rg/target/wasm32-wasip1/release/rg.wasm apps/core/rg.wasm
+	@ls -lh apps/core/rg.wasm | awk '{print "rg.wasm:", $$5}'
 
 # Build the devenv tarball (Docker, ~60-90 min first time, cached after)
 devenv:

@@ -260,7 +260,48 @@ function createWasiShim(ctx) {
       if (res.readonly) return WASI_EACCES;
       try { sync("fs.unlink", { path: res.hostPath }); return WASI_ESUCCESS; } catch { return WASI_ENOENT; }
     },
-    fd_readdir: () => WASI_ENOTSUP, // W-2 refinement
+    // fd_readdir(fd, buf, buf_len, cookie:u64, bufused) — enumerate a directory
+    // fd's entries as WASI dirents. Enough for directory-walking tools (rg/ls/
+    // find). The cookie is an index into a per-fd snapshot; d_next carries the
+    // resume cookie, so a caller re-reads with a bigger buffer until bufused <
+    // buf_len. "." and ".." are emitted first (POSIX convention).
+    fd_readdir: (fd, bufPtr, bufLen, cookie, bufusedPtr) => {
+      const e = fds.get(fd);
+      if (!e || (e.type !== "dir" && e.type !== "preopen")) return WASI_EBADF;
+      if (!e._dirents) {
+        let names = [];
+        try { names = sync("fs.readdir", { path: e.hostPath }).names ?? []; } catch { names = []; }
+        const base = e.hostPath === "/" ? "" : e.hostPath;
+        e._dirents = [
+          { name: ".", type: WASI_FILETYPE_DIRECTORY, ino: 0 },
+          { name: "..", type: WASI_FILETYPE_DIRECTORY, ino: 0 },
+        ];
+        for (const nm of names) {
+          const st = tryStat(base + "/" + nm);
+          const type = st?.isDir ? WASI_FILETYPE_DIRECTORY : st?.isSymlink ? WASI_FILETYPE_SYMBOLIC_LINK : WASI_FILETYPE_REGULAR_FILE;
+          e._dirents.push({ name: nm, type, ino: st?.ino ?? 0 });
+        }
+      }
+      const dv = view(), mem = bytes();
+      const DIRENT = 24; // d_next(u64) d_ino(u64) d_namlen(u32) d_type(u8)+pad
+      let offset = 0;
+      for (let i = Number(cookie); i < e._dirents.length; i++) {
+        if (offset + DIRENT > bufLen) { offset = bufLen; break; }
+        const ent = e._dirents[i];
+        const nameBytes = encoder.encode(ent.name);
+        dv.setBigUint64(bufPtr + offset, BigInt(i + 1), true);
+        dv.setBigUint64(bufPtr + offset + 8, BigInt(ent.ino), true);
+        dv.setUint32(bufPtr + offset + 16, nameBytes.length, true);
+        dv.setUint8(bufPtr + offset + 20, ent.type);
+        offset += DIRENT;
+        const copyLen = Math.min(nameBytes.length, bufLen - offset);
+        mem.set(nameBytes.subarray(0, copyLen), bufPtr + offset);
+        offset += copyLen;
+        if (copyLen < nameBytes.length) { offset = bufLen; break; }
+      }
+      dv.setUint32(bufusedPtr, offset, true);
+      return WASI_ESUCCESS;
+    },
     poll_oneoff: (subsPtr, eventsPtr, nsubs, neventsPtr) => { view().setUint32(neventsPtr, 0, true); return WASI_ESUCCESS; },
     sched_yield: () => WASI_ESUCCESS,
     proc_exit: (code) => { onExit(code); throw new WasiExit(code); },

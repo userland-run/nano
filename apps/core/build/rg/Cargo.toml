@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+[package]
+name = "rg"
+version = "0.1.0"
+edition = "2021"
+
+# Self-contained: keep this crate out of nano's package manifest one dir up.
+[workspace]
+
+[[bin]]
+name = "rg"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true
