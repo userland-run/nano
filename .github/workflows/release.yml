@@ -34,9 +34,9 @@ jobs:
         with:
           node-version: 20
 
-      # Git LFS pulls the real images/busybox the busybox runtime bundles.
+      # Git LFS pulls the real runners/riscv/images/busybox the busybox runtime bundles.
       - name: Pull LFS binaries
-        run: git lfs pull --include=images/busybox || true
+        run: git lfs pull --include=runners/riscv/images/busybox || true
 
       # nano.min.wasm     — plain runtime: pass/fail + golden output + budgets.
       # nano.trace.wasm   — same emulator + per-syscall debug_log(0x0A) for coverage.

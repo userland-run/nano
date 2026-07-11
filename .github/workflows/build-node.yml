@@ -2,7 +2,7 @@
 # Copyright (C) 2026 And The Next GmbH - https://userland.run
 #
 # Cross-compile the RV64 (musl, small-icu) Node.js guest in CI — the build needs
-# Docker, which GitHub runners have. Produces images/node and uploads it to the
+# Docker, which GitHub runners have. Produces runners/riscv/images/node and uploads it to the
 # v0.1.0 release, where the catalog `node` recipe sources it. Manual trigger:
 #   gh workflow run build-node.yml -R userland-run/nano
 # It is a long build (musl cross-toolchain + Node from source, ~1-2h).
@@ -12,11 +12,11 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to upload images/node to"
+        description: "Release tag to upload runners/riscv/images/node to"
         default: "v0.1.0"
 
 permissions:
-  contents: write   # upload images/node to the release
+  contents: write   # upload runners/riscv/images/node to the release
 
 jobs:
   build-node:
@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # build.sh does the Docker cross-compile (Dockerfile pins node v25.4.0 +
-      # --with-intl=small-icu) and extracts the static ELF to images/node.
+      # --with-intl=small-icu) and extracts the static ELF to runners/riscv/images/node.
       # Build via buildx with the GitHub Actions layer cache. The Dockerfile's
       # slow, deterministic stages — the GCC riscv64 cross-toolchain (musl-cross-
       # make, ~1.5-2h) and the linux headers — are cached, so re-runs and future
@@ -44,13 +44,13 @@ jobs:
 
       - name: Stage + inspect the artifact
         run: |
-          mkdir -p images && cp node-out/node images/node
-          file images/node && ls -lh images/node
+          mkdir -p runners/riscv/images && cp node-out/node runners/riscv/images/node
+          file runners/riscv/images/node && ls -lh runners/riscv/images/node
 
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ github.event.inputs.release_tag }}"
-          gh release upload "$tag" images/node -R "${{ github.repository }}" --clobber
-          echo "uploaded images/node → release $tag"
+          gh release upload "$tag" runners/riscv/images/node -R "${{ github.repository }}" --clobber
+          echo "uploaded runners/riscv/images/node → release $tag"
