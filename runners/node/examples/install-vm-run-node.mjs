@@ -19,7 +19,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Kernel, registerBuiltinServices } from "../../../kernel/index.mjs";
-import { NanoVM } from "../../../container/nanovm.mjs";
+import { NanoVM } from "../../riscv/host/nanovm.mjs";
 import { createVmDelegate } from "../src/host/vm-delegate.mjs";
 import { registerNodertDelegate } from "../src/host/delegate.mjs";
 import { createNodeEngine } from "../src/host/engine.mjs";

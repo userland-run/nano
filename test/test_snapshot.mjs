@@ -12,7 +12,7 @@
  *   node test/test_snapshot.mjs --vm               # Include VM round-trip tests (needs wasm/nano.wasm + busybox)
  *   node test/test_snapshot.mjs --node             # Include Node.js warm-start test (needs bundled WASM)
  */
-import { MemFS } from "../container/memfs.mjs";
+import { MemFS } from "../runners/riscv/host/memfs.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -191,7 +191,7 @@ if (runVM) {
   console.log("\n=== VM Snapshot Tests ===");
 
   // Dynamic import to avoid failure when WASM not available
-  const { NanoVM } = await import("../container/nanovm.mjs");
+  const { NanoVM } = await import("../runners/riscv/host/nanovm.mjs");
   const { readFileSync, existsSync } = await import("fs");
   const { resolve, dirname } = await import("path");
   const { fileURLToPath } = await import("url");
@@ -238,7 +238,7 @@ if (runVM) {
 if (process.argv.includes("--node")) {
   console.log("\n=== Node.js Warm-Start Snapshot Test ===");
 
-  const { NanoVM } = await import("../container/nanovm.mjs");
+  const { NanoVM } = await import("../runners/riscv/host/nanovm.mjs");
   const { readFileSync, existsSync } = await import("fs");
   const { resolve, dirname } = await import("path");
   const { fileURLToPath } = await import("url");

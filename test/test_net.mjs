@@ -19,7 +19,7 @@
  *
  * Usage: node test/test_net.mjs
  */
-import { NanoVM } from "../container/nanovm.mjs";
+import { NanoVM } from "../runners/riscv/host/nanovm.mjs";
 
 let passed = 0;
 let failed = 0;

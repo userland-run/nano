@@ -13,7 +13,7 @@
  */
 
 import { MemFS } from "./memfs.mjs";
-import { Kernel, FetchBridge } from "../kernel/index.mjs";
+import { Kernel, FetchBridge } from "../../../kernel/index.mjs";
 
 // ============================================================
 // VM struct constants (must match src/types.rs)
@@ -457,7 +457,7 @@ class NanoVM {
    * @param {Object} [opts.env] - read-only key/value bag injected as `<global>.env`
    * @param {Object} [opts.limits] - { loopIterations, recursion }
    * @param {number} [opts.timeoutMs] - host watchdog
-   * @returns {Promise<import("./boa.mjs").BoaEngine>}
+   * @returns {Promise<import("../../../container/boa.mjs").BoaEngine>}
    */
   async scripting(opts = {}) {
     const wasm = opts.wasm || this._boaWasm;
@@ -465,7 +465,7 @@ class NanoVM {
       throw new Error("NanoVM.scripting: provide boa.wasm via opts.wasm or NanoVM.create({ boaWasm })");
     }
     if (!this._boa) {
-      const { BoaRuntime } = await import("./boa.mjs");
+      const { BoaRuntime } = await import("../../../container/boa.mjs");
       this._boa = await BoaRuntime.load(wasm);
     }
     return this._boa.createEngine({ host: this._scriptingHost(), ...opts });

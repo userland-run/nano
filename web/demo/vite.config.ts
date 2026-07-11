@@ -7,7 +7,7 @@ import macros from "unplugin-parcel-macros";
 import react from "@vitejs/plugin-react";
 import path from "path";
 
-const containerDir = path.resolve(__dirname, "../../container");
+const containerDir = path.resolve(__dirname, "../../runners/riscv/host");
 // The catalog client (Catalog/installer) lives in the SDK; the demo installs
 // node + the toolchain from the catalog at boot now that nano.wasm is slim.
 const sdkDist = path.resolve(__dirname, "../../../sdk/dist/index.js");

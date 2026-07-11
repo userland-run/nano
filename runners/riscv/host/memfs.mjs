@@ -7,4 +7,4 @@
 // import path working for the terminal (@container alias), the SDK vendor
 // tree, and the web demo.
 
-export { MemFS, FSNode } from "../kernel/vfs/memfs.mjs";
+export { MemFS, FSNode } from "../../../kernel/vfs/memfs.mjs";

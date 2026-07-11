@@ -29,7 +29,7 @@ if (!existsSync(wasmPath) || !existsSync(busyboxPath)) {
   process.exit(0);
 }
 
-const { NanoVM } = await import("../../../container/nanovm.mjs");
+const { NanoVM } = await import("../../riscv/host/nanovm.mjs");
 
 let passed = 0, failed = 0;
 

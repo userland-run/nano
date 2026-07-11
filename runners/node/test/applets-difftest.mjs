@@ -21,7 +21,7 @@ const wasmPath = join(here, "..", "..", "wasm", "nano.wasm");
 const busyboxPath = join(here, "..", "..", "images", "busybox");
 if (!existsSync(busyboxPath)) { console.log("  SKIP: applet difftest (images/busybox not present)"); process.exit(0); }
 
-const { NanoVM } = await import("../../../container/nanovm.mjs");
+const { NanoVM } = await import("../../riscv/host/nanovm.mjs");
 
 const kernel = new Kernel();
 await registerBuiltinServices(kernel);
