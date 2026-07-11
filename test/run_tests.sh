@@ -120,7 +120,7 @@ echo ""
 # ============================================================
 
 echo "--- nodert Tier (host engine) ---"
-NODERT_DIR="$PROJECT_ROOT/nodert"
+NODERT_DIR="$PROJECT_ROOT/runners/node"
 if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     if node "$NODERT_DIR/test/smoke.mjs" 2>/dev/null; then
         ok "nodert smoke (14 programs run on the host engine)"
@@ -237,7 +237,7 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
         skip "real-VM cross-tier + applet difftest" "images/busybox not present"
     fi
 else
-    skip "nodert tier" "vendored node-lib bundle missing - run 'node nodert/tools/vendor-node-lib.mjs'"
+    skip "nodert tier" "vendored node-lib bundle missing - run 'node runners/node/tools/vendor-node-lib.mjs'"
 fi
 echo ""
 

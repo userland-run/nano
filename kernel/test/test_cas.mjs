@@ -8,7 +8,7 @@
 // model — shared inodes, O(entries), no copy).
 
 import { Kernel, registerBuiltinServices, materializePackages } from "../index.mjs";
-import { runNode } from "../../nodert/src/host/runtime.mjs";
+import { runNode } from "../../runners/node/src/host/runtime.mjs";
 
 let passed = 0, failed = 0, current = "";
 function assert(c, m) { if (!c) { console.error(`  FAIL: ${current} - ${m}`); failed++; return false; } return true; }
