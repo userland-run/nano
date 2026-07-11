@@ -745,14 +745,23 @@ async function boot(ctx) {
       prepare(sql) {
         const session = this._session;
         const query = (params) => sync("svc.invoke", { service: "duckdb", sessionId: session, method: "query", payload: { sql, params } }).result.rows ?? [];
+        // node:sqlite's setReturnArrays(true) makes all()/get() return each row as
+        // a positional array (column order) instead of an object. Real drivers
+        // (Drizzle's node:sqlite driver) rely on this and map by index — so a
+        // no-op returning objects makes them read row[0] → undefined → a bogus
+        // JSON.parse(undefined). The backend hands us objects with keys in
+        // column order (JSON preserves it), so Object.values gives the array.
+        let returnArrays = false;
+        const shape = (rows) => returnArrays ? rows.map((r) => (r && typeof r === "object" && !Array.isArray(r) ? Object.values(r) : r)) : rows;
         const stmt = {
-          all: (...params) => query(params),
-          get: (...params) => query(params)[0] ?? undefined,
+          all: (...params) => shape(query(params)),
+          get: (...params) => shape(query(params))[0] ?? undefined,
           run: (...params) => { sync("svc.invoke", { service: "duckdb", sessionId: session, method: "exec", payload: { sql, params } }); return { changes: 0, lastInsertRowid: 0 }; },
-          iterate: function* (...params) { yield* query(params); },
-          [Symbol.iterator]: function* () { yield* query([]); },
-          // node:sqlite Statement config setters (no-ops here) — chainable.
-          setReadBigInts: () => stmt, setAllowBareNamedParameters: () => stmt, setAllowUnknownNamedParameters: () => stmt, setReturnArrays: () => stmt,
+          iterate: function* (...params) { yield* shape(query(params)); },
+          [Symbol.iterator]: function* () { yield* shape(query([])); },
+          setReturnArrays: (v = true) => { returnArrays = v !== false; return stmt; },
+          // Other node:sqlite Statement config setters (no-ops) — chainable.
+          setReadBigInts: () => stmt, setAllowBareNamedParameters: () => stmt, setAllowUnknownNamedParameters: () => stmt,
           finalize: () => {}, columns: () => [],
           get sourceSQL() { return sql; }, get expandedSQL() { return sql; },
         };
