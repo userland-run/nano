@@ -1,6 +1,9 @@
 # Host API Reference
 
-NanoVM communicates with the browser through a minimal set of WASM imports and exports.
+> This is the **RISC-V runner's** WASM ↔ JS boundary — one of NanoVM's four execution tiers.
+> See [Architecture](architecture.md) for how the runners fit together.
+
+The RISC-V runner communicates with the browser through a minimal set of WASM imports and exports.
 
 ## WASM Imports (JS → WASM)
 

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+[package]
+name = "photon"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "photon"
+path = "src/main.rs"
+
+[dependencies]
+# Pure-Rust image codecs + ops — compile cleanly to wasm32-wasip1 (no rayon:
+# default-features off keeps the parallel feature out so it stays single-threaded).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1

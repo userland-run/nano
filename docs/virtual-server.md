@@ -1,5 +1,8 @@
 # Virtual Server
 
+> The virtual server belongs to the **RISC-V runner** — one of NanoVM's four execution tiers.
+> See [Architecture](architecture.md) for how the runners fit together.
+
 The virtual server bridges HTTP requests from the browser into the VM's internal socket layer, allowing Node.js HTTP servers running inside the emulator to serve pages in a preview iframe.
 
 ## Overview
@@ -33,7 +36,7 @@ Preview iframe                Service Worker              Main page
 
 ## WASM Exports
 
-Three exports in `src/exports.rs` provide the low-level socket injection:
+Three exports in `runners/riscv/src/exports.rs` provide the low-level socket injection:
 
 ### `vm_inject_connection(vm_ptr, port, req_ptr, req_len) -> conn_id`
 
@@ -60,7 +63,7 @@ Marks both sides as `SOCK_SHUTDOWN` so the server sees EOF.
 
 ## JS Implementation
 
-### VirtualServer class (`container/nanovm.mjs`)
+### VirtualServer class (`runners/riscv/host/nanovm.mjs`)
 
 ```js
 class VirtualServer {
@@ -113,7 +116,7 @@ Sub-requests from the iframe (e.g., `<script src="/app.js">`) are also intercept
 
 ## Socket Internals
 
-The socket system in `src/syscall.rs` uses a static array of 32 socket slots:
+The socket system in `runners/riscv/src/syscall.rs` uses a static array of 32 socket slots:
 
 ```rust
 struct SocketSlot {

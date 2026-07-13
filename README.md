@@ -19,14 +19,15 @@ NanoVM emulates an RV64GC RISC-V CPU with ~80 Linux syscalls, enough to run:
 
 Everything runs inside a single WASM module. The emulator handles memory management (brk/mmap), file I/O (via an in-memory POSIX filesystem), sockets, epoll, timerfds, futex-based threading, and ELF loading.
 
-The default build is **slim** (~2.4 MB, BusyBox only): Node.js and the dev tools are not embedded — they
-are installed on demand from the signed [app catalog](https://github.com/userland-run/catalog) at
-runtime. A fully-bundled build (`make build-full`, ~68 MB) embeds BusyBox + Node.js + devenv for offline use.
+The default build is **slim** (~2.3 MB, a bare emulator with no bundled binaries): BusyBox, Node.js, and
+the dev tools are not embedded — they install on demand from the signed
+[app catalog](https://github.com/userland-run/catalog) into the guest VFS at runtime. A fully-bundled
+build (`make build-full`, ~68 MB) embeds BusyBox + Node.js + devenv for offline use.
 
 ## Quick start
 
 ```bash
-# Build the WASM module (~585KB without bundled binaries)
+# Build the WASM module (~2.3MB slim default, no bundled binaries)
 make build
 
 # Run tests
@@ -48,7 +49,7 @@ NanoVM follows Fabrice Bellard's approach to high-performance WASM interpreters:
 - **Minimal host boundary** — 5 WASM imports, ~30 exports. Filesystem I/O goes through a shared-memory protocol, not per-instruction callbacks.
 - **Cooperative threading** — clone/futex-based multithreading with context switching at syscall boundaries.
 
-The WASM binary is ~585KB without bundled binaries, or ~68MB with BusyBox + Node.js + devenv embedded.
+The WASM binary is ~2.3MB for the slim default (no bundled binaries), or ~68MB with BusyBox + Node.js + devenv embedded (`make build-full`).
 
 ## Project structure
 
@@ -80,7 +81,8 @@ syscalls, host API, networking, architecture, performance, build, and the comple
 
 The source pages also live in this repo under `docs/`:
 
-- [Architecture](docs/architecture.md) — Design principles, memory layout, execution model, VM struct
+- [Architecture](docs/architecture.md) — The platform: kernel + peer runners (riscv/node/wasm/boa) + apps, and the dependency rule
+- [RISC-V Runner](docs/riscv-runner.md) — Emulator internals: interpreter, memory layout, VM struct, threading, source map
 - [Syscalls](docs/syscalls.md) — Complete syscall reference with handling modes
 - [Host API](docs/host-api.md) — WASM imports/exports and FS_PENDING protocol
 - [Virtual Server](docs/virtual-server.md) — HTTP request injection for the preview iframe
@@ -93,7 +95,7 @@ repos that turn the raw VM into a product:
 
 | Repo | What it is |
 | ---- | ---------- |
-| **[nano](https://github.com/userland-run/nano)** | The RV64GC → WASM emulator core — **this repo** |
+| **[nano](https://github.com/userland-run/nano)** | The multi-runner platform — RV64GC emulator core + node/wasm/boa runners — **this repo** |
 | [sdk](https://github.com/userland-run/sdk) | `@userland-run/nano-sdk` — typed TypeScript SDK that drives the VM (code / terminal / serve / scripting / worker) |
 | [terminal](https://github.com/userland-run/terminal) | `<nano-terminal>` Shadow-DOM web component — the terminal UI, consumed via the SDK |
 | [catalog](https://github.com/userland-run/catalog) | Signed, content-addressed app marketplace (node, typescript, eslint, prettier, …) installed on demand |

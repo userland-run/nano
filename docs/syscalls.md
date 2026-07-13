@@ -1,6 +1,9 @@
 # Syscall Reference
 
-NanoVM implements a Linux RISC-V userland syscall interface. Syscalls are dispatched in `src/syscall.rs` when the guest executes an `ECALL` instruction. The syscall number is in `a7` (x17), arguments in `a0`-`a5` (x10-x15), and the return value goes in `a0` (x10).
+> This is the **RISC-V runner's** Linux syscall ABI — one of NanoVM's four execution tiers.
+> See [Architecture](architecture.md) for how the runners fit together.
+
+The RISC-V runner implements a Linux RISC-V userland syscall interface. Syscalls are dispatched in `runners/riscv/src/syscall.rs` when the guest executes an `ECALL` instruction. The syscall number is in `a7` (x17), arguments in `a0`-`a5` (x10-x15), and the return value goes in `a0` (x10).
 
 ## Handling Modes
 
