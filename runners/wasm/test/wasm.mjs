@@ -14,6 +14,7 @@ import { normalizeCaps } from "../../../kernel/caps/caps.mjs";
 import { runWasm, moduleCacheStats } from "../src/wasm-runtime.mjs";
 import { inspectWasm } from "../src/inspect.mjs";
 import { registerWasmDelegate } from "../src/wasm-delegate.mjs";
+import { createWasiShim } from "../src/wasi-shim.mjs";
 import { runNode } from "../../node/src/host/runtime.mjs";
 import { registerNodertDelegate } from "../../node/src/host/delegate.mjs";
 import { helloModule, exitModule, readFileModule, threadsModule } from "./wasm-fixtures.mjs";
@@ -131,6 +132,31 @@ await test("wasip1-threads: wasi_thread_spawn + shared memory (X4)", async () =>
   // spin-waited (atomic load) and exited with the flag value.
   assertEqual(r.exitCode, 1, "cross-worker shared-memory write observed");
   assertEqual(r.stats.threads, 1, "one thread spawned");
+});
+
+await test("wasi path strings decode from SHARED memory under a browser-strict TextDecoder", async () => {
+  // Browsers' TextDecoder.decode() throws on SharedArrayBuffer-backed views
+  // (Node's is lenient). A wasip1-threads module's memory is shared, so the
+  // shim must copy guest strings out before decoding.
+  const Native = globalThis.TextDecoder;
+  globalThis.TextDecoder = class extends Native {
+    decode(input, opts) {
+      if (input && input.buffer instanceof SharedArrayBuffer) throw new TypeError("The provided ArrayBufferView value must not be shared.");
+      return super.decode(input, opts);
+    }
+  };
+  try {
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
+    const calls = [];
+    const sync = (op, args) => { calls.push([op, args]); if (op === "fs.stat") return { size: 3, mode: 0o100644, ino: 1, mtime: 0, isDir: false, isFile: true, isSymlink: false }; return {}; };
+    const { shim } = createWasiShim({ argv: ["t"], env: {}, preopens: [{ guestPath: "/", hostPath: "/sandbox", readonly: true }], sync, getMemory: () => memory, onExit: () => {} });
+    const path = new TextEncoder().encode("file.txt");
+    new Uint8Array(memory.buffer).set(path, 1024);
+    assertEqual(shim.path_filestat_get(3, 0, 1024, path.length, 2048), 0, "ESUCCESS");
+    assertEqual(calls.find(([op]) => op === "fs.stat")?.[1]?.path, "/sandbox/file.txt", "decoded guest path");
+  } finally {
+    globalThis.TextDecoder = Native;
+  }
 });
 
 console.log(`\n=== nodert wasm tier (W-1+W-2): ${passed} passed, ${failed} failed ===`);

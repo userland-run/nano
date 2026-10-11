@@ -19,6 +19,7 @@ import { dirname, join } from "node:path";
 import { Kernel, registerBuiltinServices } from "../../../kernel/index.mjs";
 import { loadLibBundle } from "../src/host/lib-loader.mjs";
 import { runNode } from "../src/host/runtime.mjs";
+import { initFromBytes, sourceOf } from "../src/boot/lib-bundle.mjs";
 
 const dir = dirname(fileURLToPath(import.meta.url));
 const nodertRoot = join(dir, "..");
@@ -77,6 +78,28 @@ await test("nodert boots from INJECTED bytes (the browser init path)", async () 
   const r = await runNode(k, { argv: ["node", "-e", 'process.stdout.write("booted-from-bytes:" + (40+2))'], source: 'process.stdout.write("booted-from-bytes:" + (40+2))', lib, cwd: "/", env: {}, timeoutMs: 15000 });
   assertEqual(r.stdout, "booted-from-bytes:42", "ran on nodert via injected bundle");
   assertEqual(r.exitCode, 0, "exit 0");
+});
+
+await test("sourceOf decodes the SAB-backed bundle under a browser-strict TextDecoder", async () => {
+  // Chrome/Firefox TextDecoder.decode() throws on SharedArrayBuffer-backed
+  // views (Node's is lenient) — a subarray of the shared bundle made every
+  // host-engine node exit 1 with no output in the browser.
+  const { libIndex, libBytes } = await loadLibBundle({ force: true });
+  assert(libBytes.buffer instanceof SharedArrayBuffer, "precondition: SAB-backed");
+  const Native = globalThis.TextDecoder;
+  globalThis.TextDecoder = class extends Native {
+    decode(input, opts) {
+      if (input && input.buffer instanceof SharedArrayBuffer) throw new TypeError("The provided ArrayBufferView value must not be shared.");
+      return super.decode(input, opts);
+    }
+  };
+  try {
+    initFromBytes(libIndex, libBytes);
+    const src = sourceOf("node:path");
+    assert(typeof src === "string" && src.includes("module.exports"), "decoded lib/path.js source");
+  } finally {
+    globalThis.TextDecoder = Native;
+  }
 });
 
 console.log(`\n=== nodert lib-loader (K9-browser): ${passed} passed, ${failed} failed ===`);

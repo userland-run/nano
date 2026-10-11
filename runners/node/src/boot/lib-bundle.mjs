@@ -48,7 +48,10 @@ function sourceOf(id) {
   const norm = id.replace(/^node:/, "");
   const e = index?.modules[norm];
   if (!e) return null;
-  return new TextDecoder().decode(raw.subarray(e[0], e[0] + e[1]));
+  // `.slice()` (not `.subarray()`) — copies out of the bundle bytes, which the
+  // host backs with a SharedArrayBuffer (lib-loader toShared). The browser's
+  // TextDecoder rejects SAB-backed views; Node's is lenient.
+  return new TextDecoder().decode(raw.slice(e[0], e[0] + e[1]));
 }
 
 const builtinIds = () => (index ? Object.keys(index.modules) : []);

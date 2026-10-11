@@ -30,7 +30,10 @@ function createWasiShim(ctx) {
 
   const view = () => new DataView(getMemory().buffer);
   const bytes = () => new Uint8Array(getMemory().buffer);
-  const readStr = (ptr, len) => dec.decode(bytes().subarray(ptr, ptr + len));
+  // `.slice()` (not `.subarray()`): a wasip1-threads module's memory is a
+  // shared WebAssembly.Memory, and the browser's TextDecoder rejects views
+  // backed by a SharedArrayBuffer (Node's is lenient).
+  const readStr = (ptr, len) => dec.decode(bytes().slice(ptr, ptr + len));
 
   // fd table: 0/1/2 stdio; 3.. preopens; higher = opened files/dirs.
   const fds = new Map();
