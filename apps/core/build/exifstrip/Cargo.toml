@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-UEL
+[package]
+name = "exifstrip"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "exifstrip"
+path = "src/main.rs"
+
+# No runtime dependencies: the JPEG/PNG/WebP/HEIF container walkers and the
+# TIFF/EXIF reader are small, bounds-checked and in-tree, so the module stays
+# tiny, single-threaded and fully deterministic on wasm32-wasip1.
+[dependencies]
+
+# Host-only: the tests decode every fixture before/after stripping with the
+# pure-Rust `image` crate (MIT OR Apache-2.0) and assert identical pixels.
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1

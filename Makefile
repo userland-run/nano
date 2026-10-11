@@ -1,4 +1,4 @@
-.PHONY: build build-full build-minimal build-min build-trace build-busybox build-boa build-rg build-photon devenv clean serve test test-build test-devenv test-boa test-boa-vm test-trace
+.PHONY: build build-full build-minimal build-min build-trace build-busybox build-boa build-rg build-photon build-exifstrip devenv clean serve test test-build test-devenv test-boa test-boa-vm test-trace
 
 WASM_TARGET = wasm32-unknown-unknown
 OUT_DIR = wasm
@@ -99,6 +99,14 @@ build-photon:
 	cargo build --release --target wasm32-wasip1 --manifest-path apps/core/build/photon/Cargo.toml
 	cp apps/core/build/photon/target/wasm32-wasip1/release/photon.wasm apps/core/photon.wasm
 	@ls -lh apps/core/photon.wasm | awk '{print "photon.wasm:", $$5}'
+
+# exifstrip = lossless photo-metadata removal (EXIF/GPS, XMP, ICC, comments) for
+# JPEG/PNG/WebP/HEIF; the catalog's `exifstrip` wasm-app (tools page /tools/exif/).
+build-exifstrip:
+	rustup target add wasm32-wasip1 2>/dev/null || true
+	cargo build --release --target wasm32-wasip1 --manifest-path apps/core/build/exifstrip/Cargo.toml
+	cp apps/core/build/exifstrip/target/wasm32-wasip1/release/exifstrip.wasm apps/core/exifstrip.wasm
+	@ls -lh apps/core/exifstrip.wasm | awk '{print "exifstrip.wasm:", $$5}'
 
 # Build the devenv tarball (Docker, ~60-90 min first time, cached after)
 devenv:
