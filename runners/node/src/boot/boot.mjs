@@ -153,9 +153,10 @@ async function boot(ctx) {
     const req = (spec) => requireModule(spec, dir);
     req.resolve = (spec) => resolveUserModule(spec, dir) ?? spec;
     req.cache = {};
-    const fn = new Function("exports", "require", "module", "__filename", "__dirname", "process", "Buffer", "console",
+    // Node's real CJS wrapper params only (see CJS_WRAPPER_NOTE in runMain).
+    const fn = new Function("exports", "require", "module", "__filename", "__dirname",
       `${src}\n//# sourceURL=${path}`);
-    fn.call(mod.exports, mod.exports, req, mod, path, dir, process, Buffer, consoleObj);
+    fn.call(mod.exports, mod.exports, req, mod, path, dir);
     mod.loaded = true;
     return mod.exports;
   }
@@ -203,6 +204,10 @@ async function boot(ctx) {
   }
   if (!consoleObj) consoleObj = makeConsole({ write: writeStdout, writeErr: writeStderr, Buffer });
   globalThis.console = consoleObj;
+  // As in Node, require("console") IS the global console (with .Console). The
+  // upstream module's own global console is never bound to our stdio streams.
+  try { if (!consoleObj.Console) Object.defineProperty(consoleObj, "Console", { value: requireModule("console").Console, writable: true, configurable: true }); } catch {}
+  shimCache.set("console", consoleObj);
 
   // Timers wired to the loop.
   installTimers();
@@ -464,11 +469,15 @@ async function boot(ctx) {
     const req = (spec) => requireModule(spec, dirname);
     req.resolve = (spec) => resolveUserModule(spec, dirname) ?? spec;
     req.cache = {};
+    // CJS_WRAPPER_NOTE: exactly Node's wrapper params. process/Buffer/console
+    // are globals (installed on globalThis above), NOT params — as params, a
+    // top-level `const process = require("node:process")` (commander 12) is a
+    // SyntaxError (lexical redeclaration of a parameter).
     const fn = new Function(
-      "exports", "require", "module", "__filename", "__dirname", "process", "Buffer", "console",
+      "exports", "require", "module", "__filename", "__dirname",
       `${stripShebang(source)}\n//# sourceURL=${filename}`
     );
-    fn.call(mod.exports, mod.exports, req, mod, filename, dirname, proc, Buffer, consoleObj);
+    fn.call(mod.exports, mod.exports, req, mod, filename, dirname);
   }
 
   // A real upstream Writable whose _write pushes bytes to the Kernel stdio pipe.

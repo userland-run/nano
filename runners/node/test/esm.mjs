@@ -56,5 +56,14 @@ await run("TS + import from a .ts sibling", {
   files: { "/app/main.ts": `import { greet } from "./greet.ts"; const who: string = "world"; console.log(greet(who))`, "/app/greet.ts": `export const greet = (name: string): string => "hi " + name;` },
 }, "hi world\n");
 
+// Regression: module-scope redeclaration of Node globals (ESM + CJS-from-ESM).
+await run("ESM may redeclare process/Buffer/console; CJS dep too", {
+  entryPath: "/app/main.mjs", cwd: "/app",
+  files: {
+    "/app/main.mjs": `import process from "node:process"; import { Buffer } from "node:buffer"; import console from "node:console"; import dep from "./dep.cjs"; console.log(process.platform, Buffer.from("A").toString("hex"), dep)`,
+    "/app/dep.cjs": `const process = require("node:process"); const console = require("node:console"); module.exports = typeof process.argv + ":" + (console === globalThis.console);`,
+  },
+}, "linux 41 object:true\n");
+
 console.log(`\n=== nodert ESM loader (M2): ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);

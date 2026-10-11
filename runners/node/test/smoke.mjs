@@ -31,6 +31,29 @@ async function run(name, source, expectStdout, expectExit = 0) {
   }
 }
 
+// File-backed variant: seeds `files` into the VFS and runs `entryPath`.
+async function runFiles(name, files, entryPath, expectStdout, expectExit = 0) {
+  const kernel = new Kernel();
+  await registerBuiltinServices(kernel);
+  for (const [p, c] of Object.entries(files)) {
+    let cur = "";
+    for (const seg of p.slice(0, p.lastIndexOf("/")).split("/").filter(Boolean)) { cur += "/" + seg; try { kernel.vfs.mkdir(cur, 0o755); } catch {} }
+    kernel.vfs.rootMem.createFile(p, c);
+  }
+  const cwd = entryPath.slice(0, entryPath.lastIndexOf("/")) || "/";
+  const r = await runNode(kernel, { argv: ["node", entryPath], entryPath, cwd, env: { HOME: "/root" }, timeoutMs: 20000 });
+  const okOut = typeof expectStdout === "function" ? expectStdout(r.stdout) : r.stdout === expectStdout;
+  if (okOut && r.exitCode === expectExit) { passed++; console.log(`  PASS: ${name}`); }
+  else {
+    failed++;
+    console.error(`  FAIL: ${name}`);
+    console.error(`    exit: got ${r.exitCode} want ${expectExit}`);
+    console.error(`    stdout: ${JSON.stringify(r.stdout)}`);
+    if (r.stderr) console.error(`    stderr: ${r.stderr.slice(0, 400)}`);
+    if (r.error) console.error(`    error: ${r.error}`);
+  }
+}
+
 await run("console.log string", `console.log("hi")`, "hi\n");
 await run("console.log multi + number", `console.log("n =", 42, true)`, "n = 42 true\n");
 await run("format specifiers", `console.log("%s/%d", "a", 5)`, "a/5\n");
@@ -47,6 +70,40 @@ await run("path module (upstream verbatim)", `const path=require("path"); consol
 await run("fs.promises", `const fs=require("fs").promises; (async()=>{await fs.writeFile("/tmp/p.txt","P"); console.log(await fs.readFile("/tmp/p.txt","utf8"))})()`, "P\n");
 await run("zlib service round-trip", `const z=require("zlib"); const gz=z.gzipSync("hello service "); console.log(z.gunzipSync(gz).toString())`, "hello service \n");
 await run("node:sqlite via DuckDB", `const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync(":memory:"); db.exec("CREATE TABLE t (id, v)"); db.exec("INSERT INTO t (id, v) VALUES (1, 'one'), (2, 'two')"); const rows=db.prepare("SELECT v FROM t WHERE id > 1 ORDER BY id").all(); console.log(rows.map(r=>r.v).join(","))`, "two\n");
+
+// Regression: process/Buffer/console are globals in Node, NOT CommonJS wrapper
+// params — so a module may lexically redeclare them at top level (commander 12
+// does `const process = require("node:process")`). As wrapper params this was
+// a SyntaxError ("Identifier 'process' has already been declared").
+const REDECL = `const process = require("node:process"); const Buffer = require("node:buffer").Buffer; const console = require("node:console");`;
+await run("main script may redeclare process/Buffer/console", `${REDECL} console.log(process.platform, Buffer.from("ok").toString(), typeof console.log)`, "linux ok function\n");
+await runFiles("required module may redeclare process/Buffer/console", {
+  "/app/main.js": `const m = require("./lib/m.js"); console.log(m.tag, m.same)`,
+  "/app/lib/m.js": `${REDECL}\nlet global = globalThis, setTimeout = 1, setImmediate = 2, URL = 3, TextEncoder = 4;\nexports.tag = process.platform + ":" + Buffer.from("hi").toString("hex"); exports.same = process === globalThis.process && Buffer === globalThis.Buffer && console.log === globalThis.console.log;`,
+}, "/app/main.js", "linux:6869 true\n");
+// Real-world shape: commander@12's top-level requires (lib/command.js) plus a
+// minimal program/parse, resolved from node_modules like the real package.
+await runFiles("commander@12-style module (const process = require('node:process'))", {
+  "/app/node_modules/commander/package.json": `{"name":"commander","version":"12.1.0","main":"./index.js"}`,
+  "/app/node_modules/commander/index.js": `const { Command } = require('./lib/command.js');\nexports = module.exports = new Command();\nexports.program = exports;\nexports.Command = Command;`,
+  "/app/node_modules/commander/lib/command.js": [
+    "const EventEmitter = require('node:events').EventEmitter;",
+    "const childProcess = require('node:child_process');",
+    "const path = require('node:path');",
+    "const fs = require('node:fs');",
+    "const process = require('node:process');",
+    "class Command extends EventEmitter {",
+    "  constructor(name) { super(); this._name = name || ''; this._opts = {}; this._args = []; }",
+    "  name(n) { this._name = n; return this; }",
+    "  option(flags) { this._flag = flags.split(/[ ,]+/).pop().replace(/^--/, ''); return this; }",
+    "  parse(argv) { argv = argv || process.argv; const rest = argv.slice(2); for (let i = 0; i < rest.length; i++) { if (rest[i] === '--' + this._flag) this._opts[this._flag] = rest[++i]; else this._args.push(rest[i]); } return this; }",
+    "  opts() { return this._opts; }",
+    "  get args() { return this._args; }",
+    "}",
+    "exports.Command = Command;",
+  ].join("\n"),
+  "/app/cli.js": `const { program } = require("commander"); program.name("demo").option("-n, --name").parse(["node", "cli", "--name", "nano", "x"]); console.log(program.opts().name, program.args.join(","), typeof require("commander").Command)`,
+}, "/app/cli.js", "nano x function\n");
 
 console.log(`\n=== nodert smoke: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);
