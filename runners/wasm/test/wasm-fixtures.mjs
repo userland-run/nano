@@ -290,4 +290,33 @@ function threadsModule() {
   });
 }
 
-export { helloModule, exitModule, readFileModule, threadsModule, stdinEchoModule, counterReactorModule, buildModule };
+/**
+ * envDump: environ_sizes_get + environ_get, then write the raw environ buffer
+ * ("K=V\0K2=V2\0…") to stdout. Proves the env a spawn passed reached the app.
+ */
+function envDumpModule() {
+  const countOff = 0, sizeOff = 4, iovOff = 16, nwrittenOff = 24, ptrsOff = 1024, bufOff = 8192;
+  return buildModule({
+    types: [
+      { params: [I32, I32], results: [I32] },           // 0: environ_sizes_get / environ_get
+      { params: [I32, I32, I32, I32], results: [I32] }, // 1: fd_write
+      { params: [], results: [] },                      // 2: _start
+    ],
+    imports: [
+      { module: "wasi_snapshot_preview1", name: "environ_sizes_get", type: 0 }, // func 0
+      { module: "wasi_snapshot_preview1", name: "environ_get", type: 0 },       // func 1
+      { module: "wasi_snapshot_preview1", name: "fd_write", type: 1 },         // func 2
+    ],
+    funcs: [{ type: 2, body: [
+      I32_CONST, ...sleb(countOff), I32_CONST, ...sleb(sizeOff), CALL, ...uleb(0), DROP,
+      I32_CONST, ...sleb(ptrsOff), I32_CONST, ...sleb(bufOff), CALL, ...uleb(1), DROP,
+      I32_CONST, ...sleb(iovOff), I32_CONST, ...sleb(bufOff), I32_STORE, 0x02, 0x00,
+      I32_CONST, ...sleb(iovOff + 4), I32_CONST, ...sleb(sizeOff), I32_LOAD, 0x02, 0x00, I32_STORE, 0x02, 0x00,
+      I32_CONST, 0x01, I32_CONST, ...sleb(iovOff), I32_CONST, 0x01, I32_CONST, ...sleb(nwrittenOff), CALL, ...uleb(2), DROP,
+    ] }],
+    memory: { min: 1 },
+    exports: [{ name: "memory", kind: KIND_MEM, index: 0 }, { name: "_start", kind: KIND_FUNC, index: 3 }],
+  });
+}
+
+export { helloModule, exitModule, readFileModule, threadsModule, stdinEchoModule, counterReactorModule, envDumpModule, buildModule };

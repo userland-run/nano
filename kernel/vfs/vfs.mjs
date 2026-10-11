@@ -166,6 +166,23 @@ class KernelVfs {
     return r;
   }
 
+  /**
+   * Directory entries with their types in ONE call (no per-entry stat round
+   * trip): [{ name, type: "d"|"f"|"l", ino }]. Used by the WASI fd_readdir.
+   */
+  readdirEntries(path) {
+    const m = this.resolveMount(path);
+    const node = m.backend.resolve(m.rel, true);
+    if (!node) throw new KernelError(ERRNO.ENOENT, undefined, path);
+    if (!node.isDir) throw new KernelError(ERRNO.ENOTDIR, undefined, path);
+    const out = [];
+    for (const [name, c] of node.children) {
+      // A symlink to a directory reports as a symlink (d_type DT_LNK), like Linux.
+      out.push({ name, type: c.isDir ? "d" : c.isSymlink ? "l" : "f", ino: c.ino });
+    }
+    return out;
+  }
+
   realpath(path) {
     const m = this.resolveMount(path);
     const r = m.backend.realpath(m.rel);

@@ -562,12 +562,40 @@ class NanoVM {
    * @returns {Promise<{exitCode: number, stdout: string}>}
    */
   async run(command, opts = {}) {
+    const argv = command.trim().split(/\s+/);
+    // A program pinned to another tier (a registered wasm-app such as photon)
+    // runs on that tier's delegate directly, with stdio bridged like a guest
+    // execve would — `run("photon in.jpg out.png")` works without a shell.
+    const routed = this._routeForeign(argv);
+    if (routed) return this._runRouted(routed, argv, opts);
     // Prefer the embedded busybox; otherwise exec a catalog-installed
     // /bin/busybox from the guest VFS (the migration distributes it via the catalog).
     const elf = this._busyboxElf || this._readElfFromVfs("/bin/busybox");
     if (!elf) throw new Error("No busybox ELF loaded (embed it or install the busybox catalog app)");
-    const argv = command.trim().split(/\s+/);
     return this._execute(elf, argv, [], opts);
+  }
+
+  /**
+   * The spawn delegate of a non-vm tier this argv is routed to (kernel routing
+   * table, spec §14.2), or null when it runs in the emulator.
+   */
+  _routeForeign(argv) {
+    if (!this._kernel || !argv.length || !argv[0]) return null;
+    const route = this._kernel.router.route(argv);
+    if (route.tier === "vm") return null;
+    return this._kernel.router.delegateFor(route.tier) || null;
+  }
+
+  /** run() of a foreign-tier program: no guest image; stdio → the run's console. */
+  async _runRouted(delegate, argv, opts) {
+    this._stdout = "";
+    this._onStdout = opts.onStdout || null;
+    const myRunId = ++this._runId;
+    const env = { HOME: "/root", PATH: "/usr/local/bin:/usr/bin:/bin", TERM: "xterm", ...(opts.env || {}) };
+    const fds = [{ fd_type: FD_TYPE_STDIN, host_fd: -1 }, { fd_type: FD_TYPE_STDOUT, host_fd: -1 }, { fd_type: FD_TYPE_STDERR, host_fd: -1 }];
+    const exitCode = await this._runBridgedExec({ delegate, argv, env, cwd: opts.cwd || "/" }, fds);
+    if (this._runId !== myRunId) return { exitCode: -1, stdout: this._stdout, cancelled: true };
+    return { exitCode, stdout: this._stdout };
   }
 
   /** Read an installed ELF from the guest VFS (follows symlinks), or null. */
@@ -601,6 +629,9 @@ class NanoVM {
   /** Cancel the currently running execution loop. */
   cancelRun() {
     this._runId++;
+    // A run parked on a bridged foreign-tier child (see _runBridgedExec): kill it
+    // so the run loop wakes up and observes the cancellation.
+    this._killBridged();
   }
 
   // ============================================================
@@ -616,6 +647,13 @@ class NanoVM {
   writeStdin(bytes) {
     if (typeof bytes === "string") bytes = new TextEncoder().encode(bytes);
     if (!bytes || bytes.length === 0) return;
+    // A foreign-tier program exec'd from an interactive shell owns the terminal:
+    // forward keystrokes to its stdin pipe (Ctrl-C kills it).
+    if (this._bridgedStdin) {
+      if (this._ttyEnabled || this._termEnabled ? bytes.includes(3) : false) { this._killBridged(); return; }
+      try { this._bridgedStdin.write(bytes); } catch { /* reader gone */ }
+      return;
+    }
     const X = this._exports;
     if (X && X.vm_stdin_push) {
       // Push into the in-VM tty ring (applies line discipline / echo).
@@ -664,6 +702,7 @@ class NanoVM {
 
   /** Signal end-of-input on stdin (e.g. Ctrl-D). The next empty read returns EOF. */
   closeStdin() {
+    if (this._bridgedStdin) { this._bridgedStdin.closeWrite(); this._bridgedStdin = null; return; }
     this._stdinEof = true;
     const X = this._exports;
     if (X && X.vm_stdin_eof) X.vm_stdin_eof(this._vmPtr);
@@ -1411,6 +1450,15 @@ class NanoVM {
           await this._netFetch();
           if (an.read) this._serveNetRead(an.bufPtr, an.bufLen);
         }
+        // execve of a foreign-tier program: run it with bridged stdio, then
+        // exit this guest process with its status (see _doExecve).
+        if (this._pendingExec) {
+          const job = this._pendingExec;
+          this._pendingExec = null;
+          const dvx = new DataView(this._memory.buffer);
+          const code = await this._runBridgedExec(job, [0, 1, 2].map((fd) => this._fdRead(dvx, fd)));
+          this._exitGuest(code);
+        }
         iter--; // FS operations don't consume execution budget
         if (this._blockedOnStdin) {
           // Idle interactive prompt: sleep until keystrokes arrive (or a short
@@ -1814,6 +1862,12 @@ class NanoVM {
       : null;
   }
 
+  /** The seeded /dev/null node (a MemFS file): reads are EOF, writes are discarded. */
+  _isDevNull(node) {
+    return !!node && node.name === "null" && !!node.parent && node.parent.name === "dev" &&
+      node.parent.parent === this._memfs.root;
+  }
+
   _setA0(dv, value) {
     dv.setBigInt64(this._vmPtr + 80, BigInt(value), true);
   }
@@ -1846,6 +1900,191 @@ class NanoVM {
     return out;
   }
 
+  // ---- execve bridge: guest process → foreign-tier delegate (wasm-app, …) ----
+
+  /** End the current guest process with `code` (as exit_group would). */
+  _exitGuest(code) {
+    const dv = new DataView(this._memory.buffer);
+    dv.setInt32(this._vmPtr + 532, code | 0, true); // exit_code
+    dv.setInt32(this._vmPtr + 528, STATUS_FAULT, true); // → the run loop's exit path
+  }
+
+  /** Hard-kill the foreign-tier child a bridged exec is waiting on (Ctrl-C / cancel). */
+  _killBridged() {
+    const pid = this._bridgedPid;
+    if (!pid || !this._kernel) return;
+    this._bridgedKilled = true;
+    try { this._kernel.signals.kill(pid, "SIGKILL"); } catch { /* already exited */ }
+  }
+
+  /**
+   * Run `job.delegate` as the exec'd image of a guest process: spawn it async
+   * (Kernel pipes), feed its stdin from guest fd 0, stream its stdout/stderr
+   * into guest fds 1/2 while the VM stays parked, and resolve its exit status.
+   * `fds` are the guest's fd-table entries for 0/1/2.
+   * @returns {Promise<number>} exit status (128+n for a signal)
+   */
+  async _runBridgedExec(job, fds) {
+    const k = this._kernel;
+    const enc = new TextEncoder();
+    const decoders = [null, new TextDecoder(), new TextDecoder()];
+    const emit = (fd, bytes) => this._bridgeWrite(fds[fd], fd, bytes, decoders[fd]);
+    let spawned;
+    try {
+      spawned = await job.delegate({
+        parent: this._process,
+        argv: job.argv,
+        env: job.env,
+        cwd: job.cwd,
+        caps: this._process ? this._process.caps : undefined,
+        wait: false,
+        fromExecve: true,
+        ...(this.execTimeoutMs ? { timeoutMs: this.execTimeoutMs } : {}),
+      });
+    } catch (e) {
+      emit(2, enc.encode(`${job.argv[0]}: ${e && e.message ? e.message : e}\n`));
+      return 126;
+    }
+    // A delegate that only implements the synchronous (wait) form answered
+    // with a finished result instead of pipes.
+    if (!spawned || typeof spawned.pid !== "number") {
+      if (spawned && typeof spawned.exitCode === "number") {
+        for (const [fd, out] of [[1, spawned.stdoutBytes ?? spawned.stdout], [2, spawned.stderrBytes ?? spawned.stderr]]) {
+          if (out && out.length) emit(fd, typeof out === "string" ? enc.encode(out) : out);
+        }
+        return spawned.exitCode;
+      }
+      return 126;
+    }
+
+    const pin = k.pipes.get(spawned.stdin);
+    const pout = k.pipes.get(spawned.stdout);
+    const perr = k.pipes.get(spawned.stderr);
+    this._bridgedPid = spawned.pid;
+    this._bridgedKilled = false;
+    try {
+      if (pin) this._feedBridgedStdin(fds[0], pin);
+      const exited = k.proc.waitpid(spawned.pid).catch(() => null);
+      let finished = false;
+      const pump = async (pipe, fd) => {
+        if (!pipe) return;
+        while (!finished) {
+          const r = pipe.read(1 << 16);
+          if (r === "eof") return;
+          if (r) emit(fd, r);
+          else await Promise.race([pipe.waitReadable(), exited]);
+        }
+        // The child is gone: flush whatever it wrote before exiting.
+        for (;;) { const r = pipe.read(1 << 16); if (!r || r === "eof") return; emit(fd, r); }
+      };
+      const pumps = Promise.all([pump(pout, 1), pump(perr, 2)]);
+      const info = await exited;
+      finished = true;
+      await pumps;
+      for (const fd of [1, 2]) { const tail = decoders[fd].decode(); if (tail) this._consoleText(tail); }
+      if (this._bridgedKilled) return 130;
+      if (!info) return 1;
+      if (typeof info.exitCode === "number") return info.exitCode;
+      return info.signal === "SIGKILL" ? 137 : 143;
+    } finally {
+      this._bridgedPid = 0;
+      if (this._bridgedStdin) { try { this._bridgedStdin.closeWrite(); } catch {} this._bridgedStdin = null; }
+    }
+  }
+
+  /** Feed a bridged child's stdin pipe from the guest's fd 0, then EOF it. */
+  _feedBridgedStdin(fe, pin) {
+    const write = (b) => { if (b && b.length) pin.write(b); };
+    if (fe.fd_type === FD_TYPE_PIPE) {
+      // Serialized fork: the pipe's writer already ran to completion, so its
+      // whole output is buffered — hand it over (consuming it, like a read).
+      const p = this._pipes && this._pipes.get(fe.host_fd);
+      if (p) {
+        for (let i = p.head; i < p.chunks.length; i++) {
+          const ch = p.chunks[i];
+          if (ch) write(i === p.head ? ch.subarray(p.headOff) : ch);
+        }
+        p.chunks = []; p.head = 0; p.headOff = 0; p.avail = 0;
+      }
+    } else if (fe.fd_type === FD_TYPE_FILE) {
+      // `< file`: the rest of the file from the shared description's offset.
+      const desc = this._desc(fe);
+      if (desc && !this._isDevNull(desc.node)) {
+        const size = this._memfs.lseekSize(fe.host_fd);
+        if (size > desc.offset) {
+          const buf = new Uint8Array(size - desc.offset);
+          const n = this._memfs.readInto(fe.host_fd, buf, 0, buf.length, desc.offset);
+          if (n > 0) { write(buf.subarray(0, n)); desc.offset += n; }
+        }
+      }
+    } else if (fe.fd_type === FD_TYPE_STDIN) {
+      // The host's stdin: queued (legacy) input first; an interactive session
+      // then keeps forwarding keystrokes (writeStdin) until closeStdin / exit.
+      while (this._stdinQueue.length) {
+        const ch = this._stdinQueue.shift();
+        write(this._stdinHead ? ch.subarray(this._stdinHead) : ch);
+        this._stdinHead = 0;
+      }
+      if (this._stdinInteractive && !this._stdinEof) { this._bridgedStdin = pin; return; }
+    }
+    pin.closeWrite();
+  }
+
+  /** Deliver bridged child output to guest fd `fd` (entry `fe`). */
+  _bridgeWrite(fe, fd, bytes, decoder) {
+    if (!fe || !bytes || !bytes.length) return;
+    if (fe.fd_type === FD_TYPE_STDOUT || fe.fd_type === FD_TYPE_STDERR) {
+      this._consoleBytes(fe.fd_type === FD_TYPE_STDERR ? 2 : 1, bytes, decoder);
+    } else if (fe.fd_type === FD_TYPE_PIPE) {
+      if (!this._pipes) this._pipes = new Map();
+      const p = this._pipeGet(fe.host_fd);
+      p.chunks.push(bytes.slice());
+      p.avail += bytes.length;
+    } else if (fe.fd_type === FD_TYPE_FILE) {
+      const desc = this._desc(fe);
+      if (!desc || this._isDevNull(desc.node)) return;
+      let off = desc.offset;
+      if (desc.flags & O_APPEND) { const sz = this._memfs.lseekSize(fe.host_fd); if (sz >= 0) off = sz; }
+      const n = this._memfs.writeFrom(fe.host_fd, bytes, off);
+      if (n > 0) desc.offset = off + n;
+    }
+    // Closed / other fd kinds: the output is discarded (as with a real EBADF write).
+  }
+
+  /** Console output from the host side — mirrors the console_write import. */
+  _consoleBytes(fd, bytes, decoder) {
+    // A tty's OPOST|ONLCR: the guest kernel would turn "\n" into "\r\n".
+    if (this._ttyEnabled) {
+      let extra = 0;
+      for (let i = 0; i < bytes.length; i++) if (bytes[i] === 10 && (i === 0 || bytes[i - 1] !== 13)) extra++;
+      if (extra) {
+        const out = new Uint8Array(bytes.length + extra);
+        for (let i = 0, j = 0; i < bytes.length; i++) {
+          if (bytes[i] === 10 && (i === 0 || bytes[i - 1] !== 13)) out[j++] = 13;
+          out[j++] = bytes[i];
+        }
+        bytes = out;
+      }
+    }
+    const X = this._exports;
+    if (this._termEnabled && X && X.term_feed && X.malloc) {
+      if (!this._termScratch || this._termScratchCap < bytes.length) {
+        this._termScratchCap = Math.max(bytes.length, 256);
+        this._termScratch = X.malloc(this._termScratchCap);
+      }
+      new Uint8Array(this._memory.buffer).set(bytes, this._termScratch);
+      X.term_feed(this._termScratch, bytes.length);
+    }
+    if (this._onStdoutBytes) this._onStdoutBytes(fd, bytes);
+    this._consoleText(decoder ? decoder.decode(bytes, { stream: true }) : new TextDecoder().decode(bytes));
+  }
+
+  _consoleText(text) {
+    if (!text) return;
+    this._stdout += text;
+    if (this._onStdout) this._onStdout(text);
+  }
+
   /**
    * execve: replace the current process image, preserving inherited fds and cwd.
    * Two cases are supported: the target resolves to /bin/busybox (an applet
@@ -1861,28 +2100,28 @@ class NanoVM {
     const envp = this._readGuestStrArray(envpPtr);
 
     // Kernel routing seam (spec §14.2): consult the spawn routing table
-    // BEFORE the VM-side resolution. When a non-vm tier delegate is
-    // registered (nodert M1+), the spawn leaves the emulator here with
-    // stdio bridged through Kernel pipes; until then route() always says
-    // "vm" and this block is a strict no-op.
-    if (this._kernel) {
-      const route = this._kernel.router.route(argv.length ? argv : [execPath]);
-      if (route.tier !== "vm" && this._kernel.router.delegateFor(route.tier)) {
-        const delegate = this._kernel.router.delegateFor(route.tier);
-        delegate({
-          parent: this._process,
-          argv: argv.length ? argv : [execPath],
+    // BEFORE the VM-side resolution. A program pinned to a non-vm tier with a
+    // registered delegate (e.g. a wasm-app such as photon/rg) is exec'd THERE:
+    // the request stays FS_PENDING, and _runLoop awaits _runBridgedExec(),
+    // which spawns the delegate with this process's argv/env/cwd, bridges its
+    // stdin/stdout/stderr to this process's fds 0/1/2 (tty, pipe, or file —
+    // so `| wc -l`, `> out` and `2>&1` work), and then exits this process with
+    // the delegate's exit status — exactly what the image replacement would
+    // have done. Unrouted programs fall through to the emulator below.
+    {
+      const av = argv.length ? argv : [execPath];
+      const delegate = this._routeForeign(av);
+      if (delegate) {
+        this._pendingExec = {
+          delegate,
+          argv: av,
           env: Object.fromEntries(envp.map((e) => {
             const i = e.indexOf("=");
             return i > 0 ? [e.slice(0, i), e.slice(i + 1)] : [e, ""];
           })),
           cwd: this._readCwd(),
-          fromExecve: true,
-        });
-        // The guest's exec'ing task ends; the delegate owns the child.
-        this._setA0(dv, 0);
-        dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-        return;
+        };
+        return; // leave FS_PENDING — the run loop completes it
       }
     }
 
@@ -2455,6 +2694,7 @@ class NanoVM {
         if (fe.fd_type !== FD_TYPE_FILE && fe.fd_type !== FD_TYPE_DIR) { result = -9; break; }
         const desc = this._desc(fe);
         if (!desc) { result = -9; break; }
+        if (this._isDevNull(desc.node)) { result = 0; break; } // /dev/null: always EOF
         const n = memfs.pread(fe.host_fd, this._memory, ramPtr + bufPtr, count, desc.offset);
         if (n > 0) { desc.offset += n; this._noteWrite(bufPtr, n); }
         result = n;
@@ -2500,6 +2740,7 @@ class NanoVM {
         if (fe.fd_type !== FD_TYPE_FILE) { result = -9; break; }
         const desc = this._desc(fe);
         if (!desc) { result = -9; break; }
+        if (this._isDevNull(desc.node)) { result = count; break; } // /dev/null: discard
         // O_APPEND is a property of the description: every write lands at EOF.
         let writeOff = desc.offset;
         if (desc.flags & O_APPEND) {

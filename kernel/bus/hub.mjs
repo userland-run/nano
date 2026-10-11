@@ -98,7 +98,14 @@ function buildHandlers(hub) {
   }));
   h.set(OP["fs.stat"], (p, a) => vfs().stat(a.path, true));
   h.set(OP["fs.lstat"], (p, a) => vfs().stat(a.path, false));
-  h.set(OP["fs.readdir"], (p, a) => ({ names: vfs().readdir(a.path) }));
+  h.set(OP["fs.readdir"], (p, a) => {
+    // `types: true` adds per-entry types + inodes in the same call (WASI fd_readdir).
+    if (a.types) {
+      const ents = vfs().readdirEntries(a.path);
+      return { names: ents.map((e) => e.name), types: ents.map((e) => e.type), inos: ents.map((e) => e.ino) };
+    }
+    return { names: vfs().readdir(a.path) };
+  });
   h.set(OP["fs.mkdir"], (p, a) => (vfs().mkdir(a.path, a.mode ?? 0o755), {}));
   h.set(OP["fs.unlink"], (p, a) => (vfs().unlink(a.path, a.flags ?? 0), {}));
   h.set(OP["fs.rename"], (p, a) => (vfs().rename(a.path, a.path2), {}));

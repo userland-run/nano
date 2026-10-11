@@ -30,7 +30,10 @@ function moduleCacheStats() { return { size: moduleCache.size, keys: [...moduleC
  * @param {import("../../../kernel/kernel.mjs").Kernel} kernel
  * @param {{ wasmBytes: Uint8Array, argv: string[], env?: object, cwd?: string,
  *           caps?: object, ppid?: number, preopens?: Array<{guestPath,hostPath,readonly}>,
- *           onStdout?: (b)=>void, timeoutMs?: number, _reuseProc?, _stdout?, _stderr?, _stdin? }} opts
+ *           onStdout?: (b)=>void, onStderr?: (b)=>void, stdinBytes?: Uint8Array|string,
+ *           timeoutMs?: number, _reuseProc?, _stdout?, _stderr?, _stdin? }} opts
+ * @returns {Promise<{exitCode:number, stdout:string, stderr:string, stdoutBytes:Uint8Array,
+ *           stderrBytes:Uint8Array, error?:string, pid:number, cached:boolean, stats?:object}>}
  */
 async function runWasm(kernel, opts) {
   const { wasmBytes, argv, env = {}, cwd = "/", caps, ppid = 1 } = opts;
@@ -41,9 +44,13 @@ async function runWasm(kernel, opts) {
 
   // Feed a request payload to fd 0 for a per-invoke filter (the WASI service
   // runner): write the bytes and close the write end so fd_read sees EOF.
-  if (opts.stdinBytes != null && !opts._stdin) {
-    const b = typeof opts.stdinBytes === "string" ? new TextEncoder().encode(opts.stdinBytes) : opts.stdinBytes;
-    stdin.write(b);
+  // With no payload (and no caller-owned stdin pipe) stdin is EOF right away —
+  // nobody else holds this pipe, so a read would otherwise block forever.
+  if (!opts._stdin) {
+    if (opts.stdinBytes != null) {
+      const b = typeof opts.stdinBytes === "string" ? new TextEncoder().encode(opts.stdinBytes) : opts.stdinBytes;
+      stdin.write(b);
+    }
     stdin.closeWrite();
   }
 
@@ -57,14 +64,15 @@ async function runWasm(kernel, opts) {
 
   const chan = kernel.allocChannel(proc.pid);
 
-  let outBuf = "", errBuf = "";
-  const dec = new TextDecoder();
+  // stdout/stderr are collected as raw bytes (binary-safe: an app may write a
+  // PNG to stdout); the string forms are decoded once at the end.
+  const outChunks = [], errChunks = [];
   const drains = [];
   const hostDrains = !opts._reuseProc;
-  const drain = (pipe, onData, append) => drains.push((async () => {
-    for (;;) { const r = pipe.read(1 << 16); if (r === "eof") break; if (r) { append(dec.decode(r, { stream: true })); onData?.(r); } else await pipe.waitReadable(); }
+  const drain = (pipe, onData, chunks) => drains.push((async () => {
+    for (;;) { const r = pipe.read(1 << 16); if (r === "eof") break; if (r) { chunks.push(r); onData?.(r); } else await pipe.waitReadable(); }
   })());
-  if (hostDrains) { drain(stdout, opts.onStdout, (s) => { outBuf += s; }); drain(stderr, null, (s) => { errBuf += s; }); }
+  if (hostDrains) { drain(stdout, opts.onStdout, outChunks); drain(stderr, opts.onStderr, errChunks); }
 
   // Compile once, cache, and hand the compiled Module to the worker (X5).
   const { module, cached } = await compileCached(wasmBytes, opts.moduleKey);
@@ -89,7 +97,20 @@ async function runWasm(kernel, opts) {
   if (!opts._reuseProc) kernel.proc.exit(proc.pid, exit.exitCode);
   kernel.releaseChannel(proc.pid);
 
-  return { exitCode: exit.exitCode, stdout: outBuf + dec.decode(), stderr: errBuf, error: exit.error, pid: proc.pid, cached, stats: exit.stats };
+  const stdoutBytes = joinChunks(outChunks), stderrBytes = joinChunks(errChunks);
+  const dec = new TextDecoder();
+  return {
+    exitCode: exit.exitCode, stdout: dec.decode(stdoutBytes), stderr: dec.decode(stderrBytes),
+    stdoutBytes, stderrBytes, error: exit.error, pid: proc.pid, cached, stats: exit.stats,
+  };
+}
+
+function joinChunks(chunks) {
+  if (chunks.length === 1) return chunks[0];
+  let n = 0; for (const c of chunks) n += c.length;
+  const out = new Uint8Array(n); let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
 }
 
 function scopesToPreopens(caps) {

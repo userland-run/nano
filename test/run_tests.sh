@@ -207,6 +207,18 @@ if [ -f "$NODERT_DIR/vendor/node-lib/index.json" ]; then
     else
         fail "wasm-app runner (rg)"
     fi
+    # WASI p1 surface: pread/pwrite/rename/rmdir/readlink/…, open flags, "/" + cwd preopens
+    if node "$PROJECT_ROOT/runners/wasm/test/wasi-syscalls.mjs" 2>/dev/null; then
+        ok "WASI shim syscalls (full wasip1 surface, root + cwd preopens, stdin/env/bytes)"
+    else
+        fail "WASI shim syscalls"
+    fi
+    # Real BusyBox sh exec()s a wasm-app: blocking, bridged stdio (pipes/redirects), exit status
+    if node "$PROJECT_ROOT/runners/wasm/test/execve-bridge.mjs" 2>/dev/null; then
+        ok "shell → wasm-app execve bridge (real BusyBox: pipes, redirects, exit codes)"
+    else
+        fail "shell → wasm-app execve bridge"
+    fi
     # M2 ESM blob-URL loader (§9.2)
     if node "$NODERT_DIR/test/esm.mjs" 2>/dev/null; then
         ok "nodert ESM loader (import/export/TLA/dynamic/cycles/TS via SWC)"

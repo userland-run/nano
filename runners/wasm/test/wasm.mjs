@@ -148,12 +148,12 @@ await test("wasi path strings decode from SHARED memory under a browser-strict T
   try {
     const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
     const calls = [];
-    const sync = (op, args) => { calls.push([op, args]); if (op === "fs.stat") return { size: 3, mode: 0o100644, ino: 1, mtime: 0, isDir: false, isFile: true, isSymlink: false }; return {}; };
+    const sync = (op, args) => { calls.push([op, args]); if (op === "fs.stat" || op === "fs.lstat") return { size: 3, mode: 0o100644, ino: 1, mtime: 0, isDir: false, isFile: true, isSymlink: false }; return {}; };
     const { shim } = createWasiShim({ argv: ["t"], env: {}, preopens: [{ guestPath: "/", hostPath: "/sandbox", readonly: true }], sync, getMemory: () => memory, onExit: () => {} });
     const path = new TextEncoder().encode("file.txt");
     new Uint8Array(memory.buffer).set(path, 1024);
     assertEqual(shim.path_filestat_get(3, 0, 1024, path.length, 2048), 0, "ESUCCESS");
-    assertEqual(calls.find(([op]) => op === "fs.stat")?.[1]?.path, "/sandbox/file.txt", "decoded guest path");
+    assertEqual(calls.find(([op]) => op === "fs.stat" || op === "fs.lstat")?.[1]?.path, "/sandbox/file.txt", "decoded guest path");
   } finally {
     globalThis.TextDecoder = Native;
   }
