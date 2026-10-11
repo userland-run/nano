@@ -1381,6 +1381,8 @@ class NanoVM {
           const cdv = new DataView(this._memory.buffer);
           const childFds = [];
           for (let i = 0; i < MAX_FDS; i++) childFds.push(this._fdRead(cdv, i));
+          // Release the child's VM-local fds (what the parent holds survives).
+          if (frame.held) this._exports.vm_fork_exit(this._vmPtr);
           this._forkRestore(frame.snap);
           for (const fe of childFds) this._releaseHost(fe.fd_type, fe.host_fd);
           const fdv = new DataView(this._memory.buffer);
@@ -2210,7 +2212,11 @@ class NanoVM {
       // first (clone returns 0 to the child). The parent is restored when the
       // child exits. The child's fd table is a copy of the parent's, so its
       // FILE/DIR/PIPE fds share the parent's open-file descriptions.
-      this._forkStack.push({ snap: this._forkSnapshot(), childPid: this._nextPid++ });
+      // vm_fork_hold records the parent's fd table in the VM too, so a child
+      // closing an inherited socket/eventfd/timerfd/epoll fd (httpd's
+      // per-connection child closes the listening socket) doesn't free it.
+      const held = this._exports.vm_fork_hold ? this._exports.vm_fork_hold(this._vmPtr) === 0 : false;
+      this._forkStack.push({ snap: this._forkSnapshot(), childPid: this._nextPid++, held });
       // A caller-supplied child stack (posix_spawn's CLONE_VM|CLONE_VFORK) is
       // installed only now, after the parent's sp went into the snapshot.
       if (arg3) dv.setBigUint64(this._vmPtr + 16, BigInt(arg3), true);

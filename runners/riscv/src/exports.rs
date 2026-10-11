@@ -575,6 +575,24 @@ pub unsafe extern "C" fn vm_signals_load() {
     crate::syscall::signals_load();
 }
 
+/// Serialized fork: record the parent's fd table so a child closing an
+/// inherited socket / eventfd / timerfd / epoll fd doesn't free the parent's
+/// object. Called by the host when it snapshots the parent at clone(). Returns
+/// 0, or -1 if fork nesting is too deep (then skip vm_fork_exit for it).
+#[no_mangle]
+pub unsafe extern "C" fn vm_fork_hold(vm_ptr: u32) -> i32 {
+    let vm = &*(vm_ptr as *const Vm);
+    crate::syscall::fork_hold(vm)
+}
+
+/// The forked child exited: release its VM-local fds and pop the parent's
+/// recorded table. Called before the host restores the parent's Vm struct.
+#[no_mangle]
+pub unsafe extern "C" fn vm_fork_exit(vm_ptr: u32) {
+    let vm = &mut *(vm_ptr as *mut Vm);
+    crate::syscall::fork_exit(vm);
+}
+
 /// Address + byte size of the in-memory socket table. The host copies these bytes
 /// into snapshot() and writes them back in restoreAndRun() (after the restore
 /// reset) so a warm-restored server keeps its listening/connected sockets.

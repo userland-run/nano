@@ -344,5 +344,35 @@ await test("dirfd-relative *at() resolution (host)", async () => {
   memfs.close(hostFd);
 });
 
+await test("busybox httpd (fork per connection) answers every connection, not just the first", async () => {
+  // httpd forks a child per accepted connection, and the child closes the
+  // inherited listening socket. Fork is serialized (the parent's fd table is
+  // suspended in a host snapshot), so that close used to free the socket slot
+  // under the parent: the first request was answered, then the server was gone.
+  memfs.createDir("/www");
+  vm.addFile("/www/index.html", "hello-httpd\n");
+  const run = vm.run("httpd -f -p 8080 -h /www", { maxSteps: 2_000_000_000 });
+  try {
+    // Wait until the listener exists (injection fails until bind+listen ran).
+    const req = "GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const inject = () => vm.virtualServer.injectConnection(8080, req);
+    const within = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`no response in ${ms}ms`)), ms))]);
+    let first = null;
+    for (let i = 0; i < 100 && !first; i++) {
+      try { first = await within(inject(), 10_000); } catch (e) { if (!/no server on port/.test(e.message)) throw e; await new Promise((r) => setTimeout(r, 50)); }
+    }
+    const responses = [first];
+    for (let i = 1; i < 3; i++) responses.push(await within(inject(), 10_000));
+    responses.forEach((r, i) => {
+      const text = new TextDecoder().decode(r ?? new Uint8Array(0));
+      assert(/^HTTP\/1\.[01] 200/.test(text), `request ${i + 1} answered 200 (${JSON.stringify(text.slice(0, 40))})`);
+      assert(text.endsWith("hello-httpd\n"), `request ${i + 1} body served`);
+    });
+  } finally {
+    vm.cancelRun();
+    await run;
+  }
+});
+
 console.log(`\n=== shipped host: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);

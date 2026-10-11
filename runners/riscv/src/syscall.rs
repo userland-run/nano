@@ -564,6 +564,7 @@ pub unsafe fn reset_statics() {
     EPOLL_FINITE_TIMEOUT_ACTIVE = false;
     EPOLL_BLOCKED_TIMEOUT_MS = 0;
     MMAP_FREE_COUNT = 0; // free-list isn't part of the snapshot image
+    FORK_DEPTH = 0; // a cancelled run can leave suspended fork parents behind
     crate::tty::reset();
     signals_reset();
 }
@@ -1595,7 +1596,82 @@ unsafe fn other_fd_ref(vm: &Vm, fd: usize, fd_type: i32, host_fd: i32) -> bool {
         }
         i += 1;
     }
+    fork_held(None, fd_type, host_fd)
+}
+
+// ---- Suspended fork parents' fd tables ----
+//
+// Fork is serialized: the host snapshots the parent and runs the child to exit
+// first. The parent's fd table then lives only in the host's snapshot, so the
+// "is this the last reference?" scan for VM-local objects (socket / eventfd /
+// timerfd slots, epoll interest) must also see it — otherwise a forked child
+// closing an inherited fd frees the object under the parent. (BusyBox httpd's
+// per-connection child closes the listening socket: the server then answered
+// one connection and was gone.) The host pushes the parent's table here at
+// fork (vm_fork_hold) and pops it when the child exits (vm_fork_exit).
+const FORK_MAX_DEPTH: usize = 32;
+// All-zero so the tables cost no wasm data; only rows < FORK_DEPTH are read.
+const ZERO_FD: FdEntry = FdEntry { fd_type: FD_TYPE_NONE, host_fd: 0, offset: 0, flags: 0, fd_flags: 0 };
+static mut FORK_FD_TABLES: [[FdEntry; MAX_FDS]; FORK_MAX_DEPTH] = [[ZERO_FD; MAX_FDS]; FORK_MAX_DEPTH];
+static mut FORK_DEPTH: usize = 0;
+
+/// True when a suspended fork parent references (fd_type, host_fd) — at guest
+/// fd `at` only (epoll interest is keyed by fd number), or at any fd (`None`).
+unsafe fn fork_held(at: Option<usize>, fd_type: i32, host_fd: i32) -> bool {
+    let mut d = 0;
+    while d < FORK_DEPTH {
+        let t = &*core::ptr::addr_of!(FORK_FD_TABLES[d]);
+        let (mut i, end) = match at {
+            Some(fd) => (fd, fd + 1),
+            None => (0, MAX_FDS),
+        };
+        while i < end && i < MAX_FDS {
+            if t[i].fd_type == fd_type && t[i].host_fd == host_fd {
+                return true;
+            }
+            i += 1;
+        }
+        d += 1;
+    }
     false
+}
+
+/// Drop guest fd `fd`'s epoll interest unless a suspended fork parent holds
+/// the same object at the same fd number (its registration must survive).
+unsafe fn epoll_forget_unheld(vm: &Vm, fd: usize) {
+    let e = vm.fd_table[fd];
+    if !fork_held(Some(fd), e.fd_type, e.host_fd) {
+        epoll_forget_fd(fd as i32, e.fd_type == FD_TYPE_EPOLL);
+    }
+}
+
+/// Fork: record the parent's fd table (the host snapshots the rest). Returns
+/// 0, or -1 when nesting exceeds FORK_MAX_DEPTH (then nothing is recorded and
+/// the caller must not call fork_exit for this frame).
+pub unsafe fn fork_hold(vm: &Vm) -> i32 {
+    if FORK_DEPTH >= FORK_MAX_DEPTH {
+        return -1;
+    }
+    FORK_FD_TABLES[FORK_DEPTH] = vm.fd_table;
+    FORK_DEPTH += 1;
+    0
+}
+
+/// A forked child exited: release its VM-local fds (those the parent — or an
+/// outer suspended ancestor — still holds survive), then forget the parent's
+/// recorded table. Call before the host restores the parent's Vm struct.
+pub unsafe fn fork_exit(vm: &mut Vm) {
+    let mut fd = 0;
+    while fd < MAX_FDS {
+        let t = vm.fd_table[fd].fd_type;
+        if t != FD_TYPE_NONE && !host_owned(t) {
+            drop_fd_local(vm, fd);
+        }
+        fd += 1;
+    }
+    if FORK_DEPTH > 0 {
+        FORK_DEPTH -= 1;
+    }
 }
 
 /// Release the Rust-side resource behind guest fd `fd` (socket slot, eventfd /
@@ -1605,7 +1681,7 @@ unsafe fn other_fd_ref(vm: &Vm, fd: usize, fd_type: i32, host_fd: i32) -> bool {
 /// host for those. Returns the entry that was there.
 unsafe fn drop_fd_local(vm: &mut Vm, fd: usize) -> FdEntry {
     let e = vm.fd_table[fd];
-    epoll_forget_fd(fd as i32, e.fd_type == FD_TYPE_EPOLL);
+    epoll_forget_unheld(vm, fd);
     let last = !other_fd_ref(vm, fd, e.fd_type, e.host_fd);
     match e.fd_type {
         FD_TYPE_SOCKET if last => {
@@ -1666,7 +1742,7 @@ unsafe fn sys_close(vm: &mut Vm, fd: i32) -> i64 {
         // a suspended fork parent — still references it. (Deciding that here
         // would miss the parent's references: a forked child closing an
         // inherited fd must not close the parent's file.)
-        epoll_forget_fd(fd, false);
+        epoll_forget_unheld(vm, fd as usize);
         sys_fs_request(vm, SYS_CLOSE as i32, fd, 0, 0, 0);
         return 0; // status set by fs_request
     }
@@ -2342,7 +2418,7 @@ unsafe fn sys_dup3(vm: &mut Vm, old_fd: i32, new_fd: i32, flags: i32) -> i64 {
     if vm.fd_table[new_fd as usize].fd_type != FD_TYPE_NONE {
         prev = vm.fd_table[new_fd as usize];
         if host_owned(prev.fd_type) {
-            epoll_forget_fd(new_fd, false);
+            epoll_forget_unheld(vm, new_fd as usize);
         } else {
             drop_fd_local(vm, new_fd as usize);
         }
