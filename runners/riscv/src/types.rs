@@ -32,35 +32,35 @@ pub const PAGE_MASK: u64 = !(PAGE_SIZE - 1);
 // Max file descriptors
 pub const MAX_FDS: usize = 64;
 
-// Max mmap regions
-pub const MAX_MMAP_REGIONS: usize = 16;
-
 // Thread FS request offset within VM struct
 pub const THREAD_FS_OFFSET: u32 = 3972;
 
+/// FD_CLOEXEC bit in FdEntry::fd_flags (per-descriptor, not shared by dups).
+pub const FD_CLOEXEC: i32 = 1;
+
 /// File descriptor entry (24 bytes)
+///
+/// For FILE/DIR fds the authoritative file offset and open (status) flags live
+/// on the host's shared open-file description (MemFS.openFiles[host_fd]), which
+/// dup/dup3/F_DUPFD and fork share — so `cmd >f 2>&1` appends instead of
+/// overwriting. `offset` here is unused for those types; `flags` keeps a
+/// per-process copy of the status flags for F_GETFL.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct FdEntry {
     pub fd_type: i32,     // 0
     pub host_fd: i32,     // 4
     pub offset: i64,      // 8
-    pub flags: i32,       // 16
-    pub _pad: i32,        // 20
-}
-
-/// Memory mapping entry (32 bytes)
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct MmapEntry {
-    pub guest_addr: u64,  // 0
-    pub length: u64,      // 8
-    pub prot: i32,        // 16
-    pub flags: i32,       // 20
-    pub offset: u64,      // 24
+    pub flags: i32,       // 16: open/status flags (O_APPEND, O_NONBLOCK, …)
+    pub fd_flags: i32,    // 20: descriptor flags (FD_CLOEXEC)
 }
 
 /// FS request block (552 bytes)
+///
+/// `path`/`path2` hold at most 255 bytes and are kept only for older hosts. The
+/// full NUL-terminated paths (up to PATH_MAX = 4096) are copied into static
+/// buffers exposed via vm_fs_path_ptr()/vm_fs_path2_ptr(); a path that does not
+/// fit fails with ENAMETOOLONG instead of being silently truncated.
 #[repr(C)]
 pub struct FsRequest {
     pub syscall_nr: i32,      // 0
@@ -133,9 +133,9 @@ pub struct Vm {
     pub fs_request: FsRequest,   // 2216..2768 (552 bytes)
     pub fs_response: FsResponse, // 2768..2792 (24 bytes)
 
-    // === mmap table (offset 2792) ===
-    pub mmap_entries: [MmapEntry; MAX_MMAP_REGIONS], // 2792..3304 (16 * 32 = 512)
-    pub mmap_count: i32,         // 3304..3308
+    // === formerly the (write-only, never read) mmap table; kept as reserved
+    // space so every later offset the JS host hardcodes stays put ===
+    pub _reserved_mmap: [u8; 516], // 2792..3308
     pub _mmap_pad: i32,          // 3308..3312
     pub mmap_next_addr: u64,     // 3312..3320
 
@@ -231,6 +231,14 @@ mod tests {
         assert_eq!(offset_of!(Vm, fs_request), 2216);
         assert_eq!(offset_of!(Vm, cwd), 3680);
         assert_eq!(offset_of!(Vm, ram_base), 3960);
+        // Also hardcoded by the host: fd table, brk/mmap frontier (fork
+        // snapshots), and the per-fd descriptor-flags word (FD_CLOEXEC).
+        assert_eq!(offset_of!(Vm, fd_table), 600);
+        assert_eq!(offset_of!(Vm, brk_current), 568);
+        assert_eq!(offset_of!(Vm, mmap_next_addr), 3312);
+        assert_eq!(size_of::<FdEntry>(), 24);
+        assert_eq!(offset_of!(FdEntry, flags), 16);
+        assert_eq!(offset_of!(FdEntry, fd_flags), 20);
     }
 
     #[test]

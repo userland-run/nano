@@ -121,6 +121,18 @@ const ENOTCONN: i64 = -107;
 const ECONNREFUSED: i64 = -111;
 const EINPROGRESS: i64 = -115;
 const EAFNOSUPPORT: i64 = -97;
+const EFAULT: i64 = -14;
+const ENODEV: i64 = -19;
+const EEXIST: i64 = -17;
+const ENOSPC: i64 = -28;
+const EMFILE: i64 = -24;
+
+// open/fcntl flag bits (RISC-V Linux generic values)
+const O_NONBLOCK: i32 = 0x800;
+const O_CLOEXEC: i32 = 0x80000;
+/// Status flags F_SETFL may change (O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME);
+/// the access mode and creation flags are fixed at open time.
+const SETFL_MASK: i32 = 0x400 | 0x800 | 0x2000 | 0x4000 | 0x40000;
 
 // ============================================================
 // In-memory loopback socket layer
@@ -214,6 +226,10 @@ const EPOLLHUP: u32 = 0x010;
 const MAX_EVENTFDS: usize = 16;
 static mut EVENTFD_COUNTERS: [u32; MAX_EVENTFDS] = [0; MAX_EVENTFDS];
 static mut EVENTFD_ALLOC: usize = 0;
+/// Bitmask of eventfd slots below EVENTFD_ALLOC released by close() and free
+/// for reuse. Deliberately not part of the evloop snapshot dump (its layout is
+/// fixed); after a restore every slot below the high-water mark counts as used.
+static mut EVENTFD_FREE: u32 = 0;
 
 // Pipe identity counter — monotonic across the VM lifetime (deliberately NOT reset
 // by reset_statics, so pipe ids stay unique across execve/fork). The host keys its
@@ -230,6 +246,8 @@ static mut TIMERFD_EXPIRY_MS: [f64; MAX_TIMERFDS] = [0.0; MAX_TIMERFDS];
 /// Interval in ms for repeating timers (0.0 = one-shot)
 static mut TIMERFD_INTERVAL_MS: [f64; MAX_TIMERFDS] = [0.0; MAX_TIMERFDS];
 static mut TIMERFD_ALLOC: usize = 0;
+/// Released timerfd slots (see EVENTFD_FREE).
+static mut TIMERFD_FREE: u32 = 0;
 
 /// Hint for find_runnable: set when any thread enters EPOLL_WAIT with a
 /// finite positive timeout (e.g. libuv timer). Tells find_runnable to wake
@@ -526,6 +544,8 @@ pub unsafe fn evloop_load() {
     EVENTFD_ALLOC = c[1] as usize;
     TIMERFD_ALLOC = c[2] as usize;
     EPOLL_FINITE_TIMEOUT_ACTIVE = c[3] != 0;
+    EVENTFD_FREE = 0;
+    TIMERFD_FREE = 0;
 }
 
 /// Reset all static mut globals to their initial state.
@@ -539,6 +559,8 @@ pub unsafe fn reset_statics() {
     TIMERFD_EXPIRY_MS = [0.0; MAX_TIMERFDS];
     TIMERFD_INTERVAL_MS = [0.0; MAX_TIMERFDS];
     TIMERFD_ALLOC = 0;
+    EVENTFD_FREE = 0;
+    TIMERFD_FREE = 0;
     EPOLL_FINITE_TIMEOUT_ACTIVE = false;
     EPOLL_BLOCKED_TIMEOUT_MS = 0;
     MMAP_FREE_COUNT = 0; // free-list isn't part of the snapshot image
@@ -690,7 +712,7 @@ pub unsafe fn handle(vm: &mut Vm) {
         }
         SYS_RENAMEAT2 => {
             // Copy first path, then second path into path2
-            sys_fs_request_rename(vm, a0 as i32, a1, a2 as i32, a3);
+            sys_fs_request_rename(vm, a0 as i32, a1, a2 as i32, a3, a4 as i64);
             return;
         }
         SYS_STATX => {
@@ -699,7 +721,12 @@ pub unsafe fn handle(vm: &mut Vm) {
         }
 
         SYS_GETCWD => sys_getcwd(vm, a0, a1 as u32),
-        SYS_CHDIR => sys_chdir(vm, a0),
+        SYS_CHDIR => {
+            // The host validates the target (ENOENT/ENOTDIR), canonicalizes it
+            // against the current cwd, and stores it into vm.cwd.
+            sys_fs_request(vm, SYS_CHDIR as i32, -100, a0, 0, 0);
+            return;
+        }
 
         SYS_CLOCK_GETTIME => sys_clock_gettime(vm, a0 as i32, a1),
         SYS_NANOSLEEP => sys_nanosleep(vm, a0),
@@ -753,7 +780,7 @@ pub unsafe fn handle(vm: &mut Vm) {
         }
 
         SYS_DUP => sys_dup(vm, a0 as i32),
-        SYS_DUP3 => sys_dup3(vm, a0 as i32, a1 as i32),
+        SYS_DUP3 => sys_dup3(vm, a0 as i32, a1 as i32, a2 as i32),
         SYS_FCNTL => sys_fcntl(vm, a0 as i32, a1 as i32, a2),
         SYS_IOCTL => sys_ioctl(vm, a0 as i32, a1),
         SYS_PIPE2 => sys_pipe2(vm, a0, a1 as i32),
@@ -772,7 +799,7 @@ pub unsafe fn handle(vm: &mut Vm) {
         SYS_TIMES => 0,        // stub
         SYS_CLOCK_GETRES => sys_clock_getres(vm, a0 as i32, a1),
         SYS_PRCTL => 0,        // stub: always succeed
-        SYS_TIMERFD_CREATE => sys_timerfd_create(vm),
+        SYS_TIMERFD_CREATE => sys_timerfd_create(vm, a1 as i32),
         SYS_TIMERFD_SETTIME => sys_timerfd_settime(vm, a0 as i32, a1 as i32, a2, a3),
         SYS_RSEQ => ENOSYS,       // not supported
 
@@ -870,6 +897,10 @@ unsafe fn sys_mmap(
     fd: i32,
     offset: u64,
 ) -> i64 {
+    let _ = prot;
+    if length == 0 || offset & (PAGE_SIZE - 1) != 0 {
+        return EINVAL;
+    }
     let len = (length + PAGE_SIZE - 1) & PAGE_MASK;
 
     // MAP_ANONYMOUS (0x20)
@@ -877,10 +908,22 @@ unsafe fn sys_mmap(
     // MAP_FIXED (0x10)
     let is_fixed = flags & 0x10 != 0;
 
+    // File-backed mapping: only regular files can be mapped. Validate before
+    // reserving address space so a failure can't leak a region.
+    if !is_anon {
+        if fd < 0 || fd >= MAX_FDS as i32 {
+            return EBADF;
+        }
+        let fe = vm.fd_table[fd as usize];
+        if fe.fd_type != FD_TYPE_FILE || fe.host_fd < 0 {
+            return if fe.fd_type == FD_TYPE_NONE { EBADF } else { ENODEV };
+        }
+    }
+
     let ram_limit = vm.ram_size as u64;
 
     // True when this address came from the munmap free list (below the frontier,
-    // holding stale bytes) → must be fully zeroed for MAP_ANONYMOUS.
+    // holding stale bytes) → must be fully zeroed.
     let mut reused = false;
     let guest_addr = if is_fixed && addr != 0 {
         // MAP_FIXED: must use the exact address
@@ -920,18 +963,32 @@ unsafe fn sys_mmap(
     };
 
     // Check bounds for MAP_FIXED
-    let end = guest_addr + len;
+    let end = match guest_addr.checked_add(len) {
+        Some(e) => e,
+        None => return ENOMEM,
+    };
     if end > ram_limit {
         return ENOMEM;
     }
 
-    // Zero the region for anonymous mappings. Mappings taken from the bump
-    // frontier at/above the high-water mark are virgin (engine-zero) memory —
-    // skip the redundant memset. MAP_FIXED and free-list reuse can land on dirty
-    // memory, so zero those unconditionally.
-    if is_anon && reused {
+    if is_fixed && addr != 0 {
+        // A fixed mapping now owns [addr, end): it must never be handed out
+        // again by the free list, and if it overlaps the bump frontier the
+        // frontier moves past it so the next bump allocation can't alias it.
+        free_list_remove(guest_addr, len);
+        if guest_addr < vm.mmap_next_addr && end > vm.mmap_next_addr {
+            vm.mmap_next_addr = end;
+        }
+    }
+
+    // Zero the region (anonymous memory must read as zero; a file mapping's
+    // tail past EOF must too). Mappings taken from the bump frontier at/above
+    // the high-water mark are virgin (engine-zero) memory — skip the redundant
+    // memset. MAP_FIXED and free-list reuse can land on dirty memory, so zero
+    // those unconditionally.
+    if reused {
         mem::zero_mem(vm.ram_base, guest_addr, len as usize);
-    } else if is_anon {
+    } else {
         let end_addr = guest_addr + len;
         let from_bump = !(is_fixed && addr != 0);
         if !(from_bump && guest_addr >= MMAP_HWM) {
@@ -948,40 +1005,55 @@ unsafe fn sys_mmap(
         }
     }
 
-    // Record in mmap table
-    let idx = vm.mmap_count as usize;
-    if idx < MAX_MMAP_REGIONS {
-        vm.mmap_entries[idx] = MmapEntry {
-            guest_addr,
-            length: len,
-            prot: prot as i32,
-            flags: flags as i32,
-            offset,
-        };
-        vm.mmap_count += 1;
+    if !is_anon {
+        // Populate the mapping from the file: the host preads up to `length`
+        // bytes at `offset` into [guest_addr, …) and returns guest_addr in a0
+        // (or -errno). This is a private snapshot of the file contents —
+        // MAP_SHARED stores are NOT written back to the file.
+        vm.fs_request.syscall_nr = SYS_MMAP as i32;
+        vm.fs_request.fd = fd;
+        vm.fs_request.buf_ptr = guest_addr as u32;
+        vm.fs_request.buf_len = length.min(len) as u32;
+        vm.fs_request.arg1 = guest_addr as i64;
+        vm.fs_request.arg2 = offset as i64;
+        vm.fs_request.arg3 = length as i64;
+        vm.status = STATUS_FS_PENDING;
     }
 
     guest_addr as i64
 }
 
 unsafe fn sys_munmap(vm: &mut Vm, addr: u64, length: u64) -> i64 {
+    if addr & (PAGE_SIZE - 1) != 0 || length == 0 {
+        return EINVAL;
+    }
     // Frontier reclaim: the mmap bump allocator normally never shrinks, so a
     // long-running guest (e.g. `opencode serve`, whose V8 GC churns tens of
     // thousands of mmap/munmap pairs) marches mmap_next_addr to the RAM limit
-    // and OOMs. When a region ends exactly at the frontier, pull the frontier
-    // back so the space is reused — this reclaims LIFO-freed allocations (the
-    // common V8 page-pool pattern) with zero bookkeeping and no reuse hazard
-    // (only the bump pointer moves; nothing stale is ever handed back live).
-    // Also absorb any free-listed regions that are now adjacent to the frontier.
-    if addr != 0 && length != 0 {
+    // and OOMs. When a region reaches the frontier, pull the frontier back so
+    // the space is reused — this reclaims LIFO-freed allocations (the common V8
+    // page-pool pattern) with zero bookkeeping and no reuse hazard (only the
+    // bump pointer moves; nothing stale is ever handed back live). Also absorb
+    // any free-listed regions that are now adjacent to the frontier.
+    if addr != 0 {
         let len = (length + PAGE_SIZE - 1) & PAGE_MASK;
-        let end = addr + len;
-        if end == vm.mmap_next_addr {
+        let end = addr.saturating_add(len);
+        // Drop any overlap with ranges already on the free list first, so a
+        // double munmap (or an overlapping one) can never list the same pages
+        // twice and hand them out to two later mmaps.
+        free_list_remove(addr, len);
+        let front = vm.mmap_next_addr;
+        if addr >= front {
+            // Above the bump frontier (MAP_FIXED area / stack): not bump space,
+            // never reused by the allocator.
+            return 0;
+        }
+        if end >= front {
             vm.mmap_next_addr = addr;
             coalesce_free_frontier(vm);
             return 0;
         }
-        // Not at the frontier: record it for first-fit reuse (bounded list; a
+        // Below the frontier: record it for first-fit reuse (bounded list; a
         // full list just means that region stays un-reclaimed — degrades to the
         // old no-op, never corrupts).
         if MMAP_FREE_COUNT < MMAP_FREE_CAP {
@@ -996,6 +1068,8 @@ unsafe fn sys_munmap(vm: &mut Vm, addr: u64, length: u64) -> i64 {
 // mmap (first-fit) so the guest address space stays bounded to the working set.
 // Module-global (single guest, cooperative — like BRK_HWM/MMAP_HWM); cleared on
 // program load via reset_mmap_free() so a new program never reuses stale ranges.
+// Invariant: entries never overlap each other (sys_munmap / MAP_FIXED subtract
+// a range before inserting or claiming it).
 const MMAP_FREE_CAP: usize = 1024;
 static mut MMAP_FREE: [(u64, u64); MMAP_FREE_CAP] = [(0, 0); MMAP_FREE_CAP];
 static mut MMAP_FREE_COUNT: usize = 0;
@@ -1006,9 +1080,50 @@ pub unsafe fn reset_mmap_free() {
     MMAP_FREE_COUNT = 0;
 }
 
+/// Subtract [addr, addr+len) from every free-list entry (splitting an entry
+/// that strictly contains it). If the list is full when a split needs a second
+/// slot, the right-hand remainder is dropped — it just stays un-reclaimed.
+unsafe fn free_list_remove(addr: u64, len: u64) {
+    let end = addr.saturating_add(len);
+    let mut i = 0;
+    while i < MMAP_FREE_COUNT {
+        let (faddr, flen) = MMAP_FREE[i];
+        let fend = faddr + flen;
+        if fend <= addr || faddr >= end {
+            i += 1;
+            continue;
+        }
+        let left = if faddr < addr { Some((faddr, addr - faddr)) } else { None };
+        let right = if fend > end { Some((end, fend - end)) } else { None };
+        match (left, right) {
+            (Some(l), Some(r)) => {
+                MMAP_FREE[i] = l;
+                if MMAP_FREE_COUNT < MMAP_FREE_CAP {
+                    MMAP_FREE[MMAP_FREE_COUNT] = r;
+                    MMAP_FREE_COUNT += 1;
+                }
+                i += 1;
+            }
+            (Some(l), None) => {
+                MMAP_FREE[i] = l;
+                i += 1;
+            }
+            (None, Some(r)) => {
+                MMAP_FREE[i] = r;
+                i += 1;
+            }
+            (None, None) => {
+                // Fully covered: swap-remove and re-examine slot i.
+                MMAP_FREE[i] = MMAP_FREE[MMAP_FREE_COUNT - 1];
+                MMAP_FREE_COUNT -= 1;
+            }
+        }
+    }
+}
+
 /// After the frontier moves back, absorb any free-listed region that now ends at
-/// the frontier (repeatedly), turning scattered LIFO frees into one contiguous
-/// reclaim.
+/// (or past) the frontier (repeatedly), turning scattered LIFO frees into one
+/// contiguous reclaim.
 unsafe fn coalesce_free_frontier(vm: &mut Vm) {
     let mut progress = true;
     while progress {
@@ -1016,11 +1131,15 @@ unsafe fn coalesce_free_frontier(vm: &mut Vm) {
         let mut i = 0;
         while i < MMAP_FREE_COUNT {
             let (faddr, flen) = MMAP_FREE[i];
-            if faddr + flen == vm.mmap_next_addr {
+            if faddr + flen >= vm.mmap_next_addr && faddr < vm.mmap_next_addr {
                 vm.mmap_next_addr = faddr;
                 MMAP_FREE[i] = MMAP_FREE[MMAP_FREE_COUNT - 1];
                 MMAP_FREE_COUNT -= 1;
                 progress = true;
+            } else if faddr >= vm.mmap_next_addr {
+                // Entirely at/above the frontier now — no longer free-list space.
+                MMAP_FREE[i] = MMAP_FREE[MMAP_FREE_COUNT - 1];
+                MMAP_FREE_COUNT -= 1;
             } else {
                 i += 1;
             }
@@ -1165,6 +1284,9 @@ unsafe fn sys_pread64(vm: &mut Vm, fd: i32, buf: u64, count: u32, offset: u64) -
 
     match fd_type {
         FD_TYPE_FILE => {
+            if !mem::range_ok(buf, count as u64) {
+                return EFAULT;
+            }
             // Delegate to host via FS protocol with SYS_PREAD64 marker
             // arg1 = count, arg2 = explicit offset
             vm.fs_request.syscall_nr = SYS_PREAD64 as i32;
@@ -1194,6 +1316,9 @@ unsafe fn sys_pwrite64(vm: &mut Vm, fd: i32, buf: u64, count: u32, offset: u64) 
 
     match fd_type {
         FD_TYPE_FILE => {
+            if !mem::range_ok(buf, count as u64) {
+                return EFAULT;
+            }
             // Delegate to host via FS protocol with SYS_PWRITE64 marker.
             // arg1 = count, arg2 = explicit offset (the FD cursor is left alone).
             vm.fs_request.syscall_nr = SYS_PWRITE64 as i32;
@@ -1224,6 +1349,9 @@ unsafe fn sys_pwritev(vm: &mut Vm, fd: i32, iov: u64, iovcnt: u32, offset: u64) 
                 let iov_base = mem::read_u64(vm.ram_base, iov + (i as u64) * 16);
                 let iov_len = mem::read_u64(vm.ram_base, iov + (i as u64) * 16 + 8) as u32;
                 if iov_len > 0 {
+                    if !mem::range_ok(iov_base, iov_len as u64) {
+                        return EFAULT;
+                    }
                     vm.fs_request.syscall_nr = SYS_PWRITEV as i32;
                     vm.fs_request.fd = fd;
                     vm.fs_request.buf_ptr = iov_base as u32;
@@ -1259,6 +1387,9 @@ unsafe fn sys_preadv(vm: &mut Vm, fd: i32, iov: u64, iovcnt: u32, offset: u64) -
                 let iov_base = mem::read_u64(vm.ram_base, iov + (i as u64) * 16);
                 let iov_len = mem::read_u64(vm.ram_base, iov + (i as u64) * 16 + 8) as u32;
                 if iov_len > 0 {
+                    if !mem::range_ok(iov_base, iov_len as u64) {
+                        return EFAULT;
+                    }
                     // Dispatch FS request: use SYS_PREADV marker so JS host knows
                     // to use the explicit offset and not update the FD cursor
                     vm.fs_request.syscall_nr = SYS_PREADV as i32;
@@ -1329,12 +1460,20 @@ unsafe fn sys_write(vm: &mut Vm, fd: i32, buf: u64, count: u32) -> i64 {
 
     match fd_type {
         FD_TYPE_STDOUT | FD_TYPE_STDERR => {
+            // The host reads [buf, buf+count) straight out of linear memory, so
+            // it must lie inside guest RAM.
+            if !mem::range_ok(buf, count as u64) {
+                return EFAULT;
+            }
             // Console output, with tty OPOST/ONLCR post-processing.
             console_write_tty(vm, fd, buf, count);
             count as i64
         }
         FD_TYPE_DEVNULL => count as i64,
         FD_TYPE_FILE | FD_TYPE_PIPE => {
+            if !mem::range_ok(buf, count as u64) {
+                return EFAULT;
+            }
             // Delegate to host via FS protocol
             vm.fs_request.syscall_nr = SYS_WRITE as i32;
             vm.fs_request.fd = fd;
@@ -1388,6 +1527,9 @@ unsafe fn sys_read(vm: &mut Vm, fd: i32, buf: u64, count: u32) -> i64 {
             }
         }
         FD_TYPE_FILE | FD_TYPE_PIPE => {
+            if !mem::range_ok(buf, count as u64) {
+                return EFAULT;
+            }
             // Delegate to host via FS protocol
             vm.fs_request.syscall_nr = SYS_READ as i32;
             vm.fs_request.fd = fd;
@@ -1444,6 +1586,71 @@ unsafe fn sys_read(vm: &mut Vm, fd: i32, buf: u64, count: u32) -> i64 {
     }
 }
 
+/// True when another guest fd (≠ `fd`) in this table is `fd_type` with `host_fd`.
+unsafe fn other_fd_ref(vm: &Vm, fd: usize, fd_type: i32, host_fd: i32) -> bool {
+    let mut i = 0;
+    while i < MAX_FDS {
+        if i != fd && vm.fd_table[i].fd_type == fd_type && vm.fd_table[i].host_fd == host_fd {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Release the Rust-side resource behind guest fd `fd` (socket slot, eventfd /
+/// timerfd slot, epoll interest entries) when this fd is its last reference in
+/// the table, then clear the entry. FILE/DIR/PIPE resources are host-owned
+/// (shared open-file descriptions / pipe buffers) — the caller notifies the
+/// host for those. Returns the entry that was there.
+unsafe fn drop_fd_local(vm: &mut Vm, fd: usize) -> FdEntry {
+    let e = vm.fd_table[fd];
+    epoll_forget_fd(fd as i32, e.fd_type == FD_TYPE_EPOLL);
+    let last = !other_fd_ref(vm, fd, e.fd_type, e.host_fd);
+    match e.fd_type {
+        FD_TYPE_SOCKET if last => {
+            let slot = e.host_fd as usize;
+            if slot < MAX_SOCKETS {
+                SOCKETS[slot].state = SOCK_FREE;
+                SOCKETS[slot].guest_fd = -1;
+                SOCKETS[slot].peer_idx = -1;
+                SOCKETS[slot].recv_head = 0;
+                SOCKETS[slot].recv_tail = 0;
+                SOCKETS[slot].accept_head = 0;
+                SOCKETS[slot].accept_tail = 0;
+                // Peer will see EPOLLHUP — wake epoll threads
+                wake_epoll_threads(vm);
+            }
+        }
+        FD_TYPE_EVENTFD if last => {
+            let slot = e.host_fd as usize;
+            if slot < MAX_EVENTFDS {
+                EVENTFD_COUNTERS[slot] = 0;
+                EVENTFD_FREE |= 1 << slot;
+            }
+        }
+        FD_TYPE_TIMERFD if last => {
+            let slot = e.host_fd as usize;
+            if slot < MAX_TIMERFDS {
+                TIMERFD_EXPIRY_MS[slot] = 0.0;
+                TIMERFD_INTERVAL_MS[slot] = 0.0;
+                TIMERFD_FREE |= 1 << slot;
+            }
+        }
+        _ => {}
+    }
+    vm.fd_table[fd] = FdEntry { fd_type: FD_TYPE_NONE, host_fd: -1, offset: 0, flags: 0, fd_flags: 0 };
+    e
+}
+
+/// FILE/DIR/PIPE fds reference host-side shared state (an open-file description
+/// in MemFS.openFiles, or a pipe buffer) that the host reference-counts across
+/// every process's fd table.
+#[inline(always)]
+fn host_owned(fd_type: i32) -> bool {
+    fd_type == FD_TYPE_FILE || fd_type == FD_TYPE_DIR || fd_type == FD_TYPE_PIPE
+}
+
 unsafe fn sys_close(vm: &mut Vm, fd: i32) -> i64 {
     if fd < 0 || fd >= MAX_FDS as i32 {
         return EBADF;
@@ -1453,59 +1660,66 @@ unsafe fn sys_close(vm: &mut Vm, fd: i32) -> i64 {
         return EBADF;
     }
 
-    // For file-backed FDs, notify host — but reference-count the underlying host
-    // file. A dup'd guest fd (dup/dup3/F_DUPFD) shares the same host_fd, so only ask
-    // the host to actually close the file when this is the LAST guest fd referencing
-    // it. Otherwise closing one fd (e.g. busybox sh dup'ing the script fd then closing
-    // the original) would evict the shared host file and make the dup read EOF.
-    if fd_type == FD_TYPE_FILE || fd_type == FD_TYPE_DIR {
-        let host_fd = vm.fd_table[fd as usize].host_fd;
-        let mut other_ref = false;
-        let mut i = 0;
-        while i < MAX_FDS {
-            if i != fd as usize
-                && (vm.fd_table[i].fd_type == FD_TYPE_FILE
-                    || vm.fd_table[i].fd_type == FD_TYPE_DIR)
-                && vm.fd_table[i].host_fd == host_fd
-            {
-                other_ref = true;
-                break;
-            }
-            i += 1;
-        }
-        if other_ref {
-            // Another fd still references the host file; just drop this guest fd.
-            vm.fd_table[fd as usize].fd_type = FD_TYPE_NONE;
-            vm.fd_table[fd as usize].host_fd = -1;
-            return 0;
-        }
+    if host_owned(fd_type) {
+        // The host clears the entry and releases the shared open-file
+        // description / pipe buffer only when no other fd — in this process or
+        // a suspended fork parent — still references it. (Deciding that here
+        // would miss the parent's references: a forked child closing an
+        // inherited fd must not close the parent's file.)
+        epoll_forget_fd(fd, false);
         sys_fs_request(vm, SYS_CLOSE as i32, fd, 0, 0, 0);
         return 0; // status set by fs_request
     }
 
-    // For sockets, clean up socket slot
-    if fd_type == FD_TYPE_SOCKET {
-        let slot = vm.fd_table[fd as usize].host_fd as usize;
-        if slot < MAX_SOCKETS {
-            SOCKETS[slot].state = SOCK_FREE;
-            SOCKETS[slot].guest_fd = -1;
-            SOCKETS[slot].peer_idx = -1;
-            SOCKETS[slot].recv_head = 0;
-            SOCKETS[slot].recv_tail = 0;
-            SOCKETS[slot].accept_head = 0;
-            SOCKETS[slot].accept_tail = 0;
-            // Peer will see EPOLLHUP — wake epoll threads
-            wake_epoll_threads(vm);
-        }
-    }
+    drop_fd_local(vm, fd as usize);
+    0
+}
 
-    vm.fd_table[fd as usize].fd_type = FD_TYPE_NONE;
-    vm.fd_table[fd as usize].host_fd = -1;
+/// PATH_MAX: capacity (including the NUL) of the host-visible path buffers.
+pub const PATH_CAP: usize = 4096;
+static mut FS_PATH: [u8; PATH_CAP] = [0; PATH_CAP];
+static mut FS_PATH2: [u8; PATH_CAP] = [0; PATH_CAP];
+
+/// Linear-memory address of the full first / second FS request path.
+pub unsafe fn fs_path_ptr() -> u32 {
+    core::ptr::addr_of!(FS_PATH) as u32
+}
+pub unsafe fn fs_path2_ptr() -> u32 {
+    core::ptr::addr_of!(FS_PATH2) as u32
+}
+
+/// Copy the guest path at `addr` into FS_PATH (or FS_PATH2 when `second`), plus
+/// a legacy ≤255-byte copy into fs_request.path/path2 for older hosts. A NULL
+/// pointer stages the empty path. Returns 0, or -ENAMETOOLONG / -EFAULT —
+/// never a silently truncated path.
+unsafe fn stage_path(vm: &mut Vm, addr: u64, second: bool) -> i64 {
+    let full = if second {
+        core::ptr::addr_of_mut!(FS_PATH2) as *mut u8
+    } else {
+        core::ptr::addr_of_mut!(FS_PATH) as *mut u8
+    };
+    let legacy = if second { vm.fs_request.path2.as_mut_ptr() } else { vm.fs_request.path.as_mut_ptr() };
+    let n = if addr == 0 {
+        *full = 0;
+        0
+    } else {
+        let n = mem::copy_cstr(vm.ram_base, addr, full, PATH_CAP);
+        if n < 0 {
+            *legacy = 0;
+            return n;
+        }
+        n as usize
+    };
+    let m = if n < 255 { n } else { 255 };
+    core::ptr::copy_nonoverlapping(full, legacy, m);
+    *legacy.add(m) = 0;
     0
 }
 
 /// Set up a FS request and switch to FS_PENDING status.
-/// The JS host will process the request and resume.
+/// The JS host will process the request and resume. If the path can't be
+/// staged (too long / bad pointer) the syscall fails immediately with that
+/// errno in a0 and no request is issued.
 unsafe fn sys_fs_request(
     vm: &mut Vm,
     syscall_nr: i32,
@@ -1514,73 +1728,40 @@ unsafe fn sys_fs_request(
     arg1: i64,
     arg2: i64,
 ) {
+    let r = stage_path(vm, path_addr, false);
+    if r < 0 {
+        vm.x[10] = r as u64;
+        return;
+    }
     vm.fs_request.syscall_nr = syscall_nr;
     vm.fs_request.fd = fd;
     vm.fs_request.arg1 = arg1;
     vm.fs_request.arg2 = arg2;
-
-    // Copy path if provided (use raw pointer to avoid borrow conflict)
-    if path_addr != 0 {
-        let base = vm.ram_base;
-        let src = (base + path_addr as u32) as *const u8;
-        let dst = vm.fs_request.path.as_mut_ptr();
-        let max = vm.fs_request.path.len() - 1;
-        let mut i = 0;
-        while i < max {
-            let b = src.add(i).read();
-            if b == 0 { break; }
-            dst.add(i).write(b);
-            i += 1;
-        }
-        dst.add(i).write(0);
-    } else {
-        vm.fs_request.path[0] = 0;
-    }
-
     vm.status = STATUS_FS_PENDING;
 }
 
+/// renameat2(olddirfd, oldpath, newdirfd, newpath, flags): fd = olddirfd,
+/// arg1 = newdirfd, arg2 = flags; paths in FS_PATH / FS_PATH2.
 unsafe fn sys_fs_request_rename(
     vm: &mut Vm,
     old_dirfd: i32,
     old_path_addr: u64,
-    _new_dirfd: i32,
+    new_dirfd: i32,
     new_path_addr: u64,
+    flags: i64,
 ) {
+    let mut r = stage_path(vm, old_path_addr, false);
+    if r == 0 {
+        r = stage_path(vm, new_path_addr, true);
+    }
+    if r < 0 {
+        vm.x[10] = r as u64;
+        return;
+    }
     vm.fs_request.syscall_nr = SYS_RENAMEAT2 as i32;
     vm.fs_request.fd = old_dirfd;
-
-    let base = vm.ram_base;
-
-    // Copy old path
-    if old_path_addr != 0 {
-        let src = (base + old_path_addr as u32) as *const u8;
-        let dst = vm.fs_request.path.as_mut_ptr();
-        let max = vm.fs_request.path.len() - 1;
-        let mut i = 0;
-        while i < max {
-            let b = src.add(i).read();
-            if b == 0 { break; }
-            dst.add(i).write(b);
-            i += 1;
-        }
-        dst.add(i).write(0);
-    }
-    // Copy new path
-    if new_path_addr != 0 {
-        let src = (base + new_path_addr as u32) as *const u8;
-        let dst = vm.fs_request.path2.as_mut_ptr();
-        let max = vm.fs_request.path2.len() - 1;
-        let mut i = 0;
-        while i < max {
-            let b = src.add(i).read();
-            if b == 0 { break; }
-            dst.add(i).write(b);
-            i += 1;
-        }
-        dst.add(i).write(0);
-    }
-
+    vm.fs_request.arg1 = new_dirfd as i64;
+    vm.fs_request.arg2 = flags;
     vm.status = STATUS_FS_PENDING;
 }
 
@@ -1590,20 +1771,13 @@ unsafe fn sys_getcwd(vm: &mut Vm, buf: u64, size: u32) -> i64 {
         len += 1;
     }
     if len + 1 > size as usize {
-        return EINVAL;
+        return -34; // ERANGE
+    }
+    if !mem::range_ok(buf, (len + 1) as u64) {
+        return EFAULT;
     }
     mem::write_bytes(vm.ram_base, buf, &vm.cwd[..len + 1]);
     buf as i64
-}
-
-unsafe fn sys_chdir(vm: &mut Vm, path_addr: u64) -> i64 {
-    let mut buf = [0u8; 256];
-    let len = mem::read_cstr(vm.ram_base, path_addr, &mut buf);
-    if len >= 256 {
-        return EINVAL;
-    }
-    vm.cwd[..len + 1].copy_from_slice(&buf[..len + 1]);
-    0
 }
 
 unsafe fn sys_clock_gettime(vm: &mut Vm, _clk_id: i32, tp: u64) -> i64 {
@@ -1995,21 +2169,12 @@ unsafe fn sys_futex(
 /// On success the host replaces the image and execution resumes at the new entry;
 /// on failure the host writes a negative errno to a0.
 unsafe fn sys_execve(vm: &mut Vm, path_addr: u64, argv: u64, envp: u64) {
-    let base = vm.ram_base;
-    // Copy the executable path into the FS request buffer (null-terminated).
-    let src = (base + path_addr as u32) as *const u8;
-    let dst = vm.fs_request.path.as_mut_ptr();
-    let max = vm.fs_request.path.len() - 1;
-    let mut i = 0;
-    while i < max {
-        let b = src.add(i).read();
-        if b == 0 {
-            break;
-        }
-        dst.add(i).write(b);
-        i += 1;
+    // Copy the executable path into the FS path buffer (null-terminated).
+    let r = stage_path(vm, path_addr, false);
+    if r < 0 {
+        vm.x[10] = r as u64;
+        return;
     }
-    dst.add(i).write(0);
 
     vm.fs_request.syscall_nr = SYS_EXECVE as i32;
     vm.fs_request.fd = 0;
@@ -2040,6 +2205,7 @@ unsafe fn sys_clone(
     const CLONE_CHILD_SETTID: u64 = 0x01000000;
     const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
     const CLONE_SETTLS: u64 = 0x00080000;
+    const CLONE_VFORK: u64 = 0x00004000;
 
     let new_tid = vm.tid + 1;
     vm.tid = new_tid;
@@ -2057,10 +2223,20 @@ unsafe fn sys_clone(
     // snapshots the parent, runs the child first (clone returns 0 to the child),
     // and on the child's exit restores the parent (clone returns the child pid).
     // The value returned here is a placeholder the host overwrites.
-    if flags & CLONE_VM == 0 {
+    //
+    // vfork (CLONE_VM|CLONE_VFORK — musl's vfork() and posix_spawn()) takes the
+    // same path: the parent is suspended until the child execs/exits either
+    // way, and a vfork child may only exec or _exit, so running it on a
+    // snapshot of the parent is indistinguishable from sharing its memory.
+    // Treating it as a thread instead ran parent and child concurrently on one
+    // address space and stack. `stack` (arg3) is the child's sp — posix_spawn
+    // passes a separate child stack that __clone's child path reads fn/arg
+    // from; the host installs it AFTER snapshotting the parent.
+    if flags & CLONE_VM == 0 || flags & CLONE_VFORK != 0 {
         vm.fs_request.syscall_nr = SYS_CLONE as i32;
         vm.fs_request.arg1 = flags as i64;
         vm.fs_request.arg2 = ctid as i64;
+        vm.fs_request.arg3 = stack as i64;
         vm.status = STATUS_FS_PENDING;
         return new_tid as i64;
     }
@@ -2112,6 +2288,27 @@ unsafe fn sys_clone(
     new_tid as i64
 }
 
+/// Copy fd `old` into slot `new` (sharing the host open-file description /
+/// socket / eventfd …), with a fresh descriptor-flag word (FD_CLOEXEC is
+/// per-descriptor and never inherited by a dup).
+#[inline(always)]
+unsafe fn dup_into(vm: &mut Vm, old: usize, new: usize, cloexec: bool) {
+    vm.fd_table[new] = vm.fd_table[old];
+    vm.fd_table[new].fd_flags = if cloexec { FD_CLOEXEC } else { 0 };
+}
+
+/// Lowest free fd >= min, or -EMFILE.
+unsafe fn lowest_free_fd(vm: &Vm, min: usize) -> i64 {
+    let mut i = min;
+    while i < MAX_FDS {
+        if vm.fd_table[i].fd_type == FD_TYPE_NONE {
+            return i as i64;
+        }
+        i += 1;
+    }
+    EMFILE
+}
+
 unsafe fn sys_dup(vm: &mut Vm, old_fd: i32) -> i64 {
     if old_fd < 0 || old_fd >= MAX_FDS as i32 {
         return EBADF;
@@ -2119,25 +2316,45 @@ unsafe fn sys_dup(vm: &mut Vm, old_fd: i32) -> i64 {
     if vm.fd_table[old_fd as usize].fd_type == FD_TYPE_NONE {
         return EBADF;
     }
-
-    // Find first free fd
-    for i in 0..MAX_FDS {
-        if vm.fd_table[i].fd_type == FD_TYPE_NONE {
-            vm.fd_table[i] = vm.fd_table[old_fd as usize];
-            return i as i64;
-        }
+    let n = lowest_free_fd(vm, 0);
+    if n >= 0 {
+        dup_into(vm, old_fd as usize, n as usize, false);
     }
-    -24 // EMFILE
+    n
 }
 
-unsafe fn sys_dup3(vm: &mut Vm, old_fd: i32, new_fd: i32) -> i64 {
+/// dup3(old, new, flags) — also musl's dup2 (which handles old == new itself).
+/// Atomically closes whatever `new` held: Rust-side resources are released
+/// here; a host-owned FILE/DIR/PIPE occupant is released by the host (SYS_DUP3
+/// request: fd = new, arg1 = old occupant's type, arg2 = its host_fd), after
+/// the table already holds the dup so the host's reference scan sees it.
+unsafe fn sys_dup3(vm: &mut Vm, old_fd: i32, new_fd: i32, flags: i32) -> i64 {
     if old_fd < 0 || old_fd >= MAX_FDS as i32 || new_fd < 0 || new_fd >= MAX_FDS as i32 {
         return EBADF;
     }
     if vm.fd_table[old_fd as usize].fd_type == FD_TYPE_NONE {
         return EBADF;
     }
-    vm.fd_table[new_fd as usize] = vm.fd_table[old_fd as usize];
+    if old_fd == new_fd || flags & !O_CLOEXEC != 0 {
+        return EINVAL;
+    }
+    let mut prev = FdEntry { fd_type: FD_TYPE_NONE, host_fd: -1, offset: 0, flags: 0, fd_flags: 0 };
+    if vm.fd_table[new_fd as usize].fd_type != FD_TYPE_NONE {
+        prev = vm.fd_table[new_fd as usize];
+        if host_owned(prev.fd_type) {
+            epoll_forget_fd(new_fd, false);
+        } else {
+            drop_fd_local(vm, new_fd as usize);
+        }
+    }
+    dup_into(vm, old_fd as usize, new_fd as usize, flags & O_CLOEXEC != 0);
+    if host_owned(prev.fd_type) {
+        vm.fs_request.syscall_nr = SYS_DUP3 as i32;
+        vm.fs_request.fd = new_fd;
+        vm.fs_request.arg1 = prev.fd_type as i64;
+        vm.fs_request.arg2 = prev.host_fd as i64;
+        vm.status = STATUS_FS_PENDING; // host releases prev, returns new_fd
+    }
     new_fd as i64
 }
 
@@ -2150,30 +2367,27 @@ unsafe fn sys_fcntl(vm: &mut Vm, fd: i32, cmd: i32, arg: u64) -> i64 {
     }
 
     match cmd {
-        0 => {
-            // F_DUPFD: duplicate to the lowest free fd >= arg (busybox sh relies on
-            // moving the script fd to a high number, e.g. fcntl(fd, F_DUPFD, 10)).
-            let min = arg as usize;
-            let mut result: i64 = -24; // EMFILE
-            let mut i = min;
-            while i < MAX_FDS {
-                if vm.fd_table[i].fd_type == FD_TYPE_NONE {
-                    vm.fd_table[i] = vm.fd_table[fd as usize];
-                    result = i as i64;
-                    break;
-                }
-                i += 1;
+        // F_DUPFD (0) / F_DUPFD_CLOEXEC (1030): duplicate to the lowest free fd
+        // >= arg (busybox sh relies on moving the script fd to a high number,
+        // e.g. fcntl(fd, F_DUPFD, 10)). The CLOEXEC variant marks the new fd
+        // close-on-exec, which execve honors.
+        0 | 1030 => {
+            if arg >= MAX_FDS as u64 {
+                return EINVAL;
             }
-            result
+            let n = lowest_free_fd(vm, arg as usize);
+            if n >= 0 {
+                dup_into(vm, fd as usize, n as usize, cmd == 1030);
+            }
+            n
         }
         1 => {
             // F_GETFD
-            vm.fd_table[fd as usize].flags as i64 & 1
+            (vm.fd_table[fd as usize].fd_flags & FD_CLOEXEC) as i64
         }
         2 => {
             // F_SETFD
-            vm.fd_table[fd as usize].flags =
-                (vm.fd_table[fd as usize].flags & !1) | (arg as i32 & 1);
+            vm.fd_table[fd as usize].fd_flags = arg as i32 & FD_CLOEXEC;
             0
         }
         3 => {
@@ -2181,8 +2395,29 @@ unsafe fn sys_fcntl(vm: &mut Vm, fd: i32, cmd: i32, arg: u64) -> i64 {
             vm.fd_table[fd as usize].flags as i64
         }
         4 => {
-            // F_SETFL
-            vm.fd_table[fd as usize].flags = arg as i32;
+            // F_SETFL: only the status bits are settable. They belong to the
+            // open-file description, so update every fd in this table that
+            // shares it — and, for host-owned files, the host's description
+            // (SYS_FCNTL request; arg2 = new flags).
+            let e = vm.fd_table[fd as usize];
+            let nf = (e.flags & !SETFL_MASK) | (arg as i32 & SETFL_MASK);
+            let mut i = 0;
+            while i < MAX_FDS {
+                if vm.fd_table[i].fd_type == e.fd_type && vm.fd_table[i].host_fd == e.host_fd {
+                    vm.fd_table[i].flags = nf;
+                }
+                i += 1;
+            }
+            if e.fd_type == FD_TYPE_SOCKET && (e.host_fd as usize) < MAX_SOCKETS {
+                SOCKETS[e.host_fd as usize].nonblock = if nf & O_NONBLOCK != 0 { 1 } else { 0 };
+            }
+            if (e.fd_type == FD_TYPE_FILE || e.fd_type == FD_TYPE_DIR) && e.host_fd >= 0 {
+                vm.fs_request.syscall_nr = SYS_FCNTL as i32;
+                vm.fs_request.fd = fd;
+                vm.fs_request.arg1 = 4;
+                vm.fs_request.arg2 = nf as i64;
+                vm.status = STATUS_FS_PENDING;
+            }
             0
         }
         // POSIX advisory record locks (F_GETLK=5, F_SETLK=6, F_SETLKW=7) and the
@@ -2201,23 +2436,6 @@ unsafe fn sys_fcntl(vm: &mut Vm, fd: i32, cmd: i32, arg: u64) -> i64 {
             0
         }
         6 | 7 | 37 | 38 => 0,
-        // F_DUPFD_CLOEXEC: dup to the lowest free fd >= arg, like F_DUPFD. (The
-        // VM has no exec-time fd table to close, so the CLOEXEC bit is a no-op;
-        // returning the dup is what callers need.)
-        1030 => {
-            let min = arg as usize;
-            let mut result: i64 = -24; // EMFILE
-            let mut i = min;
-            while i < MAX_FDS {
-                if vm.fd_table[i].fd_type == FD_TYPE_NONE {
-                    vm.fd_table[i] = vm.fd_table[fd as usize];
-                    result = i as i64;
-                    break;
-                }
-                i += 1;
-            }
-            result
-        }
         _ => EINVAL,
     }
 }
@@ -2305,7 +2523,10 @@ unsafe fn sys_ioctl(vm: &mut Vm, fd: i32, request: u64) -> i64 {
     }
 }
 
-unsafe fn sys_pipe2(vm: &mut Vm, pipefd: u64, _flags: i32) -> i64 {
+unsafe fn sys_pipe2(vm: &mut Vm, pipefd: u64, flags: i32) -> i64 {
+    if !mem::range_ok(pipefd, 8) {
+        return EFAULT;
+    }
     // Find two free FDs
     let mut fds = [0i32; 2];
     let mut found = 0;
@@ -2328,11 +2549,10 @@ unsafe fn sys_pipe2(vm: &mut Vm, pipefd: u64, _flags: i32) -> i64 {
     // reads on the read end (and survive dup/dup2 of either end).
     let id = PIPE_NEXT_ID;
     PIPE_NEXT_ID = PIPE_NEXT_ID.wrapping_add(1).max(1);
-    // Safety: fd0/fd1 come from 0..MAX_FDS loop, guaranteed in bounds
-    vm.fd_table.get_unchecked_mut(fd0).fd_type = FD_TYPE_PIPE;
-    vm.fd_table.get_unchecked_mut(fd0).host_fd = id; // read end
-    vm.fd_table.get_unchecked_mut(fd1).fd_type = FD_TYPE_PIPE;
-    vm.fd_table.get_unchecked_mut(fd1).host_fd = id; // write end
+    let st = flags & O_NONBLOCK;
+    let fdf = if flags & O_CLOEXEC != 0 { FD_CLOEXEC } else { 0 };
+    vm.fd_table[fd0] = FdEntry { fd_type: FD_TYPE_PIPE, host_fd: id, offset: 0, flags: st, fd_flags: fdf }; // read end
+    vm.fd_table[fd1] = FdEntry { fd_type: FD_TYPE_PIPE, host_fd: id, offset: 0, flags: st | 1, fd_flags: fdf }; // write end
 
     vm.pipe_read_fd = fds[0];
     vm.pipe_write_fd = fds[1];
@@ -2429,15 +2649,41 @@ pub unsafe fn io_retry(vm: &mut Vm) -> i32 {
     }
 }
 
-unsafe fn sys_epoll_create1(vm: &mut Vm, _flags: i32) -> i64 {
-    // Find free fd
-    for i in 0..MAX_FDS {
-        if vm.fd_table[i].fd_type == FD_TYPE_NONE {
-            vm.fd_table[i].fd_type = FD_TYPE_EPOLL;
-            return i as i64;
+unsafe fn sys_epoll_create1(vm: &mut Vm, flags: i32) -> i64 {
+    let n = lowest_free_fd(vm, 0);
+    if n >= 0 {
+        let fdf = if flags & O_CLOEXEC != 0 { FD_CLOEXEC } else { 0 };
+        vm.fd_table[n as usize] = FdEntry { fd_type: FD_TYPE_EPOLL, host_fd: -1, offset: 0, flags: 0, fd_flags: fdf };
+    }
+    n
+}
+
+/// Drop epoll interest entries that watch guest fd `fd` (it is being closed —
+/// a stale entry would otherwise watch whatever is next allocated at that fd
+/// number), and, if `fd` is itself an epoll instance, every entry it owns.
+unsafe fn epoll_forget_fd(fd: i32, is_epoll: bool) {
+    let mut i = 0;
+    while i < EPOLL_COUNT {
+        if EPOLL_ENTRIES[i].fd == fd || (is_epoll && EPOLL_ENTRIES[i].epfd == fd) {
+            EPOLL_COUNT -= 1;
+            EPOLL_ENTRIES[i] = EPOLL_ENTRIES[EPOLL_COUNT];
+            EPOLL_ENTRIES[EPOLL_COUNT] = EMPTY_EPOLL;
+        } else {
+            i += 1;
         }
     }
-    -24 // EMFILE
+}
+
+/// Index of the interest entry (epfd, fd), or -1.
+unsafe fn epoll_find(epfd: i32, fd: i32) -> i32 {
+    let mut i = 0;
+    while i < EPOLL_COUNT {
+        if EPOLL_ENTRIES[i].epfd == epfd && EPOLL_ENTRIES[i].fd == fd {
+            return i as i32;
+        }
+        i += 1;
+    }
+    -1
 }
 
 unsafe fn sys_epoll_ctl(
@@ -2453,40 +2699,51 @@ unsafe fn sys_epoll_ctl(
     let events = if event != 0 { mem::read_u32(vm.ram_base, event) } else { 0 };
     let data = if event != 0 { mem::read_u64(vm.ram_base, event + 8) } else { 0 };
 
+    if epfd < 0 || epfd >= MAX_FDS as i32 || fd < 0 || fd >= MAX_FDS as i32 {
+        return EBADF;
+    }
+    if vm.fd_table[epfd as usize].fd_type != FD_TYPE_EPOLL {
+        return if vm.fd_table[epfd as usize].fd_type == FD_TYPE_NONE { EBADF } else { EINVAL };
+    }
+    if vm.fd_table[fd as usize].fd_type == FD_TYPE_NONE {
+        return EBADF;
+    }
+    if fd == epfd {
+        return EINVAL;
+    }
+    let idx = epoll_find(epfd, fd);
+
     match op {
         1 => {
             // EPOLL_CTL_ADD
-            if EPOLL_COUNT < MAX_EPOLL_ENTRIES {
-                EPOLL_ENTRIES[EPOLL_COUNT] = EpollEntry { epfd, fd, events, data };
-                EPOLL_COUNT += 1;
+            if idx >= 0 {
+                return EEXIST;
             }
+            if EPOLL_COUNT >= MAX_EPOLL_ENTRIES {
+                return ENOSPC;
+            }
+            EPOLL_ENTRIES[EPOLL_COUNT] = EpollEntry { epfd, fd, events, data };
+            EPOLL_COUNT += 1;
             0
         }
         2 => {
             // EPOLL_CTL_DEL
-            let mut i = 0;
-            while i < EPOLL_COUNT {
-                if EPOLL_ENTRIES[i].epfd == epfd && EPOLL_ENTRIES[i].fd == fd {
-                    EPOLL_COUNT -= 1;
-                    EPOLL_ENTRIES[i] = EPOLL_ENTRIES[EPOLL_COUNT];
-                    EPOLL_ENTRIES[EPOLL_COUNT] = EMPTY_EPOLL;
-                    break;
-                }
-                i += 1;
+            if idx < 0 {
+                return ENOENT;
             }
+            let i = idx as usize;
+            EPOLL_COUNT -= 1;
+            EPOLL_ENTRIES[i] = EPOLL_ENTRIES[EPOLL_COUNT];
+            EPOLL_ENTRIES[EPOLL_COUNT] = EMPTY_EPOLL;
             0
         }
         3 => {
             // EPOLL_CTL_MOD
-            let mut i = 0;
-            while i < EPOLL_COUNT {
-                if EPOLL_ENTRIES[i].epfd == epfd && EPOLL_ENTRIES[i].fd == fd {
-                    EPOLL_ENTRIES[i].events = events;
-                    EPOLL_ENTRIES[i].data = data;
-                    break;
-                }
-                i += 1;
+            if idx < 0 {
+                return ENOENT;
             }
+            EPOLL_ENTRIES[idx as usize].events = events;
+            EPOLL_ENTRIES[idx as usize].data = data;
             0
         }
         _ => EINVAL,
@@ -2658,22 +2915,38 @@ unsafe fn sys_epoll_pwait(
     0 // Return 0 events
 }
 
-unsafe fn sys_eventfd2(vm: &mut Vm, initval: u32, _flags: i32) -> i64 {
-    if EVENTFD_ALLOC >= MAX_EVENTFDS {
-        return -24; // EMFILE
+/// Take a slot from a (free-mask, high-water) slot allocator, or -1 if full.
+unsafe fn alloc_slot(free: *mut u32, alloc: *mut usize, max: usize) -> i32 {
+    if *free != 0 {
+        let s = (*free).trailing_zeros();
+        *free &= !(1 << s);
+        return s as i32;
     }
-    let efd_slot = EVENTFD_ALLOC;
-    EVENTFD_ALLOC += 1;
-    EVENTFD_COUNTERS[efd_slot] = initval;
+    if *alloc >= max {
+        return -1;
+    }
+    *alloc += 1;
+    (*alloc - 1) as i32
+}
 
-    for i in 0..MAX_FDS {
-        if vm.fd_table[i].fd_type == FD_TYPE_NONE {
-            vm.fd_table[i].fd_type = FD_TYPE_EVENTFD;
-            vm.fd_table[i].host_fd = efd_slot as i32;
-            return i as i64;
-        }
+unsafe fn sys_eventfd2(vm: &mut Vm, initval: u32, flags: i32) -> i64 {
+    // Pick the fd first so a full fd table can't leak a counter slot.
+    let fd = lowest_free_fd(vm, 0);
+    if fd < 0 {
+        return fd;
     }
-    -24 // EMFILE
+    let slot = alloc_slot(
+        core::ptr::addr_of_mut!(EVENTFD_FREE),
+        core::ptr::addr_of_mut!(EVENTFD_ALLOC),
+        MAX_EVENTFDS,
+    );
+    if slot < 0 {
+        return EMFILE;
+    }
+    EVENTFD_COUNTERS[slot as usize] = initval;
+    let fdf = if flags & O_CLOEXEC != 0 { FD_CLOEXEC } else { 0 };
+    vm.fd_table[fd as usize] = FdEntry { fd_type: FD_TYPE_EVENTFD, host_fd: slot, offset: 0, flags: flags & O_NONBLOCK, fd_flags: fdf };
+    fd
 }
 
 unsafe fn sys_prlimit64(
@@ -2723,23 +2996,24 @@ unsafe fn sys_sysinfo(vm: &mut Vm, info: u64) -> i64 {
     0
 }
 
-unsafe fn sys_timerfd_create(vm: &mut Vm) -> i64 {
-    if TIMERFD_ALLOC >= MAX_TIMERFDS {
-        return -24; // EMFILE
+unsafe fn sys_timerfd_create(vm: &mut Vm, flags: i32) -> i64 {
+    let fd = lowest_free_fd(vm, 0);
+    if fd < 0 {
+        return fd;
     }
-    let tfd_slot = TIMERFD_ALLOC;
-    TIMERFD_ALLOC += 1;
-    TIMERFD_EXPIRY_MS[tfd_slot] = 0.0; // disarmed
-    TIMERFD_INTERVAL_MS[tfd_slot] = 0.0;
-
-    for i in 0..MAX_FDS {
-        if vm.fd_table[i].fd_type == FD_TYPE_NONE {
-            vm.fd_table[i].fd_type = FD_TYPE_TIMERFD;
-            vm.fd_table[i].host_fd = tfd_slot as i32;
-            return i as i64;
-        }
+    let slot = alloc_slot(
+        core::ptr::addr_of_mut!(TIMERFD_FREE),
+        core::ptr::addr_of_mut!(TIMERFD_ALLOC),
+        MAX_TIMERFDS,
+    );
+    if slot < 0 {
+        return EMFILE;
     }
-    -24 // EMFILE
+    TIMERFD_EXPIRY_MS[slot as usize] = 0.0; // disarmed
+    TIMERFD_INTERVAL_MS[slot as usize] = 0.0;
+    let fdf = if flags & O_CLOEXEC != 0 { FD_CLOEXEC } else { 0 };
+    vm.fd_table[fd as usize] = FdEntry { fd_type: FD_TYPE_TIMERFD, host_fd: slot, offset: 0, flags: flags & O_NONBLOCK, fd_flags: fdf };
+    fd
 }
 
 unsafe fn sys_timerfd_settime(
@@ -2898,6 +3172,7 @@ unsafe fn sys_socket(vm: &mut Vm, domain: i32, sock_type: i32, _proto: i32) -> i
     vm.fd_table[fd as usize].fd_type = FD_TYPE_SOCKET;
     vm.fd_table[fd as usize].host_fd = slot as i32;
     vm.fd_table[fd as usize].flags = if nonblock { 0x800 } else { 0 }; // O_NONBLOCK
+    vm.fd_table[fd as usize].fd_flags = if sock_type & O_CLOEXEC != 0 { FD_CLOEXEC } else { 0 };
 
     fd as i64
 }
@@ -3013,6 +3288,7 @@ unsafe fn sys_accept4(vm: &mut Vm, fd: i32, addr: u64, addrlen: u64, flags: i32)
     vm.fd_table[new_fd as usize].fd_type = FD_TYPE_SOCKET;
     vm.fd_table[new_fd as usize].host_fd = server_sock_idx as i32;
     vm.fd_table[new_fd as usize].flags = if nonblock { 0x800 } else { 0 };
+    vm.fd_table[new_fd as usize].fd_flags = if flags & O_CLOEXEC != 0 { FD_CLOEXEC } else { 0 };
 
     // Write peer address if requested
     if addr != 0 {

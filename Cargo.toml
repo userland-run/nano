@@ -12,9 +12,12 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # Default is now the SLIM runtime — node + devenv are distributed through the
 # catalog (installed into the guest VFS on demand), so they are NOT embedded by
-# default. `trace` stays on for dev convenience (`node test/run.mjs --trace`).
+# default. `trace` is NOT a default: it makes every syscall call the debug_log
+# host import, which the shipped wasm should not pay for. Test/dev builds opt in
+# explicitly (make build-minimal / build-trace pass `--features trace`, which
+# `node test/run.mjs --trace` needs).
 # The full all-in-one bundle is an explicit opt-in: `--features demo` (make build-full).
-default = ["trace"]
+default = []
 busybox = []  # Embed images/busybox RISC-V ELF into WASM data section (~1MB) — terminal instant boot
 node = []     # Embed images/node RISC-V ELF (~52MB) — legacy; prefer the catalog `node` recipe
 devenv = []   # Embed build/devenv.tar.gz — legacy; prefer the catalog typescript/eslint recipes

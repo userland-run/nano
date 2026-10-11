@@ -130,12 +130,25 @@ await test("listen respects caps.net.listen whitelist", async () => {
   client.close();
 });
 
-await test("net.fetch_open/read/abort stream a data: URL response", async () => {
+// The bridge only fetches absolute http(s) URLs, so the stream tests stub
+// fetch() (no network needed) and record what the bridge asked for.
+const realFetch = globalThis.fetch;
+let fetchSeen = null;
+function stubFetch(body) {
+  globalThis.fetch = async (url, init) => {
+    fetchSeen = { url, init };
+    return new Response(body, { status: 200, headers: { "content-type": "text/plain" } });
+  };
+}
+
+await test("net.fetch_open/read/abort stream a stubbed https response", async () => {
   const { client } = await boot();
+  stubFetch("hello fetch bridge");
   const { streamId } = await client.call("net.fetch_open", {
     method: "GET",
-    url: "data:text/plain;base64," + Buffer.from("hello fetch bridge").toString("base64"),
+    url: "https://example.test/hello",
   });
+  assertEqual(fetchSeen && fetchSeen.init.credentials, "omit", "fetch sent with credentials: omit");
   let out = new Uint8Array(0);
   let eof = false;
   while (!eof) {
@@ -163,13 +176,29 @@ await test("net.fetch_open/read/abort stream a data: URL response", async () => 
 await test("release cleans a process's ports and streams", async () => {
   const { kernel, client, proc } = await boot();
   await client.call("net.listen", { port: 5001 });
-  const { streamId } = await client.call("net.fetch_open", { url: "data:text/plain,x" });
+  stubFetch("x");
+  const { streamId } = await client.call("net.fetch_open", { url: "https://example.test/x" });
   assert(streamId >= 1, "stream open");
   kernel.releaseChannel(proc.pid);
   assertEqual(kernel.ports.lookup(5001), null, "port released");
   assertEqual(kernel.hub._netStreams.size, 0, "streams released");
   client.close();
 });
+
+await test("non-http(s) and relative URLs are refused without fetching", async () => {
+  const { client } = await boot();
+  for (const url of ["data:text/plain,x", "/relative/path", "file:///etc/passwd", "blob:x"]) {
+    fetchSeen = null;
+    stubFetch("must not be served");
+    const { streamId } = await client.call("net.fetch_open", { url });
+    const r = await client.call("net.fetch_read", { streamId, len: 4096 });
+    const head = new TextDecoder().decode(new Uint8Array(r.data));
+    assert(head.startsWith("HTTP/1.1 400"), `${url} → 400 (${head.slice(0, 16)})`);
+    assertEqual(fetchSeen, null, `${url} never reaches fetch()`);
+  }
+  client.close();
+});
+globalThis.fetch = realFetch;
 
 // ============================================================
 

@@ -18,13 +18,30 @@ class FSNode {
     this.name = name;
     this.parent = parent;
     this.mode = mode;        // full mode including type bits (S_IFDIR, S_IFREG, etc.)
-    this.data = null;        // Uint8Array for files
+    this._buf = null;        // file backing store; capacity may exceed `size`
     this.children = null;    // Map<string, FSNode> for directories
     this.target = null;      // string for symlinks
     this.ino = owner ? owner._nextIno++ : _nextIno++;
     this.nlink = 1;
-    this.size = 0;
+    this.size = 0;           // logical file length
     this.mtime = null;       // seconds since epoch; null = report "now" in stat
+  }
+
+  /**
+   * File contents as a Uint8Array of exactly `size` bytes (a view onto the
+   * backing store, which grows geometrically so appends are amortized O(1)
+   * instead of an exact-size realloc + full copy per write). Readers keep using
+   * `node.data` / `data.length` unchanged. Assigning replaces the backing store
+   * and sets `size` to its length. Bytes in [size, capacity) are always zero.
+   */
+  get data() {
+    const b = this._buf;
+    return b && b.length !== this.size ? b.subarray(0, this.size) : b;
+  }
+
+  set data(v) {
+    this._buf = v;
+    if (v) this.size = v.length;
   }
 
   get isDir()     { return (this.mode & 0o170000) === 0o040000; }
@@ -52,7 +69,22 @@ const EISDIR   = -21;
 const EINVAL   = -22;
 const EMFILE   = -24;
 const ENOSPC   = -28;
+const EFBIG    = -27;
 const ENOTEMPTY = -39;
+
+// Largest file MemFS will grow (a JS typed array must fit it, and a guest
+// pwrite at a huge offset must fail cleanly instead of throwing RangeError).
+const MAX_FILE_SIZE = 2 ** 31;
+
+/** Grow node's backing store to hold `end` bytes (geometric, zero-filled). */
+function ensureCapacity(node, end) {
+  const buf = node._buf;
+  if (buf && end <= buf.length) return;
+  const cap = Math.min(MAX_FILE_SIZE, Math.max(end, buf ? buf.length * 2 : 0, 64));
+  const nb = new Uint8Array(cap);
+  if (buf) nb.set(buf.subarray(0, node.size));
+  node._buf = nb; // size unchanged: the new tail is zero
+}
 
 class MemFS {
   constructor() {
@@ -60,7 +92,11 @@ class MemFS {
     this.root = new FSNode("", null, 0o040755, this);
     this.root.children = new Map();
     this.root.parent = this.root;
-    this.openFiles = new Map(); // hostFd -> { node, flags, dirEntries? }
+    // hostFd -> open-file description { node, flags, offset, dirEntries? }.
+    // The VM's guest fds point at these: dup'd / forked fds share ONE entry, so
+    // they share the file offset and status flags (POSIX semantics). The VM
+    // host closes an entry only once no guest fd references it any more.
+    this.openFiles = new Map();
     this.nextHostFd = 100;
     // Nullable mutation hook installed by KernelVfs: (path, kind) with kind
     // "rename" (create/delete/move) or "change" (content/metadata) — the
@@ -104,6 +140,27 @@ class MemFS {
     return node;
   }
 
+  /**
+   * Resolve the directory that will hold `path`'s final component — the parent
+   * is resolved like any other path, so ".", "..", and symlinked directories
+   * work. Returns { dir, name } (name "" for "/"), or a negative errno.
+   */
+  _parentOf(path) {
+    const parts = String(path).split("/").filter(Boolean);
+    const name = parts.pop() || "";
+    if (!name) return { dir: this.root, name: "" };
+    const dir = this.resolve("/" + parts.join("/"), true);
+    if (!dir) return ENOENT;
+    if (!dir.isDir) return ENOTDIR;
+    return { dir, name };
+  }
+
+  /** Canonical path of entry `name` inside directory `dir`. */
+  _childPath(dir, name) {
+    const p = this._pathOf(dir);
+    return p === "/" ? "/" + name : p + "/" + name;
+  }
+
   _parentPath(node) {
     const parts = [];
     let n = node.parent;
@@ -116,19 +173,23 @@ class MemFS {
 
   // --- File operations ---
 
-  open(path, flags, mode) {
+  open(path, flags, mode, depth = 8) {
+    if ((flags & O_CREAT) && (flags & O_EXCL) && this.resolve(path, false)) return EEXIST;
     let node = this.resolve(path);
 
     if (!node) {
       if (!(flags & O_CREAT)) return ENOENT;
-      const parts = path.split("/").filter(Boolean);
-      const name = parts.pop();
-      if (!name) return EINVAL;
-      let dir = this.root;
-      for (const p of parts) {
-        if (!dir.children || !dir.children.has(p)) return ENOENT;
-        dir = dir.children.get(p);
-        if (!dir.isDir) return ENOTDIR;
+      const where = this._parentOf(path);
+      if (typeof where === "number") return where;
+      const { dir, name } = where;
+      if (!name || name === "." || name === "..") return EISDIR;
+      // Present but unresolvable → a dangling symlink: create its target (as
+      // Linux does), never clobber the link itself.
+      const link = dir.children.get(name);
+      if (link) {
+        if (!link.isSymlink || depth <= 0) return ENOENT;
+        const target = link.target.startsWith("/") ? link.target : this._childPath(dir, link.target);
+        return this.open(target, flags, mode, depth - 1);
       }
       node = new FSNode(name, dir, 0o100000 | ((mode & 0o7777) || 0o644), this);
       node.data = new Uint8Array(0);
@@ -137,10 +198,12 @@ class MemFS {
       this._notify(this._pathOf(node), "rename");
     }
 
+    if ((flags & O_DIRECTORY) && !node.isDir) return ENOTDIR;
+
     if (node.isDir) {
       const hostFd = this.nextHostFd++;
       const entries = [".", "..", ...node.children.keys()];
-      this.openFiles.set(hostFd, { node, flags, dirEntries: entries });
+      this.openFiles.set(hostFd, { node, flags, offset: 0, dirEntries: entries });
       return hostFd;
     }
 
@@ -152,7 +215,7 @@ class MemFS {
     }
 
     const hostFd = this.nextHostFd++;
-    this.openFiles.set(hostFd, { node, flags });
+    this.openFiles.set(hostFd, { node, flags, offset: 0 });
     return hostFd;
   }
 
@@ -179,14 +242,12 @@ class MemFS {
     const e = this.openFiles.get(hostFd);
     if (!e) return EBADF;
     if (!e.node.isFile) return EISDIR;
-    const src = new Uint8Array(wasmMem.buffer, bufPhys, count);
+    if (!(offset >= 0) || !(count >= 0)) return EINVAL;
     const end = offset + count;
-    if (!e.node.data || end > e.node.data.length) {
-      const newBuf = new Uint8Array(end);
-      if (e.node.data) newBuf.set(e.node.data);
-      e.node.data = newBuf;
-    }
-    e.node.data.set(src, offset);
+    if (end > MAX_FILE_SIZE) return EFBIG;
+    const src = new Uint8Array(wasmMem.buffer, bufPhys, count);
+    ensureCapacity(e.node, end);
+    e.node._buf.set(src, offset);
     e.node.size = Math.max(e.node.size, end);
     e.node.mtime = Math.floor(Date.now() / 1000);
     this._notify(this._pathOf(e.node), "change");
@@ -230,6 +291,20 @@ class MemFS {
     dv.setBigInt64(72, BigInt(now), true);                 // st_atime
     dv.setBigInt64(88, BigInt(now), true);                 // st_mtime
     dv.setBigInt64(104, BigInt(now), true);                // st_ctime
+    return 0;
+  }
+
+  _writeCharDevStatx(wasmMem, bufPhys) {
+    new Uint8Array(wasmMem.buffer, bufPhys, 256).fill(0);
+    const dv = new DataView(wasmMem.buffer, bufPhys, 256);
+    const now = Math.floor(Date.now() / 1000);
+    dv.setUint32(0, 0x0fff, true);                       // stx_mask (STATX_ALL)
+    dv.setUint32(4, 1024, true);                          // stx_blksize
+    dv.setUint32(16, 1, true);                            // stx_nlink
+    dv.setUint16(28, 0o020666, true);                     // stx_mode (S_IFCHR | 0666)
+    dv.setBigUint64(32, 1n, true);                        // stx_ino
+    for (const o of [64, 80, 96, 112]) dv.setBigInt64(o, BigInt(now), true); // a/b/c/mtime
+    dv.setUint32(136, 5, true);                           // stx_dev_major
     return 0;
   }
 
@@ -346,17 +421,13 @@ class MemFS {
   }
 
   mkdir(path, mode) {
-    const parts = path.split("/").filter(Boolean);
-    const name = parts.pop();
-    // No final component means the path is "/" (root), which already exists.
-    // Return EEXIST (not EINVAL) so `mkdir -p` treats it as a no-op, not fatal.
-    if (!name) return EEXIST;
-    let dir = this.root;
-    for (const p of parts) {
-      if (!dir.children || !dir.children.has(p)) return ENOENT;
-      dir = dir.children.get(p);
-      if (!dir.isDir) return ENOTDIR;
-    }
+    const where = this._parentOf(path);
+    if (typeof where === "number") return where;
+    const { dir, name } = where;
+    // No final component means the path is "/" (root), which already exists;
+    // "." / ".." name an existing directory too. Return EEXIST (not EINVAL) so
+    // `mkdir -p` treats it as a no-op, not fatal.
+    if (!name || name === "." || name === "..") return EEXIST;
     if (dir.children.has(name)) return EEXIST;
     const newDir = new FSNode(name, dir, 0o040000 | ((mode & 0o7777) || 0o755), this);
     newDir.children = new Map();
@@ -367,17 +438,13 @@ class MemFS {
   }
 
   unlink(path, flags) {
-    const parts = path.split("/").filter(Boolean);
-    const name = parts.pop();
-    if (!name) return EINVAL;
-    let dir = this.root;
-    for (const p of parts) {
-      if (!dir.children || !dir.children.has(p)) return ENOENT;
-      dir = dir.children.get(p);
-      if (!dir.isDir) return ENOTDIR;
-    }
+    const where = this._parentOf(path);
+    if (typeof where === "number") return where;
+    const { dir, name } = where;
+    if (!name || name === "." || name === "..") return EINVAL;
     if (!dir.children.has(name)) return ENOENT;
     const node = dir.children.get(name);
+    const canon = this._childPath(dir, name);
     if (flags & 0x200) {
       if (!node.isDir) return ENOTDIR;
       if (node.children.size > 0) return ENOTEMPTY;
@@ -386,39 +453,50 @@ class MemFS {
       if (node.nlink > 0) node.nlink--;
     }
     dir.children.delete(name);
-    this._notify(path, "rename");
+    this._notify(canon, "rename");
     return 0;
   }
 
   rename(oldpath, newpath) {
-    const oldParts = oldpath.split("/").filter(Boolean);
-    const oldName = oldParts.pop();
-    if (!oldName) return EINVAL;
-    let oldDir = this.root;
-    for (const p of oldParts) {
-      if (!oldDir.children || !oldDir.children.has(p)) return ENOENT;
-      oldDir = oldDir.children.get(p);
-      if (!oldDir.isDir) return ENOTDIR;
-    }
-    if (!oldDir.children.has(oldName)) return ENOENT;
+    const src = this._parentOf(oldpath);
+    if (typeof src === "number") return src;
+    if (!src.name || src.name === "." || src.name === "..") return EINVAL;
+    const node = src.dir.children.get(src.name);
+    if (!node) return ENOENT;
+    const dst = this._parentOf(newpath);
+    if (typeof dst === "number") return dst;
+    if (!dst.name || dst.name === "." || dst.name === "..") return EINVAL;
 
-    const newParts = newpath.split("/").filter(Boolean);
-    const newName = newParts.pop();
-    if (!newName) return EINVAL;
-    let newDir = this.root;
-    for (const p of newParts) {
-      if (!newDir.children || !newDir.children.has(p)) return ENOENT;
-      newDir = newDir.children.get(p);
-      if (!newDir.isDir) return ENOTDIR;
+    // A directory can't move into itself or its own subtree (that would detach
+    // the subtree into an unreachable cycle).
+    if (node.isDir) {
+      for (let d = dst.dir; ; d = d.parent) {
+        if (d === node) return EINVAL;
+        if (!d.parent || d.parent === d) break;
+      }
     }
 
-    const node = oldDir.children.get(oldName);
-    oldDir.children.delete(oldName);
-    node.name = newName;
-    node.parent = newDir;
-    newDir.children.set(newName, node);
-    this._notify(oldpath, "rename");
-    this._notify(newpath, "rename");
+    const existing = dst.dir.children.get(dst.name);
+    if (existing === node) return 0; // same entry (or a hardlink alias): no-op
+    if (existing) {
+      if (node.isDir) {
+        if (!existing.isDir) return ENOTDIR;
+        if (existing.children.size > 0) return ENOTEMPTY;
+      } else if (existing.isDir) {
+        return EISDIR;
+      } else if (existing.nlink > 0) {
+        existing.nlink--;
+      }
+    }
+
+    const oldCanon = this._childPath(src.dir, src.name);
+    const newCanon = this._childPath(dst.dir, dst.name);
+    src.dir.children.delete(src.name);
+    node.name = dst.name;
+    node.parent = dst.dir;
+    dst.dir.children.set(dst.name, node);
+    this._notify(oldCanon, "rename");
+    this._notify(newCanon, "rename");
     return 0;
   }
 
@@ -465,13 +543,11 @@ class MemFS {
     const e = this.openFiles.get(hostFd);
     if (!e) return EBADF;
     if (!e.node.isFile) return EISDIR;
+    if (!(pos >= 0)) return EINVAL;
     const end = pos + src.length;
-    if (!e.node.data || end > e.node.data.length) {
-      const newBuf = new Uint8Array(end);
-      if (e.node.data) newBuf.set(e.node.data);
-      e.node.data = newBuf;
-    }
-    e.node.data.set(src, pos);
+    if (end > MAX_FILE_SIZE) return EFBIG;
+    ensureCapacity(e.node, end);
+    e.node._buf.set(src, pos);
     e.node.size = Math.max(e.node.size, end);
     e.node.mtime = Math.floor(Date.now() / 1000);
     this._notify(this._pathOf(e.node), "change");
@@ -492,15 +568,10 @@ class MemFS {
     const node = this.resolve(oldPath, false);
     if (!node) return ENOENT;
     if (node.isDir) return EPERM; // hardlinks to directories are not allowed
-    const parts = newPath.split("/").filter(Boolean);
-    const name = parts.pop();
-    if (!name) return EINVAL;
-    let dir = this.root;
-    for (const p of parts) {
-      if (!dir.children || !dir.children.has(p)) return ENOENT;
-      dir = dir.children.get(p);
-      if (!dir.isDir) return ENOTDIR;
-    }
+    const where = this._parentOf(newPath);
+    if (typeof where === "number") return where;
+    const { dir, name } = where;
+    if (!name || name === "." || name === "..") return EEXIST;
     if (dir.children.has(name)) return EEXIST;
     dir.children.set(name, node);
     node.nlink++;
@@ -536,11 +607,14 @@ class MemFS {
 
   _truncateNode(node, length) {
     if (!node.isFile) return EISDIR;
-    const data = node.data || new Uint8Array(0);
-    if (length !== data.length) {
-      const newBuf = new Uint8Array(length);
-      newBuf.set(data.subarray(0, Math.min(length, data.length)));
-      node.data = newBuf;
+    if (!(length >= 0)) return EINVAL;
+    if (length > MAX_FILE_SIZE) return EFBIG;
+    if (length < node.size) {
+      // Shrink in place, re-zeroing the cut tail (keeps the zero-past-size
+      // invariant the geometric backing store relies on).
+      if (node._buf) node._buf.fill(0, length, node.size);
+    } else if (length > node.size) {
+      ensureCapacity(node, length);
     }
     node.size = length;
     node.mtime = Math.floor(Date.now() / 1000);

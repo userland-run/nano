@@ -20,7 +20,7 @@ WASM_OPT_FEATURES = --enable-bulk-memory --enable-sign-ext --enable-nontrapping-
                     --enable-mutable-globals --enable-multivalue --enable-reference-types \
                     --enable-extended-const
 
-# Default: SLIM runtime → wasm/nano.wasm (bare emulator + trace). node and devenv
+# Default: SLIM runtime → wasm/nano.wasm (bare emulator, no per-syscall trace). node and devenv
 # are NOT embedded — they install from the catalog into the guest VFS on demand.
 # No bundled-binary prerequisites; small and fast to build.
 build:

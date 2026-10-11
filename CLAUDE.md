@@ -24,14 +24,15 @@ The repo is organized as **one shared kernel + peer runners + apps** (see [`runn
 ## Build Commands
 
 ```bash
-make build          # Default: fully-bundled wasm/nano.wasm (busybox + node + devenv)
-make build-minimal  # Bare emulator (~585KB) — no bundled binaries
+make build          # Default: SLIM wasm/nano.wasm (bare emulator, no bundled binaries, no trace)
+make build-full     # Legacy all-in-one bundle (busybox + node + devenv; needs prebuilt images)
+make build-minimal  # Bare emulator + `trace` feature — what `make test` uses
 make devenv         # Build devenv Docker image + extract tarball (slow first time)
 make clean          # cargo clean + remove wasm/nano.wasm
 make serve          # Build + serve wasm/ on localhost:8080
 make demo           # Build + copy WASM to demo + start vite dev server
 make test           # Build minimal + run all tests (ELF + MemFS + BusyBox)
-make test-devenv    # Build bundled + run all tests including devenv tools
+make test-devenv    # Build + run all tests including devenv tools (needs a bundled wasm)
 
 # Fast iteration (type-check only, no linking):
 cargo check --target wasm32-unknown-unknown
@@ -52,21 +53,26 @@ node test/run.mjs test/hello.elf
 # Run busybox command:
 node test/run.mjs runners/riscv/images/busybox --cmd echo Hello
 
-# Run with syscall tracing:
+# Run with syscall tracing (needs a `trace` build, e.g. make build-minimal):
 node test/run.mjs runners/riscv/images/busybox --trace --cmd ls /tmp
+
+# Shipped-host regression tests (real BusyBox through runners/riscv/host/nanovm.mjs):
+node test/test_nanovm_host.mjs
 ```
 
-**Test phases**: MemFS unit tests → ELF execution (hello, test_suite, test_rvc, test_memory, test_syscalls, test_float) → BusyBox smoke tests (17 applets) → Devenv tool tests (node, tsc, npm, eslint, prettier).
+**Test phases**: MemFS unit tests (the shipped kernel MemFS, via the `test/memfs.mjs` re-export) → net bridge + kernel + nodert tiers → ELF execution (hello, test_suite, test_rvc, test_memory, test_syscalls, test_float) → BusyBox smoke tests (17 applets, `test/run.mjs` harness) → shipped-host tests (`test/test_nanovm_host.mjs`: fork/exec, pipes, shared fd offsets, path resolution, mmap) → Devenv tool tests (node, tsc, npm, eslint, prettier).
+
+`test/run.mjs` is a single-process CLI harness with its own FS-request handler (no fork/pipes); `runners/riscv/host/nanovm.mjs` is the host that actually ships. Keep both in sync when the FS protocol changes.
 
 ## Build Configuration
 
-- **Target**: `wasm32-unknown-unknown` (Rust stable toolchain)
-- **Crate type**: `cdylib` (produces `.wasm`)
-- **Dependencies**: none — `[dependencies]` is empty (`sqrt`/`sqrtf` lower directly to WASM `f64.sqrt`/`f32.sqrt` opcodes; no `libm`)
+- **Target**: `wasm32-unknown-unknown` — **nightly** toolchain (`rust-toolchain.toml`): the shared-memory build recompiles `core`/`alloc` with `+atomics,+bulk-memory` via build-std (`CARGO_UNSTABLE_BUILD_STD`, set by the Makefile)
+- **Crate type**: `cdylib` (produces `.wasm`) + `rlib` (so `cargo test --lib` can run the host-safe `decode`/`types` unit tests)
+- **Dependencies**: `vte` (`default-features = false`, no_std) for the in-wasm terminal parser (`term.rs`). No `libm` — `sqrt`/`sqrtf` lower directly to WASM `f64.sqrt`/`f32.sqrt`
 - **Release profile**: `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true` (speed-first, per the Bellard interpreter design)
 - **Dev profile**: `opt-level = 1`, `codegen-units = 256` (fast incremental builds)
 - **WASM memory**: 1MB stack, 192MB initial, 2GB max, shared + imported (set in `.cargo/config.toml`)
-- **Features**: `demo` (default) — embeds busybox + node + devenv into the WASM data section
+- **Features**: none by default (slim runtime). `busybox` / `node` / `devenv` embed those images into the data section (`demo` = all three, used by `make build-full`); `trace` emits a `debug_log` per syscall (conformance coverage; test builds only); `memcheck` logs out-of-range guest accesses (diagnostic)
 
 ## Architecture
 
@@ -88,7 +94,7 @@ The core design principle is a **single monolithic `exec()` function** with dens
 - `runners/riscv/src/cpu.rs` — Main RV64 interpreter loop (`exec()`) with instruction decode/dispatch
 - `runners/riscv/src/decode.rs` — Instruction decode helpers
 - `runners/riscv/src/syscall.rs` — Linux syscall dispatch (handles ~50 syscalls for BusyBox + Node.js)
-- `runners/riscv/src/mem.rs` — Guest memory access (read/write with bounds checking)
+- `runners/riscv/src/mem.rs` — Guest memory access. Every guest address goes through `mem::ea()`: in-range → `ram_base + addr`, out-of-range (>= ram_size, incl. u32-wrapping addresses) → a static sink, so a guest can never touch the Vm struct / Rust statics. Bulk ops are range-checked and mark self-modifying-code pages
 - `runners/riscv/src/elf.rs` — ELF loader (parses segments, sets up stack with argv/envp/auxv)
 - `runners/riscv/src/types.rs` — VM struct layout (12680 bytes, `#[repr(C)]`, compile-time size assertion)
 - `runners/riscv/src/exports.rs` — WASM exports (vm_create, vm_step, vm_load_elf, debug_*, etc.)
@@ -100,9 +106,10 @@ The core design principle is a **single monolithic `exec()` function** with dens
 Key offsets (must stay in sync with JS host code):
 - `0..560` — CPU state (x[32], pc, f[32], fcsr, status, exit_code, budget, fault info)
 - `560..600` — brk/memory (brk_start, brk_current, stack_limit)
-- `600..2136` — fd_table[64] (24 bytes each: fd_type, host_fd, offset, flags)
-- `2216..2768` — FsRequest (552 bytes: syscall_nr, fd, args, path[256], path2[256])
+- `600..2136` — fd_table[64] (24 bytes each: fd_type, host_fd, offset, flags, fd_flags=FD_CLOEXEC). For FILE/DIR fds the real offset + status flags live on the host's shared open-file description (`memfs.openFiles[host_fd]`), shared by dup/fork
+- `2216..2768` — FsRequest (552 bytes: syscall_nr, fd, args, path[256], path2[256]). path/path2 are legacy ≤255-byte copies; the full paths (PATH_MAX 4096, ENAMETOOLONG beyond) are at `vm_fs_path_ptr()` / `vm_fs_path2_ptr()`
 - `2768..2792` — FsResponse (24 bytes)
+- `2792..3312` — reserved (old unused mmap table); `3312` mmap_next_addr
 - `3680..3936` — cwd[256]
 - `3936..3972` — run state (tid, run_status, ram_base, ram_size, heap_ptr)
 
@@ -115,9 +122,11 @@ When the VM needs filesystem I/O:
 4. JS host resets `vm.status = STATUS_OK` (0)
 5. VM resumes execution
 
+Path syscalls pass their dirfd in `fd` (AT_FDCWD = -100); the host resolves relative paths against it. Host-only ops beyond the plain syscalls: `SYS_CLOSE` for FILE/DIR/PIPE (the host releases the shared description/pipe when no fd in any live process — current or suspended fork parent — still references it), `SYS_DUP3` (release the fd dup3 replaced), `SYS_FCNTL` (F_SETFL → description flags), `SYS_CHDIR` (validate + canonicalize into `cwd`), `SYS_MMAP` (populate a file-backed mapping), `SYS_CLONE` (serialized fork; also vfork), `SYS_EXECVE` (honors FD_CLOEXEC). The host wraps request handling in try/catch (→ `-EIO`) and range-checks guest buffers (→ `-EFAULT`).
+
 ### Host Boundary (JS ↔ WASM)
 
-**WASM exports**: `vm_create`, `vm_step`, `vm_load_elf`, `vm_fs_request_ptr`, `vm_ram_ptr`, `vm_ram_size`, `vm_exit_code`, `debug_pc`, `debug_reg`, `debug_status`, `vm_bundled_*`
+**WASM exports**: `vm_create`, `vm_step`, `vm_load_elf`, `vm_fs_request_ptr`, `vm_fs_path_ptr`/`vm_fs_path2_ptr`/`vm_fs_path_cap`, `vm_note_host_write` (host wrote guest RAM → invalidate cached code), `vm_reset_blocks`, `vm_ram_ptr`, `vm_ram_size`, `vm_exit_code`, `debug_pc`, `debug_reg`, `debug_status`, `vm_bundled_*`
 
 **WASM imports**: `memory` (SharedArrayBuffer), `console_write(fd, ptr, len)`, `debug_log(val)`, `abort_js()`, `emscripten_random()`, `emscripten_date_now()`
 

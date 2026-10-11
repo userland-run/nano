@@ -32,6 +32,16 @@ const FD_TYPE_PIPE    = 6;
 const FD_TYPE_EPOLL   = 7;
 const FD_TYPE_EVENTFD = 8;
 
+// fd_table entry: +0 fd_type, +4 host_fd, +8 offset (unused for FILE/DIR —
+// the offset lives on the shared open-file description), +16 status flags,
+// +20 descriptor flags (FD_CLOEXEC).
+const FD_CLOEXEC = 1;
+const O_APPEND   = 0x400;
+const O_CLOEXEC  = 0x80000;
+const SETFL_MASK = 0x400 | 0x800 | 0x2000 | 0x4000 | 0x40000; // F_SETFL-settable bits
+const AT_FDCWD   = -100;
+const AT_EMPTY_PATH = 0x1000;
+
 // VM struct offsets
 const FD_TABLE_OFF  = 600;
 const FD_ENTRY_SIZE = 24;
@@ -54,6 +64,10 @@ const SERVER_IDLE_HEARTBEAT_MS = 1000;
 
 // Syscall numbers (RISC-V Linux)
 const SYS_GETCWD     = 17;
+const SYS_DUP3       = 24;
+const SYS_FCNTL      = 25;
+const SYS_CHDIR      = 49;
+const SYS_MMAP       = 222;
 const SYS_CLONE      = 220;
 const SYS_EXECVE     = 221;
 const SYS_WAIT4      = 260;
@@ -816,7 +830,7 @@ class NanoVM {
    */
   _pipeGet(id) {
     let p = this._pipes.get(id);
-    if (!p) { p = { chunks: [], total: 0, readPos: 0 }; this._pipes.set(id, p); }
+    if (!p) { p = { chunks: [], head: 0, headOff: 0, avail: 0 }; this._pipes.set(id, p); }
     return p;
   }
 
@@ -825,31 +839,99 @@ class NanoVM {
     if (count <= 0) return 0;
     const p = this._pipeGet(id);
     p.chunks.push(new Uint8Array(this._memory.buffer, srcPhys, count).slice());
-    p.total += count;
+    p.avail += count;
     return count;
   }
 
-  /** Drain up to `count` bytes from a pipe buffer; 0 = EOF (writer finished). */
+  /**
+   * Drain up to `count` bytes from a pipe buffer; 0 = EOF (writer finished).
+   * Consumes from a head cursor (chunk index + offset) — O(bytes copied), not a
+   * rescan from the first chunk ever written — and drops drained chunks.
+   */
   _pipeRead(id, dstPhys, count) {
-    const p = this._pipeGet(id);
-    const avail = p.total - p.readPos;
-    if (avail <= 0 || count <= 0) return 0;
-    const n = Math.min(count, avail);
+    const p = this._pipes.get(id);
+    if (!p || p.avail <= 0 || count <= 0) return 0;
+    const n = Math.min(count, p.avail);
     const dst = new Uint8Array(this._memory.buffer, dstPhys, n);
-    let copied = 0, chunkStart = 0;
-    for (const ch of p.chunks) {
-      const chunkEnd = chunkStart + ch.length;
-      if (p.readPos + copied < chunkEnd && copied < n) {
-        const from = Math.max(0, p.readPos + copied - chunkStart);
-        const take = Math.min(ch.length - from, n - copied);
-        dst.set(ch.subarray(from, from + take), copied);
-        copied += take;
-      }
-      chunkStart = chunkEnd;
-      if (copied >= n) break;
+    let copied = 0;
+    while (copied < n) {
+      const ch = p.chunks[p.head];
+      const take = Math.min(ch.length - p.headOff, n - copied);
+      dst.set(ch.subarray(p.headOff, p.headOff + take), copied);
+      copied += take;
+      p.headOff += take;
+      if (p.headOff >= ch.length) { p.chunks[p.head++] = null; p.headOff = 0; }
     }
-    p.readPos += copied;
+    if (p.head >= p.chunks.length) { p.chunks = []; p.head = 0; }
+    else if (p.head >= 64 && p.head * 2 >= p.chunks.length) { p.chunks = p.chunks.slice(p.head); p.head = 0; }
+    p.avail -= copied;
     return copied;
+  }
+
+  // ---- Shared host objects behind guest fds (open-file descriptions, pipes) ----
+  //
+  // FILE/DIR fds point at a MemFS open-file description (memfs.openFiles[host_fd]:
+  // node + offset + status flags); PIPE fds at a pipe buffer (this._pipes[id]).
+  // dup/dup2/F_DUPFD copy the fd entry and fork copies the whole table, so every
+  // copy shares the SAME description — one offset, as POSIX requires. The
+  // reference count is the number of fd entries that point at it across all
+  // live processes: the running one plus every fork parent suspended on
+  // _forkStack. It is computed on demand (a 64-entry scan per table) rather than
+  // tracked incrementally, so it can't drift; the description is released
+  // exactly when the last referencing fd goes away.
+
+  /** Number of live fd entries (all processes) referencing a host object. */
+  _hostRefs(fdType, hostFd) {
+    const isPipe = fdType === FD_TYPE_PIPE;
+    const match = (t, h) => h === hostFd &&
+      (isPipe ? t === FD_TYPE_PIPE : (t === FD_TYPE_FILE || t === FD_TYPE_DIR));
+    const count = (buf, off) => {
+      const dv = new DataView(buf, off, MAX_FDS * FD_ENTRY_SIZE);
+      let n = 0;
+      for (let i = 0; i < MAX_FDS; i++) {
+        if (match(dv.getInt32(i * FD_ENTRY_SIZE, true), dv.getInt32(i * FD_ENTRY_SIZE + 4, true))) n++;
+      }
+      return n;
+    };
+    let n = count(this._memory.buffer, this._vmPtr + FD_TABLE_OFF);
+    for (const frame of this._forkStack || []) {
+      const t = frame.snap.vmStruct;
+      n += count(t.buffer, t.byteOffset + FD_TABLE_OFF);
+    }
+    return n;
+  }
+
+  /** A fd referencing (fdType, hostFd) went away: free the object if it was the last. */
+  _releaseHost(fdType, hostFd) {
+    if (hostFd < 0) return; // sentinel fds (/dev/__snapshot__, /dev/__net__)
+    if (fdType !== FD_TYPE_FILE && fdType !== FD_TYPE_DIR && fdType !== FD_TYPE_PIPE) return;
+    if (this._hostRefs(fdType, hostFd) > 0) return;
+    if (fdType === FD_TYPE_PIPE) { if (this._pipes) this._pipes.delete(hostFd); }
+    else this._memfs.close(hostFd);
+  }
+
+  /** Clear guest fds (all, or only FD_CLOEXEC ones) in the current table and release what they held. */
+  _closeFds(dv, onlyCloexec) {
+    const dropped = [];
+    for (let i = 0; i < MAX_FDS; i++) {
+      const fe = this._fdRead(dv, i);
+      if (fe.fd_type === FD_TYPE_NONE) continue;
+      if (onlyCloexec && !(fe.fd_flags & FD_CLOEXEC)) continue;
+      this._fdClear(dv, i);
+      dropped.push(fe);
+    }
+    for (const fe of dropped) this._releaseHost(fe.fd_type, fe.host_fd);
+  }
+
+  /** Tell the VM the host wrote guest RAM directly (drops stale decoded code blocks). */
+  _noteWrite(guestAddr, len) {
+    const X = this._exports;
+    if (len > 0 && X && X.vm_note_host_write) X.vm_note_host_write(guestAddr >>> 0, len >>> 0);
+  }
+
+  /** True when [guestAddr, guestAddr+len) lies inside guest RAM. */
+  _guestOk(guestAddr, len) {
+    return guestAddr >= 0 && len >= 0 && guestAddr + len <= this._ramSize;
   }
 
   /** Capture parent process state for a serialized fork (struct + used RAM). */
@@ -884,6 +966,10 @@ class NanoVM {
 
   /** Restore parent process state captured by _forkSnapshot. */
   _forkRestore(snap) {
+    // Decoded blocks are keyed by guest address only. The child ran in place —
+    // and after an execve, a different image lives at the same addresses — so
+    // the parent must not resume on the child's cached blocks.
+    if (this._exports.vm_reset_blocks) this._exports.vm_reset_blocks();
     const mem = new Uint8Array(this._memory.buffer);
     mem.set(snap.vmStruct, this._vmPtr);
     mem.set(snap.lowRAM, this._ramPtr);
@@ -1289,12 +1375,22 @@ class NanoVM {
         if (this._forkStack && this._forkStack.length > 0) {
           const frame = this._forkStack.pop();
           this._zombies.push({ pid: frame.childPid, exitCode: X.vm_exit_code(this._vmPtr) });
+          // The exiting child's fds die with it: capture them, restore the
+          // parent's table, then release whatever only the child still held
+          // (a description the parent shares stays open).
+          const cdv = new DataView(this._memory.buffer);
+          const childFds = [];
+          for (let i = 0; i < MAX_FDS; i++) childFds.push(this._fdRead(cdv, i));
           this._forkRestore(frame.snap);
+          for (const fe of childFds) this._releaseHost(fe.fd_type, fe.host_fd);
           const fdv = new DataView(this._memory.buffer);
           this._setA0(fdv, frame.childPid);
           fdv.setInt32(this._vmPtr + 528, STATUS_OK, true);
           continue;
         }
+        // Real process exit: close its descriptors (frees MemFS open-file
+        // descriptions + pipe buffers instead of leaking them across runs).
+        this._closeFds(new DataView(this._memory.buffer), false);
         return { exitCode: X.vm_exit_code(this._vmPtr), stdout: this._stdout };
       }
 
@@ -1649,11 +1745,30 @@ class NanoVM {
     return new TextDecoder().decode(cwdBytes.slice(0, end)) || "/";
   }
 
-  _resolvePath(path) {
+  /**
+   * Absolute form of a guest path for an *at() syscall: relative paths resolve
+   * against the directory open on `dirfd` (or the cwd for AT_FDCWD). "." and
+   * empty components are dropped; ".." is left for MemFS.resolve, which applies
+   * it physically (through symlinked directories, like the kernel). Returns the
+   * path string, or a negative errno (EBADF / ENOTDIR for a bad dirfd).
+   */
+  _resolvePath(path, dirfd = AT_FDCWD) {
     if (!path) return this._readCwd();
-    if (path.startsWith("/")) return path;
-    const cwd = this._readCwd();
-    return cwd === "/" ? "/" + path : cwd + "/" + path;
+    let base = "";
+    if (!path.startsWith("/")) {
+      if (dirfd === AT_FDCWD) {
+        base = this._readCwd();
+      } else {
+        if (dirfd < 0 || dirfd >= MAX_FDS) return -9; // EBADF
+        const fe = this._fdRead(new DataView(this._memory.buffer), dirfd);
+        if (fe.fd_type === FD_TYPE_NONE) return -9;
+        if (fe.fd_type !== FD_TYPE_DIR) return -20; // ENOTDIR
+        const desc = this._memfs.openFiles.get(fe.host_fd);
+        if (!desc) return -9;
+        base = this._memfs._pathOf(desc.node);
+      }
+    }
+    return "/" + (base + "/" + path).split("/").filter((seg) => seg && seg !== ".").join("/");
   }
 
   // FD table helpers
@@ -1661,10 +1776,11 @@ class NanoVM {
   _fdRead(dv, gfd) {
     const o = this._vmPtr + FD_TABLE_OFF + gfd * FD_ENTRY_SIZE;
     return {
-      fd_type: dv.getInt32(o, true),
-      host_fd: dv.getInt32(o + 4, true),
-      offset:  Number(dv.getBigInt64(o + 8, true)),
-      flags:   dv.getInt32(o + 16, true),
+      fd_type:  dv.getInt32(o, true),
+      host_fd:  dv.getInt32(o + 4, true),
+      offset:   Number(dv.getBigInt64(o + 8, true)),
+      flags:    dv.getInt32(o + 16, true),
+      fd_flags: dv.getInt32(o + 20, true),
     };
   }
 
@@ -1674,7 +1790,7 @@ class NanoVM {
     dv.setInt32(o + 4, host_fd, true);
     dv.setBigInt64(o + 8, BigInt(offset), true);
     dv.setInt32(o + 16, flags, true);
-    dv.setInt32(o + 20, 0, true);
+    dv.setInt32(o + 20, (flags & O_CLOEXEC) ? FD_CLOEXEC : 0, true);
   }
 
   _fdClear(dv, gfd) {
@@ -1689,9 +1805,11 @@ class NanoVM {
     return -24; // EMFILE
   }
 
-  _fdUpdateOffset(dv, gfd, newOffset) {
-    const o = this._vmPtr + FD_TABLE_OFF + gfd * FD_ENTRY_SIZE;
-    dv.setBigInt64(o + 8, BigInt(newOffset), true);
+  /** The shared open-file description behind a FILE/DIR guest fd, or null. */
+  _desc(fe) {
+    return (fe.fd_type === FD_TYPE_FILE || fe.fd_type === FD_TYPE_DIR) && fe.host_fd >= 0
+      ? this._memfs.openFiles.get(fe.host_fd) || null
+      : null;
   }
 
   _setA0(dv, value) {
@@ -1810,6 +1928,9 @@ class NanoVM {
     new Uint8Array(this._memory.buffer).set(fdTable, v + FD_TABLE_OFF);
     new Uint8Array(this._memory.buffer).set(cwd, v + 3680);
     new Uint8Array(this._memory.buffer).set(ttyState, v + 3632);
+    // Close-on-exec: fds marked FD_CLOEXEC (O_CLOEXEC opens, F_DUPFD_CLOEXEC,
+    // F_SETFD, pipe2/dup3 with O_CLOEXEC) don't survive into the new image.
+    this._closeFds(new DataView(this._memory.buffer), true);
 
     // Load the new image and set up argv/envp.
     new Uint8Array(this._memory.buffer).set(elfBytes, this._ramPtr);
@@ -1937,6 +2058,7 @@ class NanoVM {
       this._blockedOnNet = true;
       return;
     }
+    if (!r.error && r.copied > 0) this._noteWrite(bufPtr, r.copied);
     this._setA0(dv, r.error ? -5 /* EIO */ : r.copied);
     dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
   }
@@ -1995,7 +2117,37 @@ class NanoVM {
     return this._netBridge.httpResp(status, statusText, headers, body);
   }
 
+  /** Read a NUL-terminated string of at most `cap` bytes at linear address `ptr`. */
+  _readPathAt(ptr, cap) {
+    const bytes = new Uint8Array(this._memory.buffer, ptr, cap);
+    let e = 0; while (e < cap && bytes[e] !== 0) e++;
+    return e > 0 ? new TextDecoder().decode(bytes.slice(0, e)) : "";
+  }
+
+  /**
+   * Service one FS_PENDING request. Never throws: a host-side exception (a bad
+   * guest pointer, an allocation failure, a MemFS bug) completes the syscall
+   * with -EIO instead of escaping into the run loop and wedging the VM in
+   * FS_PENDING forever.
+   */
   _processFsRequest() {
+    try {
+      this._processFsRequestInner();
+    } catch (e) {
+      if (!this._fsErrWarned) {
+        this._fsErrWarned = true;
+        console.warn("[NanoVM] FS request failed on the host; returning EIO:", e);
+      }
+      const dv = new DataView(this._memory.buffer);
+      this._blockedOnStdin = false;
+      this._blockedOnNet = false;
+      this._asyncNet = null;
+      this._setA0(dv, -5); // EIO
+      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+    }
+  }
+
+  _processFsRequestInner() {
     const X = this._exports;
     this._blockedOnStdin = false; // set true below when a stdin read parks (idle prompt)
     this._blockedOnNet = false;   // set true below when a net read parks awaiting a stream chunk
@@ -2027,31 +2179,42 @@ class NanoVM {
       }
     }
 
-    // Read null-terminated path (offset +40, max 256 bytes)
-    const pathBytes = new Uint8Array(this._memory.buffer, reqPtr + 40, 256);
-    let pe = 0; while (pe < 256 && pathBytes[pe] !== 0) pe++;
-    const rawPath = pe > 0 ? new TextDecoder().decode(pathBytes.slice(0, pe)) : "";
+    const done = (value) => {
+      this._setA0(dv, value);
+      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+    };
 
-    // Read path2 for rename (offset +296, max 256 bytes)
-    const path2Bytes = new Uint8Array(this._memory.buffer, reqPtr + 296, 256);
-    let pe2 = 0; while (pe2 < 256 && path2Bytes[pe2] !== 0) pe2++;
-    const rawPath2 = pe2 > 0 ? new TextDecoder().decode(path2Bytes.slice(0, pe2)) : "";
+    // Paths: the full (PATH_MAX) copies when the wasm exports them, else the
+    // legacy 256-byte FsRequest fields (+40 / +296).
+    const rawPath = X.vm_fs_path_ptr
+      ? this._readPathAt(X.vm_fs_path_ptr(), X.vm_fs_path_cap())
+      : this._readPathAt(reqPtr + 40, 256);
+    const rawPath2 = () => X.vm_fs_path2_ptr
+      ? this._readPathAt(X.vm_fs_path2_ptr(), X.vm_fs_path_cap())
+      : this._readPathAt(reqPtr + 296, 256);
 
-    const path = this._resolvePath(rawPath);
-    const path2 = rawPath2 ? this._resolvePath(rawPath2) : "";
+    // Path-taking *at() syscalls resolve relative paths against their dirfd
+    // (the request's fd field); execve/chdir and the rest use the cwd.
+    const AT_CALLS = [SYS_OPENAT, SYS_NEWFSTATAT, SYS_READLINKAT, SYS_MKDIRAT, SYS_UNLINKAT,
+      SYS_FACCESSAT, SYS_UTIMENSAT, SYS_STATX, SYS_RENAMEAT2];
+    const path = this._resolvePath(rawPath, AT_CALLS.includes(syscallNr) ? gfd : AT_FDCWD);
 
     if (syscallNr === SYS_EXECVE) {
+      if (typeof path === "number") return done(path);
       this._doExecve(dv, path, arg1, arg2);
       return;
     }
 
     if (syscallNr === SYS_CLONE) {
-      // Serialized fork: snapshot the parent and run the child first (clone
-      // returns 0 to the child). The parent is restored when the child exits.
+      // Serialized fork (and vfork): snapshot the parent and run the child
+      // first (clone returns 0 to the child). The parent is restored when the
+      // child exits. The child's fd table is a copy of the parent's, so its
+      // FILE/DIR/PIPE fds share the parent's open-file descriptions.
       this._forkStack.push({ snap: this._forkSnapshot(), childPid: this._nextPid++ });
-      this._setA0(dv, 0);
-      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-      return;
+      // A caller-supplied child stack (posix_spawn's CLONE_VM|CLONE_VFORK) is
+      // installed only now, after the parent's sp went into the snapshot.
+      if (arg3) dv.setBigUint64(this._vmPtr + 16, BigInt(arg3), true);
+      return done(0);
     }
 
     if (syscallNr === SYS_WAIT4) {
@@ -2061,16 +2224,37 @@ class NanoVM {
       for (let i = 0; i < this._zombies.length; i++) {
         if (wpid <= 0 || this._zombies[i].pid === wpid) { zi = i; break; }
       }
-      if (zi >= 0) {
-        const z = this._zombies.splice(zi, 1)[0];
-        // wait status: WEXITSTATUS = (status >> 8) & 0xff.
-        if (statusPtr) dv.setInt32(this._ramPtr + statusPtr, (z.exitCode & 0xff) << 8, true);
-        this._setA0(dv, z.pid);
-      } else {
-        this._setA0(dv, -10); // ECHILD
+      if (zi < 0) return done(-10); // ECHILD
+      if (statusPtr && !this._guestOk(statusPtr, 4)) return done(-14); // EFAULT
+      const z = this._zombies.splice(zi, 1)[0];
+      // wait status: WEXITSTATUS = (status >> 8) & 0xff.
+      if (statusPtr) {
+        dv.setInt32(this._ramPtr + statusPtr, (z.exitCode & 0xff) << 8, true);
+        this._noteWrite(statusPtr, 4);
       }
-      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-      return;
+      return done(z.pid);
+    }
+
+    if (syscallNr === SYS_CHDIR) {
+      if (typeof path === "number") return done(path);
+      if (!rawPath) return done(-2); // ENOENT
+      const node = memfs.resolve(path, true);
+      if (!node) return done(-2);
+      if (!node.isDir) return done(-20); // ENOTDIR
+      // Store the canonical (physical) path, like the kernel's getcwd().
+      const canon = new TextEncoder().encode(memfs._pathOf(node));
+      if (canon.length >= 256) return done(-36); // ENAMETOOLONG (vm.cwd is 256 bytes)
+      const cwd = new Uint8Array(this._memory.buffer, this._vmPtr + 3680, 256);
+      cwd.fill(0);
+      cwd.set(canon);
+      return done(0);
+    }
+
+    if (syscallNr === SYS_DUP3) {
+      // dup3/dup2 replaced fd `gfd`, which held (arg1 = type, arg2 = host_fd):
+      // the table already has the new entry, so release the old object now.
+      this._releaseHost(arg1, arg2);
+      return done(gfd);
     }
 
     // Snapshot sentinel: detect openat for /dev/__snapshot__
@@ -2082,55 +2266,46 @@ class NanoVM {
       if (newGfd >= 0) {
         this._fdWrite(dv, newGfd, FD_TYPE_FILE, -99, 0, 0);
       }
-      this._setA0(dv, newGfd >= 0 ? newGfd : -28);
-      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-      return;
+      return done(newGfd >= 0 ? newGfd : -28);
     }
 
     // Network sentinel: openat /dev/__net__ assigns host_fd -98. The guest writes
     // a request ("METHOD URL\nHeader: v\n\nbody") then reads back an HTTP-like
     // response; the actual host fetch runs in the (async) run loop after close.
     if (syscallNr === SYS_OPENAT && path === "/dev/__net__") {
-      if (this._netDisabled) { this._setA0(dv, -13); dv.setInt32(this._vmPtr + 528, STATUS_OK, true); return; } // EACCES
+      if (this._netDisabled) return done(-13); // EACCES
       // A fully-consumed previous response (guest saw EOF/EIO) is stale — drop
       // it so this open can start a fresh request/response cycle.
       if (this._netStream && this._netStream.eofDelivered) this._netStream = null;
       const newGfd = this._fdAlloc(dv);
       if (newGfd >= 0) this._fdWrite(dv, newGfd, FD_TYPE_FILE, -98, 0, 0);
-      this._setA0(dv, newGfd >= 0 ? newGfd : -28);
-      dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-      return;
+      return done(newGfd >= 0 ? newGfd : -28);
     }
     // Handle sentinel fd operations (host_fd === -99)
-    if (gfd >= 0 && gfd < MAX_FDS) {
+    if (gfd >= 0 && gfd < MAX_FDS && syscallNr !== SYS_MMAP) {
       const fe = this._fdRead(dv, gfd);
       if (fe.host_fd === -99) {
         if (syscallNr === SYS_WRITE) {
           // Pretend write succeeded
-          const count = bufLen || arg1;
-          this._setA0(dv, count);
-          dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-          return;
+          return done(bufLen || arg1);
         }
         if (syscallNr === SYS_FSTAT) {
           // Return fake regular file stat
+          if (!this._guestOk(arg1 >>> 0, 128)) return done(-14);
           const statBufPhys = ramPtr + (arg1 >>> 0);
           new Uint8Array(this._memory.buffer, statBufPhys, 128).fill(0);
           const sdv = new DataView(this._memory.buffer, statBufPhys, 128);
           sdv.setUint32(16, 0o100644, true); // st_mode = regular file
           sdv.setUint32(20, 1, true);        // st_nlink
           sdv.setInt32(56, 4096, true);      // st_blksize
-          this._setA0(dv, 0);
-          dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-          return;
+          this._noteWrite(arg1 >>> 0, 128);
+          return done(0);
         }
         if (syscallNr === SYS_CLOSE) {
           // Close triggers the snapshot — writeFileSync is complete
           this._fdClear(dv, gfd);
           this._snapshotRequested = true;
-          this._setA0(dv, 0);
-          dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-          return;
+          return done(0);
         }
       }
       // Network sentinel fd (host_fd === -98): accumulate the request on write,
@@ -2138,13 +2313,13 @@ class NanoVM {
       if (fe.host_fd === -98) {
         if (syscallNr === SYS_WRITE) {
           const count = bufLen || arg1;
+          if (!this._guestOk(bufPtr, count)) return done(-14);
           (this._netReq = this._netReq || []).push(
             new Uint8Array(this._memory.buffer, ramPtr + bufPtr, count).slice());
-          this._setA0(dv, count);
-          dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-          return;
+          return done(count);
         }
         if (syscallNr === SYS_READ) {
+          if (!this._guestOk(bufPtr, bufLen)) return done(-14);
           // First read after a written request (single-fd RDWR shim): fetch first,
           // then serve — the run loop awaits and calls _serveNetRead.
           if (this._netReq && this._netReq.length && !this._netStream) {
@@ -2155,13 +2330,13 @@ class NanoVM {
           return;
         }
         if (syscallNr === SYS_FSTAT) {
+          if (!this._guestOk(arg1 >>> 0, 128)) return done(-14);
           const statBufPhys = ramPtr + (arg1 >>> 0);
           new Uint8Array(this._memory.buffer, statBufPhys, 128).fill(0);
           const sdv = new DataView(this._memory.buffer, statBufPhys, 128);
           sdv.setUint32(16, 0o100644, true); sdv.setUint32(20, 1, true); sdv.setInt32(56, 4096, true);
-          this._setA0(dv, 0);
-          dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-          return;
+          this._noteWrite(arg1 >>> 0, 128);
+          return done(0);
         }
         if (syscallNr === SYS_CLOSE) {
           this._fdClear(dv, gfd);
@@ -2169,18 +2344,20 @@ class NanoVM {
           // A request written then closed without reading (printf>; cat pattern):
           // fetch now so the next open+read serves it.
           if (this._netReq && this._netReq.length && !this._netStream) this._asyncNet = { read: false };
-          this._setA0(dv, 0);
-          dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
-          return;
+          return done(0);
         }
       }
     }
+
+    // Any path error (bad dirfd, …) for the remaining path syscalls.
+    if (AT_CALLS.includes(syscallNr) && typeof path === "number") return done(path);
 
     let result = 0;
 
     switch (syscallNr) {
 
       case SYS_OPENAT: {
+        if (!rawPath) { result = -2; break; } // ENOENT
         const flags = arg1;
         const mode = arg2;
         const hostFd = memfs.open(path, flags, mode);
@@ -2205,10 +2382,20 @@ class NanoVM {
         if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
         const fe = this._fdRead(dv, gfd);
         if (fe.fd_type === FD_TYPE_NONE) { result = -9; break; }
-        if (fe.fd_type === FD_TYPE_FILE || fe.fd_type === FD_TYPE_DIR) {
-          memfs.close(fe.host_fd);
-        }
+        // Drop this fd, then release the description / pipe only if it was the
+        // last reference (dups, and fork parents' tables, keep it alive).
         this._fdClear(dv, gfd);
+        this._releaseHost(fe.fd_type, fe.host_fd);
+        result = 0;
+        break;
+      }
+
+      case SYS_FCNTL: {
+        // F_SETFL on a FILE/DIR fd: the status flags live on the shared
+        // description (Rust already updated this process's fd copies).
+        if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
+        const desc = this._desc(this._fdRead(dv, gfd));
+        if (desc && arg1 === 4) desc.flags = (desc.flags & ~SETFL_MASK) | (arg2 & SETFL_MASK);
         result = 0;
         break;
       }
@@ -2217,17 +2404,20 @@ class NanoVM {
         if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
         const fe = this._fdRead(dv, gfd);
         if (fe.fd_type === FD_TYPE_NONE) { result = -9; break; }
+        if (fe.fd_type === FD_TYPE_PIPE) { result = -29; break; } // ESPIPE
+        const desc = this._desc(fe);
+        if (!desc) { result = -29; break; }
         const offset = arg1;
         const whence = arg2;
         let newOff;
         if (whence === 0) newOff = offset;                                     // SEEK_SET
-        else if (whence === 1) newOff = fe.offset + offset;                    // SEEK_CUR
+        else if (whence === 1) newOff = desc.offset + offset;                  // SEEK_CUR
         else if (whence === 2) {                                               // SEEK_END
           const sz = memfs.lseekSize(fe.host_fd);
           newOff = (sz < 0 ? 0 : sz) + offset;
         } else { result = -22; break; }
         if (newOff < 0) { result = -22; break; }
-        this._fdUpdateOffset(dv, gfd, newOff);
+        desc.offset = newOff;
         result = newOff;
         break;
       }
@@ -2235,11 +2425,13 @@ class NanoVM {
       case SYS_READ: {
         if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
         const fe = this._fdRead(dv, gfd);
+        const count = bufLen || arg1;
+        if (!this._guestOk(bufPtr, count)) { result = -14; break; } // EFAULT
         if (fe.fd_type === FD_TYPE_STDIN) {
           const avail = this._stdinAvailable();
           if (avail > 0) {
-            const count = bufLen || arg1;
             result = this._stdinDrain(ramPtr + bufPtr, Math.min(count, avail));
+            this._noteWrite(bufPtr, result);
             break;
           }
           // No queued input. In interactive mode park the read (leave the VM
@@ -2249,37 +2441,31 @@ class NanoVM {
           result = 0;
           break;
         }
-        if (fe.fd_type === FD_TYPE_PIPE) { result = this._pipeRead(fe.host_fd, ramPtr + bufPtr, bufLen || arg1); break; }
+        if (fe.fd_type === FD_TYPE_PIPE) {
+          result = this._pipeRead(fe.host_fd, ramPtr + bufPtr, count);
+          this._noteWrite(bufPtr, result);
+          break;
+        }
         if (fe.fd_type !== FD_TYPE_FILE && fe.fd_type !== FD_TYPE_DIR) { result = -9; break; }
-        const count = bufLen || arg1;
-        const bufPhys = ramPtr + bufPtr;
-        const n = memfs.pread(fe.host_fd, this._memory, bufPhys, count, fe.offset);
-        if (n > 0) this._fdUpdateOffset(dv, gfd, fe.offset + n);
+        const desc = this._desc(fe);
+        if (!desc) { result = -9; break; }
+        const n = memfs.pread(fe.host_fd, this._memory, ramPtr + bufPtr, count, desc.offset);
+        if (n > 0) { desc.offset += n; this._noteWrite(bufPtr, n); }
         result = n;
         break;
       }
 
-      case SYS_PREAD64: {
-        if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
-        const fe = this._fdRead(dv, gfd);
-        if (fe.fd_type !== FD_TYPE_FILE) { result = -9; break; }
-        const count = bufLen || arg1;
-        const preadOffset = arg2;
-        const bufPhys = ramPtr + bufPtr;
-        const n = memfs.pread(fe.host_fd, this._memory, bufPhys, count, preadOffset);
-        result = n;
-        break;
-      }
-
+      case SYS_PREAD64:
       case SYS_PREADV: {
+        // Read at an explicit offset (arg2) without moving the fd cursor.
         if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
         const fe = this._fdRead(dv, gfd);
         if (fe.fd_type !== FD_TYPE_FILE) { result = -9; break; }
         const count = bufLen || arg1;
-        const preadOffset = arg2;
-        const bufPhys = ramPtr + bufPtr;
-        const n = memfs.pread(fe.host_fd, this._memory, bufPhys, count, preadOffset);
-        result = n;
+        if (!this._guestOk(bufPtr, count)) { result = -14; break; }
+        if (arg2 < 0) { result = -22; break; }
+        result = memfs.pread(fe.host_fd, this._memory, ramPtr + bufPtr, count, arg2);
+        if (result > 0) this._noteWrite(bufPtr, result);
         break;
       }
 
@@ -2294,26 +2480,28 @@ class NanoVM {
         const fe = this._fdRead(dv, gfd);
         if (fe.fd_type !== FD_TYPE_FILE) { result = -9; break; }
         const count = bufLen || arg1;
-        const pwriteOffset = arg2;
-        const bufPhys = ramPtr + bufPtr;
-        result = memfs.pwrite(fe.host_fd, this._memory, bufPhys, count, pwriteOffset);
+        if (!this._guestOk(bufPtr, count)) { result = -14; break; }
+        result = memfs.pwrite(fe.host_fd, this._memory, ramPtr + bufPtr, count, arg2);
         break;
       }
 
       case SYS_WRITE: {
         if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
         const fe = this._fdRead(dv, gfd);
-        if (fe.fd_type === FD_TYPE_PIPE) { result = this._pipeWrite(fe.host_fd, ramPtr + bufPtr, bufLen || arg1); break; }
-        if (fe.fd_type !== FD_TYPE_FILE) { result = -9; break; }
         const count = bufLen || arg1;
-        const bufPhys = ramPtr + bufPtr;
-        let writeOff = fe.offset;
-        if (fe.flags & 0x400) { // O_APPEND
+        if (!this._guestOk(bufPtr, count)) { result = -14; break; }
+        if (fe.fd_type === FD_TYPE_PIPE) { result = this._pipeWrite(fe.host_fd, ramPtr + bufPtr, count); break; }
+        if (fe.fd_type !== FD_TYPE_FILE) { result = -9; break; }
+        const desc = this._desc(fe);
+        if (!desc) { result = -9; break; }
+        // O_APPEND is a property of the description: every write lands at EOF.
+        let writeOff = desc.offset;
+        if (desc.flags & O_APPEND) {
           const sz = memfs.lseekSize(fe.host_fd);
           if (sz >= 0) writeOff = sz;
         }
-        const n = memfs.pwrite(fe.host_fd, this._memory, bufPhys, count, writeOff);
-        if (n > 0) this._fdUpdateOffset(dv, gfd, writeOff + n);
+        const n = memfs.pwrite(fe.host_fd, this._memory, ramPtr + bufPtr, count, writeOff);
+        if (n > 0) desc.offset = writeOff + n;
         result = n;
         break;
       }
@@ -2322,14 +2510,17 @@ class NanoVM {
         if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
         const fe = this._fdRead(dv, gfd);
         if (fe.fd_type !== FD_TYPE_DIR) { result = -20; break; }
+        const desc = this._desc(fe);
+        if (!desc) { result = -9; break; }
         const bufGuestAddr = arg1;
         const bufSize = arg2;
-        const bufPhys = ramPtr + bufGuestAddr;
-        const cookie = fe.offset;
-        const r = memfs.getdents(fe.host_fd, this._memory, bufPhys, bufSize, cookie);
+        if (!this._guestOk(bufGuestAddr, bufSize)) { result = -14; break; }
+        // The directory cursor is the description's offset (lseek/rewinddir reset it).
+        const r = memfs.getdents(fe.host_fd, this._memory, ramPtr + bufGuestAddr, bufSize, desc.offset);
         if (typeof r === "object") {
           result = r.bytes;
-          this._fdUpdateOffset(dv, gfd, r.nextCookie);
+          desc.offset = r.nextCookie;
+          this._noteWrite(bufGuestAddr, r.bytes);
         } else {
           result = r;
         }
@@ -2339,6 +2530,7 @@ class NanoVM {
       case SYS_FSTAT: {
         if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
         const fe = this._fdRead(dv, gfd);
+        if (!this._guestOk(arg1 >>> 0, 128)) { result = -14; break; }
         const statBufPhys = ramPtr + (arg1 >>> 0);
         if (fe.fd_type >= FD_TYPE_STDIN && fe.fd_type <= FD_TYPE_STDERR) {
           result = memfs._writeCharDevStat(this._memory, statBufPhys);
@@ -2347,39 +2539,78 @@ class NanoVM {
         } else {
           result = -9;
         }
+        if (result === 0) this._noteWrite(arg1 >>> 0, 128);
         break;
       }
 
-      case SYS_NEWFSTATAT: {
-        const statBufPhys = ramPtr + (arg1 >>> 0);
-        const flags = arg2;
-        result = memfs.stat(path, this._memory, statBufPhys, flags);
+      case SYS_NEWFSTATAT:
+      case SYS_STATX: {
+        const isStatx = syscallNr === SYS_STATX;
+        const bufG = (isStatx ? arg2 : arg1) >>> 0;
+        const flags = isStatx ? arg1 : arg2;
+        const size = isStatx ? 256 : 128;
+        if (!this._guestOk(bufG, size)) { result = -14; break; }
+        const bufPhys = ramPtr + bufG;
+        if (!rawPath) {
+          // fstatat(fd, "", AT_EMPTY_PATH) / statx(fd, "", AT_EMPTY_PATH, …) —
+          // libuv's fstat — stats the fd's own node (AT_FDCWD → the cwd).
+          if (!(flags & AT_EMPTY_PATH)) { result = -2; break; }
+          let node;
+          if (gfd === AT_FDCWD) node = memfs.resolve(this._readCwd());
+          else if (gfd >= 0 && gfd < MAX_FDS) {
+            const fe = this._fdRead(dv, gfd);
+            if (fe.fd_type >= FD_TYPE_STDIN && fe.fd_type <= FD_TYPE_STDERR) {
+              // std streams are character devices (matches SYS_FSTAT).
+              result = isStatx ? memfs._writeCharDevStatx(this._memory, bufPhys)
+                               : memfs._writeCharDevStat(this._memory, bufPhys);
+              this._noteWrite(bufG, size);
+              break;
+            }
+            const desc = this._desc(fe);
+            node = desc && desc.node;
+          }
+          if (!node) { result = -9; break; }
+          result = isStatx ? memfs._writeStatx(node, this._memory, bufPhys)
+                           : memfs._writeStat(node, this._memory, bufPhys);
+        } else {
+          result = isStatx ? memfs.statx(path, this._memory, bufPhys, flags)
+                           : memfs.stat(path, this._memory, bufPhys, flags);
+        }
+        if (result === 0) this._noteWrite(bufG, size);
         break;
       }
 
       case SYS_READLINKAT: {
-        const rBufPhys = ramPtr + (arg1 >>> 0);
+        const rBufG = arg1 >>> 0;
         const rCount = arg2;
-        result = memfs.readlink(path, this._memory, rBufPhys, rCount);
+        if (!this._guestOk(rBufG, rCount)) { result = -14; break; }
+        result = memfs.readlink(path, this._memory, ramPtr + rBufG, rCount);
+        if (result > 0) this._noteWrite(rBufG, result);
         break;
       }
 
       case SYS_MKDIRAT: {
-        result = memfs.mkdir(path, arg1);
+        result = rawPath ? memfs.mkdir(path, arg1) : -2;
         break;
       }
 
       case SYS_UNLINKAT: {
-        result = memfs.unlink(path, arg1);
+        result = rawPath ? memfs.unlink(path, arg1) : -2;
         break;
       }
 
       case SYS_FACCESSAT: {
-        result = memfs.access(path);
+        result = rawPath ? memfs.access(path) : -2;
         break;
       }
 
       case SYS_RENAMEAT2: {
+        // fd = olddirfd, arg1 = newdirfd, arg2 = flags (RENAME_NOREPLACE = 1).
+        const raw2 = rawPath2();
+        const path2 = this._resolvePath(raw2, arg1);
+        if (typeof path2 === "number") { result = path2; break; }
+        if (!rawPath || !raw2) { result = -2; break; }
+        if ((arg2 & 1) && memfs.resolve(path2, false)) { result = -17; break; } // EEXIST
         result = memfs.rename(path, path2);
         break;
       }
@@ -2389,10 +2620,18 @@ class NanoVM {
         break;
       }
 
-      case SYS_STATX: {
-        const statxBufPhys = ramPtr + (arg2 >>> 0);
-        const flags = arg1;
-        result = memfs.statx(path, this._memory, statxBufPhys, flags);
+      case SYS_MMAP: {
+        // Populate a file-backed mapping Rust already reserved + zeroed:
+        // copy up to bufLen bytes of the file at offset arg2 to guest arg1.
+        const fe = gfd >= 0 && gfd < MAX_FDS ? this._fdRead(dv, gfd) : null;
+        const desc = fe && this._desc(fe);
+        if (!desc || !desc.node.isFile) { result = -19; break; } // ENODEV
+        const gaddr = arg1;
+        if (!this._guestOk(gaddr, bufLen)) { result = -14; break; }
+        const n = memfs.pread(fe.host_fd, this._memory, ramPtr + gaddr, bufLen, arg2);
+        if (n < 0) { result = n; break; }
+        this._noteWrite(gaddr, n);
+        result = gaddr;
         break;
       }
 
@@ -2404,8 +2643,7 @@ class NanoVM {
     }
 
     // Write result to a0 register and reset status
-    this._setA0(dv, result);
-    dv.setInt32(this._vmPtr + 528, STATUS_OK, true);
+    done(result);
   }
 }
 

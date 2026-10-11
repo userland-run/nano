@@ -35,11 +35,15 @@ class FetchBridge {
    * bytes and open a net stream for the response.
    */
   async openFromRawRequest(reqBytes) {
-    // Parse "METHOD URL\nHeader: v\n...\n\nbody".
-    const text = new TextDecoder().decode(reqBytes);
-    const sep = text.indexOf("\n\n");
-    const head = sep >= 0 ? text.slice(0, sep) : text;
-    const body = sep >= 0 ? text.slice(sep + 2) : "";
+    // Parse "METHOD URL\nHeader: v\n...\n\nbody". Only the head is decoded as
+    // text; the body stays raw bytes so binary uploads survive byte-for-byte
+    // (a UTF-8 decode/re-encode would mangle any non-UTF-8 sequence).
+    let sep = -1;
+    for (let i = 0; i + 1 < reqBytes.length; i++) {
+      if (reqBytes[i] === 0x0a && reqBytes[i + 1] === 0x0a) { sep = i; break; }
+    }
+    const head = new TextDecoder().decode(sep >= 0 ? reqBytes.subarray(0, sep) : reqBytes);
+    const body = sep >= 0 ? reqBytes.slice(sep + 2) : new Uint8Array(0);
     const lines = head.split("\n").map((l) => l.replace(/\r$/, "")).filter(Boolean);
     const first = (lines.shift() || "GET ").trim().split(/\s+/);
     const method = (first[0] || "GET").toUpperCase();
@@ -53,22 +57,32 @@ class FetchBridge {
   /**
    * Structured entry (net.fetch_open): open a net stream for the response.
    * Never rejects — transport failures come back as framed 502 responses,
-   * exactly like the VM path.
+   * exactly like the VM path. `body` is a string or raw bytes (Uint8Array).
+   *
+   * Only absolute http(s) URLs are accepted (no relative URLs resolved against
+   * the embedding page, no data:/blob:/file: schemes), and requests are sent
+   * with credentials:"omit" so guest code can never ride the page's cookies or
+   * HTTP auth.
    */
   async open({ method = "GET", url, headers = {}, body = "" }) {
     try {
+      let parsed = null;
+      try { parsed = new URL(url); } catch { /* relative / malformed */ }
+      if (!parsed || (parsed.protocol !== "http:" && parsed.protocol !== "https:")) {
+        return this.bufferedStream(this.httpResp(400, "Bad Request", {}, "nano-net: URL must be an absolute http(s) URL"));
+      }
       // Internal origin: route to the in-page LLM bridge instead of fetch().
-      let host = "";
-      try { host = new URL(url).hostname; } catch { /* non-URL → let fetch fail */ }
-      if (host === "nanoinfer.internal") {
+      if (parsed.hostname === "nanoinfer.internal") {
         if (!this.llmBridge) {
           return this.bufferedStream(this.httpResp(502, "Bad Gateway", {}, "nano-net: no LLM bridge registered"));
         }
-        const r = await this.llmBridge({ method, url, headers, body });
+        // The bridge contract hands handlers a text body (LLM APIs are JSON).
+        const text = typeof body === "string" ? body : new TextDecoder().decode(body);
+        const r = await this.llmBridge({ method, url, headers, body: text });
         return await this.llmResultToStream(r);
       }
-      const opts = { method, headers };
-      if (method !== "GET" && method !== "HEAD" && body) opts.body = body;
+      const opts = { method, headers, credentials: "omit" };
+      if (method !== "GET" && method !== "HEAD" && body && body.length) opts.body = body;
       let resp;
       try {
         resp = await fetch(url, opts);

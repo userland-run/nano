@@ -69,8 +69,27 @@ class KernelVfs {
     }
   }
 
+  /**
+   * Lexically normalize an absolute path: collapse "//", drop ".", and apply
+   * ".." (never above "/"). Mount matching must see the normalized form — a raw
+   * "/mnt/../etc/x" would otherwise prefix-match the /mnt mount and be resolved
+   * INSIDE it (rel "/../etc/x" → that backend's /etc/x), escaping the tree the
+   * caller asked for.
+   */
+  static normalize(path) {
+    const out = [];
+    for (const seg of String(path).split("/")) {
+      if (!seg || seg === ".") continue;
+      if (seg === "..") out.pop();
+      else out.push(seg);
+    }
+    return "/" + out.join("/");
+  }
+
   /** @returns {{ prefix: string, backend: MemFS, kind: string, rel: string }} */
   resolveMount(path) {
+    path = KernelVfs.normalize(path);
+    // Match on whole path segments only ("/mnt" owns "/mnt" and "/mnt/…", not "/mntx").
     for (const m of this._mounts) {
       if (m.prefix === "/") return { ...m, rel: path };
       if (path === m.prefix || path.startsWith(m.prefix + "/")) {

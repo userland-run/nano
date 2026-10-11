@@ -341,6 +341,22 @@ fi
 echo ""
 
 # ============================================================
+# Phase 4b: Shipped-host tests — real BusyBox through runners/riscv/host/nanovm.mjs
+# (fork/exec, pipes, shared fd offsets, path resolution), not the run.mjs harness
+# ============================================================
+
+echo "--- Shipped Host (nanovm.mjs) Tests ---"
+if [ ! -f "$BUSYBOX" ]; then
+    skip "shipped-host tests" "busybox binary not found"
+elif NANOVM_WASM="$WASM" timeout 300 node "$SCRIPT_DIR/test_nanovm_host.mjs" 2>/dev/null; then
+    ok "shipped host: paths, dup/fork offsets, fork+exec+resume, rename-into-self"
+else
+    fail "shipped host (run: node test/test_nanovm_host.mjs)"
+fi
+
+echo ""
+
+# ============================================================
 # Phase 5: Devenv tool tests (requires bundled WASM + node binary)
 # ============================================================
 

@@ -17,15 +17,17 @@ use crate::types::*;
 pub extern "C" fn vm_create(ram_size: i32) -> i32 {
     let struct_size = core::mem::size_of::<Vm>() as u32;
 
-    // Allocate RAM
-    let ram_ptr = alloc::malloc(ram_size as u32);
+    // Allocate RAM (+ a small guard pad: see mem::ea — an in-range access that
+    // straddles ram_size lands in the pad, never in the Vm struct after it)
+    let ram_ptr = alloc::malloc(ram_size as u32 + mem::RAM_GUARD_PAD);
     if ram_ptr == 0 {
         return 0;
     }
 
     // Zero the RAM
     unsafe {
-        core::ptr::write_bytes(ram_ptr as *mut u8, 0, ram_size as usize);
+        core::ptr::write_bytes(ram_ptr as *mut u8, 0, ram_size as usize + mem::RAM_GUARD_PAD as usize);
+        mem::set_ram_limit(ram_size as u32);
     }
 
     // Allocate VM struct (tracked via global offset, not malloc)
@@ -57,6 +59,7 @@ pub unsafe extern "C" fn vm_init(vm_ptr: u32, ram_base: u32, ram_size: u32) {
     vm.ram_size = ram_size;
     vm.heap_ptr = ram_base + ram_size;
     vm.status = STATUS_OK;
+    mem::set_ram_limit(ram_size);
 
     // Initialize the global allocator with memory after RAM
     alloc::init(ram_base + ram_size);
@@ -139,6 +142,9 @@ pub unsafe extern "C" fn vm_load_raw(
     entry: u32,
 ) -> i32 {
     let vm = &mut *(vm_ptr as *mut Vm);
+    if !mem::range_ok(load_addr as u64, data_size as u64) {
+        return -1;
+    }
     // Copy data into guest memory at load_addr
     let src = data_offset as *const u8;
     let dst = (vm.ram_base + load_addr) as *mut u8;
@@ -213,6 +219,34 @@ pub extern "C" fn vm_thread_fs_request_ptr(vm_ptr: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn vm_thread_fs_response_ptr(vm_ptr: u32) -> u32 {
     vm_ptr + THREAD_FS_OFFSET + core::mem::size_of::<FsRequest>() as u32
+}
+
+/// Linear-memory address of the full (up to PATH_MAX) first FS request path.
+/// Supersedes the 256-byte FsRequest.path for hosts that know about it.
+#[no_mangle]
+pub unsafe extern "C" fn vm_fs_path_ptr() -> u32 {
+    crate::syscall::fs_path_ptr()
+}
+
+/// Linear-memory address of the full second FS request path (rename target).
+#[no_mangle]
+pub unsafe extern "C" fn vm_fs_path2_ptr() -> u32 {
+    crate::syscall::fs_path2_ptr()
+}
+
+/// Capacity of each vm_fs_path*_ptr buffer, including the NUL.
+#[no_mangle]
+pub extern "C" fn vm_fs_path_cap() -> u32 {
+    crate::syscall::PATH_CAP as u32
+}
+
+/// The host wrote [guest_addr, guest_addr+len) of guest RAM directly (a file
+/// read(), stat buffer, getdents, mmap populate, …). Flags the self-modifying-
+/// code check if that range overlaps a page cached blocks were decoded from, so
+/// the next exec() drops them instead of running stale code.
+#[no_mangle]
+pub unsafe extern "C" fn vm_note_host_write(guest_addr: u32, len: u32) {
+    mem::note_store_range(guest_addr as u64, len as u64);
 }
 
 // ---------- Memory info ----------

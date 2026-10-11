@@ -146,6 +146,18 @@ pub unsafe fn load(vm: &mut Vm, elf_addr: u64, elf_size: u32) -> ElfLoadResult {
 
         let (p_offset, p_vaddr, p_filesz, p_memsz) = loads[best];
 
+        // The image is guest-supplied (execve of any VFS file): a segment whose
+        // source or destination leaves guest RAM would let the raw copy below
+        // overwrite host state (the Vm struct sits right after RAM). Refuse it.
+        let span = if p_memsz > p_filesz { p_memsz } else { p_filesz };
+        let src_ok = match elf_addr.checked_add(p_offset) {
+            Some(a) => mem::range_ok(a, p_filesz),
+            None => false,
+        };
+        if !src_ok || !mem::range_ok(p_vaddr, span) {
+            return fail;
+        }
+
         // Copy file data using physical pointers (memmove-safe)
         if p_filesz > 0 {
             let src_phys = (vm.ram_base as u64 + elf_addr + p_offset) as *const u8;

@@ -28,6 +28,77 @@ unsafe fn note_store(guest_addr: u64) {
     }
 }
 
+/// Range form of note_store for bulk writes (syscall-side write_bytes /
+/// zero_mem / copy_within, and host-side writes reported via
+/// vm_note_host_write): flag dirty if ANY page in [addr, addr+len) holds cached
+/// code, so a block decoded from bytes the host or a syscall later rewrites
+/// (e.g. a file read() into a JIT code buffer) is invalidated.
+pub unsafe fn note_store_range(addr: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let first = addr >> 12;
+    let last = addr.saturating_add(len - 1) >> 12;
+    let mut pg = first;
+    while pg <= last {
+        if CODE_PAGES[pg as usize & (NUM_CODE_PAGES - 1)] != 0 {
+            CODE_DIRTY = true;
+            return;
+        }
+        pg += 1;
+    }
+}
+
+// =====================================================================
+// Guest address bounds
+//
+// Guest RAM is one bump-allocated region; the Vm struct (and the host's
+// scratch buffers, thread structs, …) are allocated right AFTER it, and the
+// Rust statics (block cache, socket table, …) sit below it. A raw
+// `base + addr as u32` therefore let a guest address >= ram_size (or one that
+// wraps in the u32 truncation) read/overwrite host-trusted state. Every guest
+// access now goes through `ea()`: an in-range address maps to base+addr as
+// before; an out-of-range one is redirected to a small static SINK (loads
+// read zeros/garbage, stores are discarded). This is a compare + select per
+// access — no branch in the hot path — and vm_create pads RAM by
+// RAM_GUARD_PAD bytes so an in-range access straddling the end (e.g. an
+// 8-byte load at ram_size-4) stays inside the allocation. Out-of-range
+// accesses are silently absorbed rather than raising SIGSEGV (the cheap
+// option; a guest doing this was already corrupting the VM).
+// =====================================================================
+
+/// Bytes of padding allocated after guest RAM (covers an access of up to 8
+/// bytes that starts in range but straddles ram_size).
+pub const RAM_GUARD_PAD: u32 = 64;
+
+/// Exclusive upper bound for guest addresses (= ram_size). 0 until a VM
+/// exists, which routes every access to the sink.
+static mut RAM_LIMIT: u64 = 0;
+
+/// Landing zone for out-of-range guest accesses (>= the widest scalar access).
+#[repr(align(16))]
+#[allow(dead_code)]
+struct Sink([u8; 64]);
+static mut SINK: Sink = Sink([0; 64]);
+
+/// Set the guest address limit (called whenever ram_size is established).
+pub unsafe fn set_ram_limit(ram_size: u32) {
+    RAM_LIMIT = ram_size as u64;
+}
+
+/// True when [addr, addr+len) lies entirely inside guest RAM.
+#[inline(always)]
+pub unsafe fn range_ok(addr: u64, len: u64) -> bool {
+    addr <= RAM_LIMIT && len <= RAM_LIMIT - addr
+}
+
+/// Effective linear-memory address of a scalar guest access (<= 8 bytes).
+#[inline(always)]
+pub unsafe fn ea(base: u32, addr: u64) -> u32 {
+    let sink = core::ptr::addr_of_mut!(SINK) as u32;
+    if addr < RAM_LIMIT { base.wrapping_add(addr as u32) } else { sink }
+}
+
 /// Take-and-clear the code-dirty flag (polled at the exec loop top).
 #[inline(always)]
 pub unsafe fn take_code_dirty() -> bool {
@@ -80,28 +151,28 @@ unsafe fn dbg_check(_base: u32, _addr: u64, _len: u64) {}
 #[inline(always)]
 pub unsafe fn read_u8(base: u32, addr: u64) -> u8 {
     dbg_check(base, addr, 1);
-    *((base + addr as u32) as *const u8)
+    *(ea(base, addr) as *const u8)
 }
 
 /// Read u16 LE from guest address (single WASM i32.load16_u)
 #[inline(always)]
 pub unsafe fn read_u16(base: u32, addr: u64) -> u16 {
     dbg_check(base, addr, 2);
-    ((base + addr as u32) as *const u16).read_unaligned()
+    (ea(base, addr) as *const u16).read_unaligned()
 }
 
 /// Read u32 LE from guest address (single WASM i32.load)
 #[inline(always)]
 pub unsafe fn read_u32(base: u32, addr: u64) -> u32 {
     dbg_check(base, addr, 4);
-    ((base + addr as u32) as *const u32).read_unaligned()
+    (ea(base, addr) as *const u32).read_unaligned()
 }
 
 /// Read u64 LE from guest address (single WASM i64.load)
 #[inline(always)]
 pub unsafe fn read_u64(base: u32, addr: u64) -> u64 {
     dbg_check(base, addr, 8);
-    ((base + addr as u32) as *const u64).read_unaligned()
+    (ea(base, addr) as *const u64).read_unaligned()
 }
 
 /// Read i8 from guest address
@@ -133,7 +204,7 @@ pub unsafe fn read_i64(base: u32, addr: u64) -> i64 {
 pub unsafe fn write_u8(base: u32, addr: u64, val: u8) {
     dbg_check(base, addr, 1);
     note_store(addr);
-    *((base + addr as u32) as *mut u8) = val;
+    *(ea(base, addr) as *mut u8) = val;
 }
 
 /// Write u16 LE to guest address (single WASM i32.store16)
@@ -141,7 +212,7 @@ pub unsafe fn write_u8(base: u32, addr: u64, val: u8) {
 pub unsafe fn write_u16(base: u32, addr: u64, val: u16) {
     dbg_check(base, addr, 2);
     note_store(addr);
-    ((base + addr as u32) as *mut u16).write_unaligned(val);
+    (ea(base, addr) as *mut u16).write_unaligned(val);
 }
 
 /// Write u32 LE to guest address (single WASM i32.store)
@@ -149,7 +220,7 @@ pub unsafe fn write_u16(base: u32, addr: u64, val: u16) {
 pub unsafe fn write_u32(base: u32, addr: u64, val: u32) {
     dbg_check(base, addr, 4);
     note_store(addr);
-    ((base + addr as u32) as *mut u32).write_unaligned(val);
+    (ea(base, addr) as *mut u32).write_unaligned(val);
 }
 
 /// Write u64 LE to guest address (single WASM i64.store)
@@ -157,56 +228,77 @@ pub unsafe fn write_u32(base: u32, addr: u64, val: u32) {
 pub unsafe fn write_u64(base: u32, addr: u64, val: u64) {
     dbg_check(base, addr, 8);
     note_store(addr);
-    ((base + addr as u32) as *mut u64).write_unaligned(val);
+    (ea(base, addr) as *mut u64).write_unaligned(val);
 }
 
-/// Write a byte slice to guest memory
+/// Write a byte slice to guest memory (no-op if the range is out of bounds)
 #[inline]
 pub unsafe fn write_bytes(base: u32, addr: u64, data: &[u8]) {
     dbg_check(base, addr, data.len() as u64);
+    if !range_ok(addr, data.len() as u64) {
+        return;
+    }
+    note_store_range(addr, data.len() as u64);
     let dst = (base + addr as u32) as *mut u8;
     core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
 }
 
-/// Read bytes from guest memory into a slice
+/// Read bytes from guest memory into a slice (zero-filled if out of bounds)
 #[inline]
 pub unsafe fn read_bytes(base: u32, addr: u64, buf: &mut [u8]) {
     dbg_check(base, addr, buf.len() as u64);
+    if !range_ok(addr, buf.len() as u64) {
+        buf.fill(0);
+        return;
+    }
     let src = (base + addr as u32) as *const u8;
     core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len());
 }
 
-/// Zero a region of guest memory
+/// Zero a region of guest memory (no-op if the range is out of bounds)
 #[inline]
 pub unsafe fn zero_mem(base: u32, addr: u64, len: usize) {
     dbg_check(base, addr, len as u64);
+    if !range_ok(addr, len as u64) {
+        return;
+    }
+    note_store_range(addr, len as u64);
     let dst = (base + addr as u32) as *mut u8;
     core::ptr::write_bytes(dst, 0, len);
 }
 
-/// Copy a region of guest memory (handles overlapping via memmove)
+/// Copy a region of guest memory (handles overlapping via memmove; no-op if
+/// either range is out of bounds)
 #[inline]
 pub unsafe fn copy_within(base: u32, src_addr: u64, dst_addr: u64, len: usize) {
     dbg_check(base, src_addr, len as u64);
     dbg_check(base, dst_addr, len as u64);
+    if !range_ok(src_addr, len as u64) || !range_ok(dst_addr, len as u64) {
+        return;
+    }
+    note_store_range(dst_addr, len as u64);
     let src = (base + src_addr as u32) as *const u8;
     let dst = (base + dst_addr as u32) as *mut u8;
     core::ptr::copy(src, dst, len); // handles overlap
 }
 
-/// Get a raw pointer into guest memory
+/// Get a raw pointer into guest memory (bounds-guarded like a scalar access)
 #[inline(always)]
 pub unsafe fn guest_ptr(base: u32, addr: u64) -> *mut u8 {
-    (base + addr as u32) as *mut u8
+    ea(base, addr) as *mut u8
 }
 
-/// Read a null-terminated string from guest memory (up to max_len bytes)
+/// Read a null-terminated string from guest memory (up to buf.len()-1 bytes).
+/// Returns the length; stops at the end of guest RAM.
 pub unsafe fn read_cstr(base: u32, addr: u64, buf: &mut [u8]) -> usize {
-    let src = (base + addr as u32) as *const u8;
     let max = buf.len() - 1;
     let mut i = 0;
     while i < max {
-        let b = src.add(i).read();
+        let a = addr.wrapping_add(i as u64);
+        if a >= RAM_LIMIT {
+            break;
+        }
+        let b = *((base + a as u32) as *const u8);
         if b == 0 {
             break;
         }
@@ -217,12 +309,37 @@ pub unsafe fn read_cstr(base: u32, addr: u64, buf: &mut [u8]) -> usize {
     i
 }
 
-/// Get length of null-terminated guest string
-pub unsafe fn strlen_guest(base: u32, addr: u64) -> usize {
-    let src = (base + addr as u32) as *const u8;
-    let mut i = 0;
-    while src.add(i).read() != 0 {
+/// Copy a NUL-terminated guest string into `dst` (capacity `cap`, including the
+/// NUL). Returns the length (excluding the NUL), or a negative errno:
+/// -36 ENAMETOOLONG when no NUL fits in `cap`, -14 EFAULT when the string runs
+/// off the end of guest RAM. Never truncates silently.
+pub unsafe fn copy_cstr(base: u32, addr: u64, dst: *mut u8, cap: usize) -> i64 {
+    let mut i = 0usize;
+    while i < cap {
+        let a = addr.wrapping_add(i as u64);
+        if a >= RAM_LIMIT {
+            *dst = 0;
+            return -14; // EFAULT
+        }
+        let b = *((base + a as u32) as *const u8);
+        *dst.add(i) = b;
+        if b == 0 {
+            return i as i64;
+        }
         i += 1;
     }
-    i
+    *dst = 0;
+    -36 // ENAMETOOLONG
+}
+
+/// Get length of null-terminated guest string (stops at the end of guest RAM)
+pub unsafe fn strlen_guest(base: u32, addr: u64) -> usize {
+    let mut i = 0;
+    loop {
+        let a = addr.wrapping_add(i as u64);
+        if a >= RAM_LIMIT || *((base + a as u32) as *const u8) == 0 {
+            return i;
+        }
+        i += 1;
+    }
 }

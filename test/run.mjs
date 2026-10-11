@@ -360,7 +360,7 @@ function fdWrite(dv, gfd, fd_type, host_fd, offset, flags) {
   dv.setInt32(o + 4, host_fd, true);
   dv.setBigInt64(o + 8, BigInt(offset), true);
   dv.setInt32(o + 16, flags, true);
-  dv.setInt32(o + 20, 0, true);
+  dv.setInt32(o + 20, (flags & 0x80000) ? 1 : 0, true); // FD_CLOEXEC from O_CLOEXEC
 }
 
 function fdClear(dv, gfd) {
@@ -375,9 +375,22 @@ function fdAlloc(dv) {
   return -24; // EMFILE
 }
 
-function fdUpdateOffset(dv, gfd, newOffset) {
-  const o = vmPtr + FD_TABLE_OFF + gfd * FD_ENTRY_SIZE;
-  dv.setBigInt64(o + 8, BigInt(newOffset), true);
+// FILE/DIR fds share an open-file description (memfs.openFiles[host_fd]) with
+// their dups: the offset and status flags live there, not in the fd entry.
+function fdDesc(fe) {
+  return (fe.fd_type === FD_TYPE_FILE || fe.fd_type === FD_TYPE_DIR) && fe.host_fd >= 0
+    ? memfs.openFiles.get(fe.host_fd) || null
+    : null;
+}
+
+// Close the host file behind (type, hostFd) once no fd in the table uses it.
+function releaseHost(dv, fdType, hostFd) {
+  if (hostFd < 0 || (fdType !== FD_TYPE_FILE && fdType !== FD_TYPE_DIR)) return;
+  for (let i = 0; i < MAX_FDS; i++) {
+    const fe = fdRead(dv, i);
+    if ((fe.fd_type === FD_TYPE_FILE || fe.fd_type === FD_TYPE_DIR) && fe.host_fd === hostFd) return;
+  }
+  memfs.close(hostFd);
 }
 
 // Read CWD from VM struct (offset 3680, 256 bytes, null-terminated)
@@ -388,12 +401,23 @@ function readCwd() {
   return new TextDecoder().decode(cwdBytes.subarray(0, end)) || "/";
 }
 
-// Resolve path: if relative, prepend CWD
-function resolvePath(path) {
+// Resolve path: if relative, prepend the dirfd's directory (or the CWD for
+// AT_FDCWD). Returns a negative errno for a bad dirfd.
+function resolvePath(path, dirfd = -100) {
   if (!path) return readCwd();
-  if (path.startsWith("/")) return path;
-  const cwd = readCwd();
-  return cwd === "/" ? "/" + path : cwd + "/" + path;
+  let base = "";
+  if (!path.startsWith("/")) {
+    if (dirfd === -100) base = readCwd();
+    else {
+      if (dirfd < 0 || dirfd >= MAX_FDS) return -9;
+      const fe = fdRead(new DataView(memory.buffer), dirfd);
+      if (fe.fd_type !== FD_TYPE_DIR) return fe.fd_type === FD_TYPE_NONE ? -9 : -20;
+      const desc = fdDesc(fe);
+      if (!desc) return -9;
+      base = memfs._pathOf(desc.node);
+    }
+  }
+  return "/" + (base + "/" + path).split("/").filter((s) => s && s !== ".").join("/");
 }
 
 // Write return value to x[10] (a0 register at vmPtr + 80)
@@ -410,7 +434,8 @@ const SYS_GETCWD = 17, SYS_MKDIRAT = 34, SYS_UNLINKAT = 35,
       SYS_GETDENTS64 = 61, SYS_LSEEK = 62, SYS_READ = 63,
       SYS_WRITE = 64, SYS_PREAD64 = 67, SYS_PREADV = 69,
       SYS_READLINKAT = 78, SYS_NEWFSTATAT = 79, SYS_FSTAT = 80,
-      SYS_UTIMENSAT = 88, SYS_RENAMEAT2 = 276, SYS_STATX = 291;
+      SYS_UTIMENSAT = 88, SYS_RENAMEAT2 = 276, SYS_STATX = 291,
+      SYS_DUP3 = 24, SYS_FCNTL = 25, SYS_CHDIR = 49, SYS_MMAP = 222;
 
 function processFsRequest() {
   const reqPtr  = X.vm_fs_request_ptr(vmPtr);
@@ -424,18 +449,21 @@ function processFsRequest() {
   const bufPtr    = dv.getUint32(reqPtr + 32, true); // guest buffer addr
   const bufLen    = dv.getUint32(reqPtr + 36, true);
 
-  // Read null-terminated path (offset +40, max 256 bytes)
-  const pathBytes = new Uint8Array(memory.buffer, reqPtr + 40, 256);
-  let pe = 0; while (pe < 256 && pathBytes[pe] !== 0) pe++;
-  const rawPath = pe > 0 ? new TextDecoder().decode(pathBytes.subarray(0, pe)) : "";
+  // Read the null-terminated paths: the full PATH_MAX buffers when exported,
+  // else the legacy 256-byte FsRequest fields (+40 / +296).
+  const readPath = (ptr, cap) => {
+    const b = new Uint8Array(memory.buffer, ptr, cap);
+    let e = 0; while (e < cap && b[e] !== 0) e++;
+    return e > 0 ? new TextDecoder().decode(b.slice(0, e)) : "";
+  };
+  const rawPath = X.vm_fs_path_ptr ? readPath(X.vm_fs_path_ptr(), X.vm_fs_path_cap()) : readPath(reqPtr + 40, 256);
+  const rawPath2 = X.vm_fs_path2_ptr ? readPath(X.vm_fs_path2_ptr(), X.vm_fs_path_cap()) : readPath(reqPtr + 296, 256);
 
-  // Read path2 for rename (offset +296)
-  const path2Bytes = new Uint8Array(memory.buffer, reqPtr + 296, 256);
-  let pe2 = 0; while (pe2 < 256 && path2Bytes[pe2] !== 0) pe2++;
-  const rawPath2 = pe2 > 0 ? new TextDecoder().decode(path2Bytes.subarray(0, pe2)) : "";
-
-  const path = resolvePath(rawPath);
-  const path2 = rawPath2 ? resolvePath(rawPath2) : "";
+  // *at() syscalls resolve relative paths against their dirfd (the fd field).
+  const atCall = [SYS_OPENAT, SYS_NEWFSTATAT, SYS_READLINKAT, SYS_MKDIRAT, SYS_UNLINKAT,
+    SYS_FACCESSAT, SYS_UTIMENSAT, SYS_STATX, SYS_RENAMEAT2].includes(syscallNr);
+  const path = resolvePath(rawPath, atCall ? gfd : -100);
+  const path2 = syscallNr === SYS_RENAMEAT2 && rawPath2 ? resolvePath(rawPath2, arg1) : "";
 
   let result = 0;
 
@@ -444,6 +472,12 @@ function processFsRequest() {
     const name = fsNames[syscallNr] || `?${syscallNr}`;
     if (syscallNr === SYS_OPENAT || syscallNr === SYS_STATX)
       console.error(`  [fs] ${name} path="${path}"`);
+  }
+
+  if (atCall && typeof path === "number") {
+    setA0(dv, path);
+    dv.setInt32(vmPtr + 528, 0, true);
+    return syscallNr;
   }
 
   switch (syscallNr) {
@@ -475,11 +509,48 @@ function processFsRequest() {
       if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
       const fe = fdRead(dv, gfd);
       if (fe.fd_type === FD_TYPE_NONE) { result = -9; break; }
-      if (fe.fd_type === FD_TYPE_FILE || fe.fd_type === FD_TYPE_DIR) {
-        memfs.close(fe.host_fd);
-      }
       fdClear(dv, gfd);
+      releaseHost(dv, fe.fd_type, fe.host_fd); // only if no dup still uses it
       result = 0;
+      break;
+    }
+
+    case SYS_DUP3: {
+      // dup3 replaced fd gfd, which held (arg1 = type, arg2 = host_fd).
+      releaseHost(dv, arg1, arg2);
+      result = gfd;
+      break;
+    }
+
+    case SYS_FCNTL: {
+      // F_SETFL on a FILE/DIR fd → update the shared description's status flags.
+      const desc = gfd >= 0 && gfd < MAX_FDS ? fdDesc(fdRead(dv, gfd)) : null;
+      const MASK = 0x400 | 0x800 | 0x2000 | 0x4000 | 0x40000;
+      if (desc && arg1 === 4) desc.flags = (desc.flags & ~MASK) | (arg2 & MASK);
+      result = 0;
+      break;
+    }
+
+    case SYS_CHDIR: {
+      const node = rawPath && typeof path === "string" ? memfs.resolve(path, true) : null;
+      if (!node) { result = typeof path === "number" ? path : -2; break; }
+      if (!node.isDir) { result = -20; break; }
+      const canon = new TextEncoder().encode(memfs._pathOf(node));
+      if (canon.length >= 256) { result = -36; break; }
+      const cwd = new Uint8Array(memory.buffer, vmPtr + 3680, 256);
+      cwd.fill(0);
+      cwd.set(canon);
+      result = 0;
+      break;
+    }
+
+    case SYS_MMAP: {
+      // Populate a file-backed mapping: bufLen bytes of the file at offset
+      // arg2 into guest arg1; a0 = the mapping address.
+      const desc = gfd >= 0 && gfd < MAX_FDS ? fdDesc(fdRead(dv, gfd)) : null;
+      if (!desc || !desc.node.isFile) { result = -19; break; }
+      const n = memfs.pread(fdRead(dv, gfd).host_fd, memory, ramPtr + arg1, bufLen, arg2);
+      result = n < 0 ? n : arg1;
       break;
     }
 
@@ -487,13 +558,15 @@ function processFsRequest() {
       if (gfd < 0 || gfd >= MAX_FDS) { result = -9; break; }
       const fe = fdRead(dv, gfd);
       if (fe.fd_type === FD_TYPE_NONE) { result = -9; break; }
+      const desc = fdDesc(fe);
+      if (!desc) { result = -29; break; } // ESPIPE
       const offset = arg1;
       const whence = arg2;
       let newOff;
       if (whence === 0) {        // SEEK_SET
         newOff = offset;
       } else if (whence === 1) { // SEEK_CUR
-        newOff = fe.offset + offset;
+        newOff = desc.offset + offset;
       } else if (whence === 2) { // SEEK_END
         const sz = memfs.lseekSize(fe.host_fd);
         newOff = (sz < 0 ? 0 : sz) + offset;
@@ -501,7 +574,7 @@ function processFsRequest() {
         result = -22; break;
       }
       if (newOff < 0) { result = -22; break; }
-      fdUpdateOffset(dv, gfd, newOff);
+      desc.offset = newOff;
       result = newOff;
       break;
     }
@@ -526,8 +599,10 @@ function processFsRequest() {
       if (fe.fd_type !== FD_TYPE_FILE && fe.fd_type !== FD_TYPE_DIR) { result = -9; break; }
       const count = bufLen || arg1;
       const bufPhys = ramPtr + bufPtr;
-      const n = memfs.pread(fe.host_fd, memory, bufPhys, count, fe.offset);
-      if (n > 0) fdUpdateOffset(dv, gfd, fe.offset + n);
+      const desc = fdDesc(fe);
+      if (!desc) { result = -9; break; }
+      const n = memfs.pread(fe.host_fd, memory, bufPhys, count, desc.offset);
+      if (n > 0) desc.offset += n;
       result = n;
       break;
     }
@@ -568,14 +643,16 @@ function processFsRequest() {
       if (fe.fd_type !== FD_TYPE_FILE) { result = -9; break; }
       const count = bufLen || arg1;
       const bufPhys = ramPtr + bufPtr;
-      // O_APPEND: seek to end before writing
-      let writeOff = fe.offset;
-      if (fe.flags & 0x400) { // O_APPEND
+      const desc = fdDesc(fe);
+      if (!desc) { result = -9; break; }
+      // O_APPEND (a description flag): seek to end before writing
+      let writeOff = desc.offset;
+      if (desc.flags & 0x400) { // O_APPEND
         const sz = memfs.lseekSize(fe.host_fd);
         if (sz >= 0) writeOff = sz;
       }
       const n = memfs.pwrite(fe.host_fd, memory, bufPhys, count, writeOff);
-      if (n > 0) fdUpdateOffset(dv, gfd, writeOff + n);
+      if (n > 0) desc.offset = writeOff + n;
       result = n;
       break;
     }
@@ -587,11 +664,12 @@ function processFsRequest() {
       const bufGuestAddr = arg1;
       const bufSize = arg2;
       const bufPhys = ramPtr + bufGuestAddr;
-      const cookie = fe.offset;
-      const r = memfs.getdents(fe.host_fd, memory, bufPhys, bufSize, cookie);
+      const desc = fdDesc(fe);
+      if (!desc) { result = -9; break; }
+      const r = memfs.getdents(fe.host_fd, memory, bufPhys, bufSize, desc.offset);
       if (typeof r === "object") {
         result = r.bytes;
-        fdUpdateOffset(dv, gfd, r.nextCookie);
+        desc.offset = r.nextCookie;
       } else {
         result = r; // error or 0 (EOF via empty bytes)
       }

@@ -4,7 +4,7 @@
 // Part of NanoVM; dual-licensed - see LICENSE.md.
 
 /**
- * Unit tests for MemFS (test/memfs.mjs)
+ * Unit tests for MemFS (kernel/vfs/memfs.mjs, via the test/memfs.mjs shim)
  * Pure Node.js - no WASM needed. Tests the in-memory filesystem independently.
  *
  * Usage: node test/test_memfs.mjs

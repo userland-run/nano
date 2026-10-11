@@ -295,7 +295,7 @@ unsafe fn build_block(blk: &mut BlockEntry, start_pc: u64, base: u32) {
     let mut total = 0u16;
 
     while (count as usize) < MAX_BLOCK_OPS {
-        let raw = ((base + pc as u32) as *const u32).read_unaligned();
+        let raw = (mem::ea(base, pc) as *const u32).read_unaligned();
         let (insn, step): (u32, u8) = if raw & 3 != 3 {
             let expanded = decode::expand_compressed(raw as u16);
             if expanded == 0 { break; }
@@ -871,7 +871,7 @@ unsafe fn try_exec_rvc(
             let rd = (((i >> 2) & 0x7) + 8) as usize;
             let rs1 = (((i >> 7) & 0x7) + 8) as usize;
             let addr = x[rs1].wrapping_add(c_ld_off(i));
-            f[rd] = ((base + addr as u32) as *const u64).read_unaligned();
+            f[rd] = (mem::ea(base, addr) as *const u64).read_unaligned();
             *pc = pc.wrapping_add(2);
             true
         }
@@ -880,7 +880,7 @@ unsafe fn try_exec_rvc(
             let rd = (((i >> 2) & 0x7) + 8) as usize;
             let rs1 = (((i >> 7) & 0x7) + 8) as usize;
             let addr = x[rs1].wrapping_add(c_lw_off(i));
-            x[rd] = ((base + addr as u32) as *const u32).read_unaligned() as i32 as i64 as u64;
+            x[rd] = (mem::ea(base, addr) as *const u32).read_unaligned() as i32 as i64 as u64;
             *pc = pc.wrapping_add(2);
             true
         }
@@ -889,7 +889,7 @@ unsafe fn try_exec_rvc(
             let rd = (((i >> 2) & 0x7) + 8) as usize;
             let rs1 = (((i >> 7) & 0x7) + 8) as usize;
             let addr = x[rs1].wrapping_add(c_ld_off(i));
-            x[rd] = ((base + addr as u32) as *const u64).read_unaligned();
+            x[rd] = (mem::ea(base, addr) as *const u64).read_unaligned();
             *pc = pc.wrapping_add(2);
             true
         }
@@ -900,7 +900,7 @@ unsafe fn try_exec_rvc(
             let rs2 = (((i >> 2) & 0x7) + 8) as usize;
             let rs1 = (((i >> 7) & 0x7) + 8) as usize;
             let addr = x[rs1].wrapping_add(c_ld_off(i));
-            ((base + addr as u32) as *mut u64).write_unaligned(f[rs2]);
+            mem::write_u64(base, addr, f[rs2]);
             *pc = pc.wrapping_add(2);
             true
         }
@@ -909,7 +909,7 @@ unsafe fn try_exec_rvc(
             let rs2 = (((i >> 2) & 0x7) + 8) as usize;
             let rs1 = (((i >> 7) & 0x7) + 8) as usize;
             let addr = x[rs1].wrapping_add(c_lw_off(i));
-            ((base + addr as u32) as *mut u32).write_unaligned(x[rs2] as u32);
+            mem::write_u32(base, addr, x[rs2] as u32);
             *pc = pc.wrapping_add(2);
             true
         }
@@ -918,7 +918,7 @@ unsafe fn try_exec_rvc(
             let rs2 = (((i >> 2) & 0x7) + 8) as usize;
             let rs1 = (((i >> 7) & 0x7) + 8) as usize;
             let addr = x[rs1].wrapping_add(c_ld_off(i));
-            ((base + addr as u32) as *mut u64).write_unaligned(x[rs2]);
+            mem::write_u64(base, addr, x[rs2]);
             *pc = pc.wrapping_add(2);
             true
         }
@@ -1075,7 +1075,7 @@ unsafe fn try_exec_rvc(
         17 => {
             let rd = ((i >> 7) & 0x1f) as usize;
             let addr = x[2].wrapping_add(c_ldsp_off(i));
-            f[rd] = ((base + addr as u32) as *const u64).read_unaligned();
+            f[rd] = (mem::ea(base, addr) as *const u64).read_unaligned();
             *pc = pc.wrapping_add(2);
             true
         }
@@ -1084,7 +1084,7 @@ unsafe fn try_exec_rvc(
             let rd = ((i >> 7) & 0x1f) as usize;
             if rd == 0 { return false; }
             let addr = x[2].wrapping_add(c_lwsp_off(i));
-            x[rd] = ((base + addr as u32) as *const u32).read_unaligned() as i32 as i64 as u64;
+            x[rd] = (mem::ea(base, addr) as *const u32).read_unaligned() as i32 as i64 as u64;
             *pc = pc.wrapping_add(2);
             true
         }
@@ -1093,7 +1093,7 @@ unsafe fn try_exec_rvc(
             let rd = ((i >> 7) & 0x1f) as usize;
             if rd == 0 { return false; }
             let addr = x[2].wrapping_add(c_ldsp_off(i));
-            x[rd] = ((base + addr as u32) as *const u64).read_unaligned();
+            x[rd] = (mem::ea(base, addr) as *const u64).read_unaligned();
             // Fusion: C.LDSP + C.JR (load + indirect jump pattern)
             let next_hw = raw >> 16;
             if next_hw & 0xF07F == 0x8002 {
@@ -1142,7 +1142,7 @@ unsafe fn try_exec_rvc(
         21 => {
             let rs2 = ((i >> 2) & 0x1f) as usize;
             let addr = x[2].wrapping_add(c_sdsp_off(i));
-            ((base + addr as u32) as *mut u64).write_unaligned(f[rs2]);
+            mem::write_u64(base, addr, f[rs2]);
             *pc = pc.wrapping_add(2);
             true
         }
@@ -1150,7 +1150,7 @@ unsafe fn try_exec_rvc(
         22 => {
             let rs2 = ((i >> 2) & 0x1f) as usize;
             let addr = x[2].wrapping_add(c_swsp_off(i));
-            ((base + addr as u32) as *mut u32).write_unaligned(x[rs2] as u32);
+            mem::write_u32(base, addr, x[rs2] as u32);
             *pc = pc.wrapping_add(2);
             true
         }
@@ -1158,7 +1158,7 @@ unsafe fn try_exec_rvc(
         23 => {
             let rs2 = ((i >> 2) & 0x1f) as usize;
             let addr = x[2].wrapping_add(c_sdsp_off(i));
-            ((base + addr as u32) as *mut u64).write_unaligned(x[rs2]);
+            mem::write_u64(base, addr, x[rs2]);
             *pc = pc.wrapping_add(2);
             true
         }
@@ -1219,7 +1219,7 @@ pub unsafe fn exec(vm: &mut Vm, budget: i32) -> i32 {
         BASELINE_INSNS += 1; // C1: instructions executed in the baseline loop
 
         // Single 32-bit fetch (1 WASM i32.load instruction)
-        let raw = ((base + pc as u32) as *const u32).read_unaligned();
+        let raw = (mem::ea(base, pc) as *const u32).read_unaligned();
 
         let (insn, step): (u32, u64);
 
