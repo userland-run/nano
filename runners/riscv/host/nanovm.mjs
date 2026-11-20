@@ -74,6 +74,7 @@ const SYS_WAIT4      = 260;
 const SYS_MKDIRAT    = 34;
 const SYS_UNLINKAT   = 35;
 const SYS_FACCESSAT  = 48;
+const SYS_FCHMODAT   = 53;
 const SYS_OPENAT     = 56;
 const SYS_CLOSE      = 57;
 const SYS_GETDENTS64 = 61;
@@ -975,6 +976,7 @@ class NanoVM {
 
   /** Capture parent process state for a serialized fork (struct + used RAM). */
   _forkSnapshot() {
+    const X = this._exports;
     const dv = new DataView(this._memory.buffer);
     const v = this._vmPtr;
     const brkCurrent = Number(dv.getBigUint64(v + 568, true));
@@ -988,10 +990,14 @@ class NanoVM {
     // handler, so Ctrl-C at the next prompt would kill the shell instead of the
     // input line).
     let sigState = null, sigAddr = 0;
-    if (this._exports.vm_signals_dump) {
-      sigAddr = this._exports.vm_signals_dump();
+    if (X.vm_signals_dump) {
+      sigAddr = X.vm_signals_dump();
       sigState = new Uint8Array(this._memory.buffer, sigAddr, 2 * 64 * 8).slice();
     }
+    const mmapFreeSize = X.vm_mmap_free_size?.() ?? 0;
+    const mmapFree = mmapFreeSize
+      ? new Uint8Array(this._memory.buffer, X.vm_mmap_free_ptr(), mmapFreeSize).slice()
+      : null;
     return {
       vmStruct: new Uint8Array(this._memory.buffer, v, VM_STRUCT_SIZE).slice(),
       lowRAM: new Uint8Array(this._memory.buffer, this._ramPtr, lowEnd).slice(),
@@ -1000,6 +1006,7 @@ class NanoVM {
       stackStart,
       sigState,
       sigAddr,
+      mmapFree,
     };
   }
 
@@ -1022,11 +1029,16 @@ class NanoVM {
       mem.fill(0, this._ramPtr + snap.lowEnd, this._ramPtr + snap.stackStart);
     }
     if (snap.stackRAM.length) mem.set(snap.stackRAM, this._ramPtr + snap.stackStart);
+    // The child's munmap/execve can change the free list independently of
+    // the frontier in vmStruct. Restore it even when the parent had no entries.
+    const X = this._exports;
+    if (snap.mmapFree) mem.set(snap.mmapFree, X.vm_mmap_free_ptr());
+    X.vm_mmap_free_set_size?.(snap.mmapFree?.length ?? 0);
     // Restore the parent's signal handler tables (see _forkSnapshot) so the child's
     // execve() reset can't leave the shell with a default (fatal) SIGINT.
-    if (snap.sigState && this._exports.vm_signals_load) {
+    if (snap.sigState && X.vm_signals_load) {
       new Uint8Array(this._memory.buffer, snap.sigAddr, snap.sigState.length).set(snap.sigState);
-      this._exports.vm_signals_load();
+      X.vm_signals_load();
     }
   }
 
@@ -2437,7 +2449,7 @@ class NanoVM {
     // Path-taking *at() syscalls resolve relative paths against their dirfd
     // (the request's fd field); execve/chdir and the rest use the cwd.
     const AT_CALLS = [SYS_OPENAT, SYS_NEWFSTATAT, SYS_READLINKAT, SYS_MKDIRAT, SYS_UNLINKAT,
-      SYS_FACCESSAT, SYS_UTIMENSAT, SYS_STATX, SYS_RENAMEAT2];
+      SYS_FACCESSAT, SYS_FCHMODAT, SYS_UTIMENSAT, SYS_STATX, SYS_RENAMEAT2];
     const path = this._resolvePath(rawPath, AT_CALLS.includes(syscallNr) ? gfd : AT_FDCWD);
 
     if (syscallNr === SYS_EXECVE) {
@@ -2848,6 +2860,11 @@ class NanoVM {
 
       case SYS_FACCESSAT: {
         result = rawPath ? memfs.access(path) : -2;
+        break;
+      }
+
+      case SYS_FCHMODAT: {
+        result = rawPath ? memfs.chmod(path, arg1) : -2;
         break;
       }
 

@@ -575,6 +575,23 @@ pub unsafe extern "C" fn vm_signals_load() {
     crate::syscall::signals_load();
 }
 
+// The host saves the live free-list entries alongside the parent's mmap
+// frontier in the Vm struct, then restores both when the child exits.
+#[no_mangle]
+pub extern "C" fn vm_mmap_free_ptr() -> u32 {
+    crate::syscall::mmap_free_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_mmap_free_size() -> u32 {
+    crate::syscall::mmap_free_size()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_mmap_free_set_size(size: u32) {
+    crate::syscall::mmap_free_set_size(size);
+}
+
 /// Serialized fork: record the parent's fd table so a child closing an
 /// inherited socket / eventfd / timerfd / epoll fd doesn't free the parent's
 /// object. Called by the host when it snapshots the parent at clone(). Returns
