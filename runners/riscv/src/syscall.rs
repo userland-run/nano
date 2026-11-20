@@ -20,6 +20,7 @@ const SYS_MKDIRAT: u64 = 34;
 const SYS_UNLINKAT: u64 = 35;
 const SYS_FACCESSAT: u64 = 48;
 const SYS_CHDIR: u64 = 49;
+const SYS_FCHMODAT: u64 = 53;
 const SYS_OPENAT: u64 = 56;
 const SYS_CLOSE: u64 = 57;
 const SYS_PIPE2: u64 = 59;
@@ -706,6 +707,14 @@ pub unsafe fn handle(vm: &mut Vm) {
         SYS_FACCESSAT => {
             sys_fs_request(vm, SYS_FACCESSAT as i32, a0 as i32, a1, a2 as i64, a3 as i64);
             return;
+        }
+        SYS_FCHMODAT => {
+            if a1 == 0 {
+                EFAULT
+            } else {
+                sys_fs_request(vm, SYS_FCHMODAT as i32, a0 as i32, a1, a2 as u32 as i64, 0);
+                return;
+            }
         }
         SYS_UTIMENSAT => {
             sys_fs_request(vm, SYS_UTIMENSAT as i32, a0 as i32, a1, a2 as i64, a3 as i64);

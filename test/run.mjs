@@ -430,7 +430,7 @@ function setA0(dv, value) {
 // ============================================================
 // Syscall numbers (RISC-V Linux)
 const SYS_GETCWD = 17, SYS_MKDIRAT = 34, SYS_UNLINKAT = 35,
-      SYS_FACCESSAT = 48, SYS_OPENAT = 56, SYS_CLOSE = 57,
+      SYS_FACCESSAT = 48, SYS_FCHMODAT = 53, SYS_OPENAT = 56, SYS_CLOSE = 57,
       SYS_GETDENTS64 = 61, SYS_LSEEK = 62, SYS_READ = 63,
       SYS_WRITE = 64, SYS_PREAD64 = 67, SYS_PREADV = 69,
       SYS_READLINKAT = 78, SYS_NEWFSTATAT = 79, SYS_FSTAT = 80,
@@ -461,7 +461,7 @@ function processFsRequest() {
 
   // *at() syscalls resolve relative paths against their dirfd (the fd field).
   const atCall = [SYS_OPENAT, SYS_NEWFSTATAT, SYS_READLINKAT, SYS_MKDIRAT, SYS_UNLINKAT,
-    SYS_FACCESSAT, SYS_UTIMENSAT, SYS_STATX, SYS_RENAMEAT2].includes(syscallNr);
+    SYS_FACCESSAT, SYS_FCHMODAT, SYS_UTIMENSAT, SYS_STATX, SYS_RENAMEAT2].includes(syscallNr);
   const path = resolvePath(rawPath, atCall ? gfd : -100);
   const path2 = syscallNr === SYS_RENAMEAT2 && rawPath2 ? resolvePath(rawPath2, arg1) : "";
 
@@ -719,6 +719,11 @@ function processFsRequest() {
 
     case SYS_FACCESSAT: {
       result = memfs.access(path);
+      break;
+    }
+
+    case SYS_FCHMODAT: {
+      result = rawPath ? memfs.chmod(path, arg1) : -2;
       break;
     }
 

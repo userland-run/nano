@@ -178,6 +178,13 @@ function probeElf(pc) {
   return b;
 }
 
+await test("chmod makes a generated file executable", async () => {
+  vm.addFile("/tmp/chmod-probe", probeElf(0x10100), 0o644);
+  const { code } = await sh("cd /tmp && chmod u+x chmod-probe && ./chmod-probe");
+  assertEqual(code, 42, "execution after chmod");
+  assertEqual(memfs.resolve("/tmp/chmod-probe").mode & 0o777, 0o744, "mode after chmod");
+});
+
 await test("fork → execve(other image at the parent's resume pc) → parent resumes its own code", async () => {
   // The child execs an image whose code lives at the exact pc the parent
   // resumes at after clone(). Decoded blocks are keyed by address, so unless

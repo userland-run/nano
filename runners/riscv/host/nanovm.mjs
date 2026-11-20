@@ -74,6 +74,7 @@ const SYS_WAIT4      = 260;
 const SYS_MKDIRAT    = 34;
 const SYS_UNLINKAT   = 35;
 const SYS_FACCESSAT  = 48;
+const SYS_FCHMODAT   = 53;
 const SYS_OPENAT     = 56;
 const SYS_CLOSE      = 57;
 const SYS_GETDENTS64 = 61;
@@ -2448,7 +2449,7 @@ class NanoVM {
     // Path-taking *at() syscalls resolve relative paths against their dirfd
     // (the request's fd field); execve/chdir and the rest use the cwd.
     const AT_CALLS = [SYS_OPENAT, SYS_NEWFSTATAT, SYS_READLINKAT, SYS_MKDIRAT, SYS_UNLINKAT,
-      SYS_FACCESSAT, SYS_UTIMENSAT, SYS_STATX, SYS_RENAMEAT2];
+      SYS_FACCESSAT, SYS_FCHMODAT, SYS_UTIMENSAT, SYS_STATX, SYS_RENAMEAT2];
     const path = this._resolvePath(rawPath, AT_CALLS.includes(syscallNr) ? gfd : AT_FDCWD);
 
     if (syscallNr === SYS_EXECVE) {
@@ -2859,6 +2860,11 @@ class NanoVM {
 
       case SYS_FACCESSAT: {
         result = rawPath ? memfs.access(path) : -2;
+        break;
+      }
+
+      case SYS_FCHMODAT: {
+        result = rawPath ? memfs.chmod(path, arg1) : -2;
         break;
       }
 
