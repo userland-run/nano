@@ -1067,8 +1067,8 @@ unsafe fn sys_munmap(vm: &mut Vm, addr: u64, length: u64) -> i64 {
 
 // Bounded free list of non-frontier munmap'd regions, reused by later anonymous
 // mmap (first-fit) so the guest address space stays bounded to the working set.
-// Module-global (single guest, cooperative — like BRK_HWM/MMAP_HWM); cleared on
-// program load via reset_mmap_free() so a new program never reuses stale ranges.
+// Module-global (single guest, cooperative). Cleared on program load and
+// saved/restored with the suspended parent's memory on serialized fork.
 // Invariant: entries never overlap each other (sys_munmap / MAP_FIXED subtract
 // a range before inserting or claiming it).
 const MMAP_FREE_CAP: usize = 1024;
@@ -1079,6 +1079,19 @@ static mut MMAP_FREE_COUNT: usize = 0;
 /// load / snapshot restore — so freed ranges from a prior image aren't reused).
 pub unsafe fn reset_mmap_free() {
     MMAP_FREE_COUNT = 0;
+}
+
+pub fn mmap_free_ptr() -> u32 {
+    core::ptr::addr_of_mut!(MMAP_FREE) as u32
+}
+
+pub unsafe fn mmap_free_size() -> u32 {
+    (MMAP_FREE_COUNT * core::mem::size_of::<(u64, u64)>()) as u32
+}
+
+pub unsafe fn mmap_free_set_size(size: u32) {
+    let count = size as usize / core::mem::size_of::<(u64, u64)>();
+    MMAP_FREE_COUNT = count.min(MMAP_FREE_CAP);
 }
 
 /// Subtract [addr, addr+len) from every free-list entry (splitting an entry
