@@ -38,6 +38,7 @@ Syscalls are handled in two ways:
 | 35 | unlinkat | Remove file or empty directory |
 | 276 | renameat2 | Move/rename |
 | 48 | faccessat | Access check |
+| 53 | fchmodat | Change file permissions |
 | 88 | utimensat | Update timestamps |
 | 17 | getcwd | Get working directory |
 | 49 | chdir | Change working directory |

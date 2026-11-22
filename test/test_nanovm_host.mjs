@@ -178,6 +178,13 @@ function probeElf(pc) {
   return b;
 }
 
+await test("chmod makes a generated file executable", async () => {
+  vm.addFile("/tmp/chmod-probe", probeElf(0x10100), 0o644);
+  const { code } = await sh("cd /tmp && chmod u+x chmod-probe && ./chmod-probe");
+  assertEqual(code, 42, "execution after chmod");
+  assertEqual(memfs.resolve("/tmp/chmod-probe").mode & 0o777, 0o744, "mode after chmod");
+});
+
 await test("fork → execve(other image at the parent's resume pc) → parent resumes its own code", async () => {
   // The child execs an image whose code lives at the exact pc the parent
   // resumes at after clone(). Decoded blocks are keyed by address, so unless
@@ -246,6 +253,9 @@ const li = (rd, v) => {
   return [((hi & 0xfffff) << 12) | (rd << 7) | 0x37, addi(rd, rd, v - (hi << 12))];
 };
 const ECALL = 0x73;
+const bne = (rs1, rs2, off) =>
+  (((off >> 12) & 1) << 31) | (((off >> 5) & 0x3f) << 25) | (rs2 << 20) | (rs1 << 15) |
+  (1 << 12) | (((off >> 1) & 0xf) << 8) | (((off >> 11) & 1) << 7) | 0x63;
 
 await test("file-backed mmap is populated with the file's contents", async () => {
   const text = "mapped-from-file\n";
@@ -296,10 +306,36 @@ await test("munmap twice / MAP_FIXED never let two mappings share pages", async 
   assert(out.includes("fix=0"), `MAP_FIXED range not handed out again (out=${JSON.stringify(out)})`);
 });
 
+await test("serialized fork restores the parent's mmap free list", async () => {
+  const savedAddr = 9; // s1
+  const mmap = [
+    ...li(R.a0, 0), ...li(R.a1, 4096), ...li(R.a2, 3), ...li(R.a3, 0x22),
+    ...li(R.a4, -1), ...li(R.a5, 0), ...li(R.a7, 222), ECALL,
+  ];
+  const munmap = [addi(R.a0, savedAddr, 0), ...li(R.a1, 4096), ...li(R.a7, 215), ECALL];
+  const fork = [
+    ...li(R.a0, 17), ...li(R.a1, 0), ...li(R.a2, 0), ...li(R.a3, 0),
+    ...li(R.a4, 0), ...li(R.a7, 220), ECALL,
+  ];
+  const exit = (code) => [...li(R.a0, code), ...li(R.a7, 93), ECALL];
+  for (const parentFreesPage of [false, true]) {
+    // Allocate two pages so freeing the first adds a hole below the frontier.
+    // The child changes that hole in the opposite direction from the parent.
+    const child = [...(parentFreesPage ? mmap : munmap), ...exit(0)];
+    const samePage = exit(parentFreesPage ? 0 : 1);
+    const differentPage = exit(parentFreesPage ? 1 : 0);
+    const probe = [
+      ...mmap, addi(savedAddr, R.a0, 0), ...mmap, ...(parentFreesPage ? munmap : []),
+      ...fork, bne(R.a0, R.zero, (child.length + 1) * 4), ...child,
+      ...mmap, bne(R.a0, savedAddr, (samePage.length + 1) * 4), ...samePage, ...differentPage,
+    ];
+    vm.addFile("/bin/forkmmap", rawElf(probe, new Uint8Array(0)).bytes, 0o755);
+    const { code } = await sh("/bin/forkmmap");
+    assertEqual(code, 0, parentFreesPage ? "parent reuses its freed page" : "parent keeps its live page");
+  }
+});
+
 await test("vfork (clone CLONE_VM|CLONE_VFORK) runs the child first, then resumes the parent", async () => {
-  const bne = (rs1, rs2, off) =>
-    (((off >> 12) & 1) << 31) | (((off >> 5) & 0x3f) << 25) | (rs2 << 20) | (rs1 << 15) |
-    (1 << 12) | (((off >> 1) & 0xf) << 8) | (((off >> 11) & 1) << 7) | 0x63;
   const writeByte = (addr) => [...li(R.a0, 1), ...li(R.a1, addr), ...li(R.a2, 1), ...li(R.a7, 64), ECALL];
   const build = (data) => {
     const clone = [...li(R.a0, 0x4111), ...li(R.a1, 0), ...li(R.a2, 0), ...li(R.a3, 0), ...li(R.a4, 0), ...li(R.a7, 220), ECALL];
